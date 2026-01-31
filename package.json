@@ -1,0 +1,11 @@
+{
+    "name": "ckb-voting-dapp",
+    "private": true,
+    "workspaces": ["contracts/*", "frontend"],
+    "scripts": {
+      "build:contracts": "pnpm --filter voting-script build",
+      "deploy": "node scripts/deploy.ts",
+      "test:contracts": "pnpm --filter voting-script test",
+      "dev:frontend": "pnpm --filter frontend dev"
+    }
+  }
