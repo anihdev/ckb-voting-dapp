@@ -2,7 +2,7 @@
 # Builder Track Weekly Status Update -- Week 7
 
 **Name:** Anih Soma (AnihDev)  
-**Duration:** 28th Jan, 2026 - 3rd Feb, 2026
+**Duration:** 28th Jan, 2026 - 5th Feb, 2026
 
 ## Focus of the Week
 
