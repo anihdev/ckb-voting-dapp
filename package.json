@@ -1,11 +1,23 @@
 {
-    "name": "ckb-voting-dapp",
-    "private": true,
-    "workspaces": ["contracts/*", "frontend"],
-    "scripts": {
-      "build:contracts": "pnpm --filter voting-script build",
-      "deploy": "node scripts/deploy.ts",
-      "test:contracts": "pnpm --filter voting-script test",
-      "dev:frontend": "pnpm --filter frontend dev"
-    }
+  "name": "ckb-voting-dapp",
+  "private": true,
+  "workspaces": [
+    "contracts/*",
+    "frontend"
+  ],
+  "scripts": {
+    "build:contracts": "pnpm --filter voting-script build",
+    "deploy": "node scripts/deploy.ts",
+    "test:contracts": "pnpm --filter voting-script test",
+    "dev:frontend": "pnpm --filter frontend dev"
+  },
+  "dependencies": {
+    "@ckb-js-std/bindings": "^1.0.0",
+    "@ckb-js-std/core": "^1.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.2",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.9.3"
   }
+}

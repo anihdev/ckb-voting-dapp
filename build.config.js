@@ -15,7 +15,7 @@ const esbuild = require('esbuild');
     // Compile to RISC-V bytecode
     execSync('ckb-js-vm compile dist/voting-script.js -o dist/voting-script.bc');
     
-    console.log('✅ Build complete!');
+    console.log('Build complete!');
   }
   
   build().catch(console.error);

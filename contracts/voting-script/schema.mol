@@ -1,0 +1,31 @@
+array Byte32 [byte; 32];
+  array Uint64 [byte; 8];
+  array Uint32 [byte; 4];
+  vector Bytes <byte>;
+  
+  struct PollData {
+      poll_id: Byte32,
+      question: Bytes,
+      created_at: Uint64,
+      deadline: Uint64,
+      status: byte,
+      yes_count: Uint32,
+      no_count: Uint32,
+      creator: Bytes,
+      version: Uint32,
+  }
+  
+  struct VoteData {
+      poll_id: Byte32,
+      voter: Bytes,
+      vote: byte,
+      timestamp: Uint64,
+      version: Uint32,
+  }
+
+
+   const inputPoll = parsePollData(inputPollData);
+    const outputPoll = parsePollData(outputPollData);
+
+     const inputPoll = parsePollData(inputPollData);
+    const outputPoll = parsePollData(outputPollData);
