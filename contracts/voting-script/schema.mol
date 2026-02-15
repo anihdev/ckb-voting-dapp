@@ -22,10 +22,3 @@ array Byte32 [byte; 32];
       timestamp: Uint64,
       version: Uint32,
   }
-
-
-   const inputPoll = parsePollData(inputPollData);
-    const outputPoll = parsePollData(outputPollData);
-
-     const inputPoll = parsePollData(inputPollData);
-    const outputPoll = parsePollData(outputPollData);
