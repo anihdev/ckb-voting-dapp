@@ -1,11 +1,6 @@
 import { HighLevel } from "@ckb-js-std/core";
 import { PollData, VoteData } from "./types";
 
-
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
 /**
  * Parse poll data from Molecule-encoded bytes
  * 
