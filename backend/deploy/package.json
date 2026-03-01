@@ -1,0 +1,16 @@
+{
+  "name": "ckb-voting-deploy",
+  "version": "1.0.0",
+  "scripts": {
+    "deploy": "ts-node deploy/deploy.ts",
+    "build-contract": "cd ../contract && npm install && npm run build"
+  },
+  "dependencies": {
+    "@ckb-ccc/core": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0"
+  }
+}
