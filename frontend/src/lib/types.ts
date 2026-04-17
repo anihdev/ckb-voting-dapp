@@ -1,42 +1,90 @@
 /**
- * Frontend Types
- * ==============
- * File: frontend/src/lib/types.ts
+ * Frontend Governance Types
+ * =========================
+ * Shared UI-facing types derived from the contract's poll, intent, and
+ * delegation cell layouts.
  */
 
+export interface CellRef {
+  txHash: string;
+  index: number;
+}
+
 export interface Poll {
-  // Derived / display fields
-  id: string;           // type script hash of the poll cell (unique identifier)
-  outPoint: {           // current out_point of the poll cell (changes each vote)
-    txHash: string;
-    index: number;
-  };
-
-  // On-chain data (decoded from cell data via molecule)
-  question:     string;
-  options:      string[];
-  voteCounts:   bigint[];
-  deadline:     bigint;  // epoch number
-  creator:      string;  // 0x-prefixed hex (32 bytes = lock script hash)
-  isClosed:     boolean;
-  totalVoters:  bigint;
-
-  // Computed
-  totalVotes:   bigint;
-  winnerIndex:  number | null;  // index with most votes, null if tied or 0 votes
+  id: string;
+  outPoint: CellRef;
+  question: string;
+  options: string[];
+  voteCounts: bigint[];
+  deadline: bigint;
+  creator: string;
+  isClosed: boolean;
+  totalVoters: bigint;
+  creatorDeposit: bigint;
+  pendingIntentCount: bigint;
+  tokenWeighted: boolean;
+  udtTypeHash: string;
+  totalVotes: bigint;
+  winnerIndex: number | null;
+  authorityOptions: VoteAuthorityOption[];
+  outstandingIntentCount: number;
 }
 
-export interface VoteReceipt {
-  pollId:       string;
-  voterAddress: string;
-  optionIndex:  number;
-  epochCast:    bigint;
+export interface VoteIntent {
+  id: string;
+  pollId: string;
+  outPoint: CellRef;
+  voterLockHash: string;
+  optionIndex: number;
+  votedAtEpoch: bigint;
+  aggregated: boolean;
+  capacity: bigint;
 }
 
-export type TxStatus = "idle" | "building" | "signing" | "sending" | "confirming" | "success" | "error";
+export interface VoteAuthorityOption {
+  id: string;
+  mode: "self" | "delegation";
+  label: string;
+  voterLockHash: string;
+  delegationId: string | null;
+  hasIntent: boolean;
+  hasPendingIntent: boolean;
+  hasAggregatedIntent: boolean;
+}
+
+export interface DelegationRecord {
+  id: string;
+  outPoint: CellRef;
+  delegatorLockHash: string;
+  delegateLockHash: string;
+  pollId: string | null;
+  expiresEpoch: bigint;
+  capacity: bigint;
+}
+
+export interface DelegateParams {
+  delegateLockHash: string;
+  pollId?: string;
+  expiresEpoch?: bigint;
+}
+
+export type TxStatus =
+  | "idle"
+  | "building"
+  | "signing"
+  | "sending"
+  | "confirming"
+  | "success"
+  | "error";
 
 export interface TxState {
-  status:  TxStatus;
-  txHash:  string | null;
-  error:   string | null;
+  status: TxStatus;
+  txHash: string | null;
+  error: string | null;
+}
+
+export interface SeedPollConfig {
+  question: string;
+  options: string[];
+  durationEpochs: number;
 }

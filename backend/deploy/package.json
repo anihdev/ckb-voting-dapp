@@ -2,8 +2,9 @@
   "name": "ckb-voting-deploy",
   "version": "1.0.0",
   "scripts": {
-    "deploy": "ts-node deploy/deploy.ts",
-    "build-contract": "cd ../contract && npm install && npm run build"
+    "deploy": "ts-node -P tsconfig.json deploy.ts",
+    "seed": "ts-node -P tsconfig.json seed.ts",
+    "build-contract": "cd ../contract && pnpm build"
   },
   "dependencies": {
     "@ckb-ccc/core": "^1.0.0"

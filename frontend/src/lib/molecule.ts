@@ -1,141 +1,346 @@
 /**
  * Frontend Molecule Codec
  * =======================
- * Mirrors backend/contract/src/molecule.ts exactly.
- * Used to encode TX data before sending and decode cell data when querying.
- *
- * File: frontend/src/lib/molecule.ts
+ * Mirrors the backend contract codec so frontend builders and indexers
+ * serialize exactly the same poll, intent, and delegation layouts.
  */
 
 export interface PollData {
-  question:     string;
-  options:      string[];
-  vote_counts:  bigint[];
-  deadline:     bigint;
-  creator:      Uint8Array; // 32 bytes
-  is_closed:    boolean;
+  question: string;
+  options: string[];
+  vote_counts: bigint[];
+  deadline: bigint;
+  creator: Uint8Array;
+  is_closed: boolean;
   total_voters: bigint;
+  creator_deposit: bigint;
+  pending_intent_count: bigint;
+  counted_voter_lock_hashes: Uint8Array[];
+  token_weighted: boolean;
+  udt_type_hash: Uint8Array;
 }
 
-export interface VoteData {
-  poll_type_hash:  Uint8Array; // 32 bytes
-  voter_lock_hash: Uint8Array; // 32 bytes
-  option_index:    number;
-  voted_at_epoch:  bigint;
+export interface VoteIntentData {
+  poll_type_hash: Uint8Array;
+  voter_lock_hash: Uint8Array;
+  option_index: number;
+  voted_at_epoch: bigint;
+  aggregated: boolean;
+  refund_lock: EncodedScript;
 }
 
-// ─── Primitives ───────────────────────────────────────────────────────────────
-
-function encodeUint32(n: number): Uint8Array {
-  const b = new Uint8Array(4);
-  b[0] = n & 0xff;  b[1] = (n >> 8) & 0xff;
-  b[2] = (n >> 16) & 0xff;  b[3] = (n >> 24) & 0xff;
-  return b;
-}
-function decodeUint32(b: Uint8Array, o = 0): number {
-  return b[o] | (b[o+1]<<8) | (b[o+2]<<16) | (b[o+3]<<24);
-}
-function encodeUint64(n: bigint): Uint8Array {
-  const b = new Uint8Array(8);
-  let v = n;
-  for (let i = 0; i < 8; i++) { b[i] = Number(v & 0xffn); v >>= 8n; }
-  return b;
-}
-function decodeUint64(b: Uint8Array, o = 0): bigint {
-  let r = 0n;
-  for (let i = 7; i >= 0; i--) r = (r << 8n) | BigInt(b[o + i]);
-  return r;
-}
-function encodeStr(s: string): Uint8Array {
-  const bytes = new TextEncoder().encode(s);
-  const out = new Uint8Array(4 + bytes.length);
-  out.set(encodeUint32(bytes.length), 0);
-  out.set(bytes, 4);
-  return out;
-}
-function decodeStr(b: Uint8Array, o: number): [string, number] {
-  const len = decodeUint32(b, o);
-  return [new TextDecoder().decode(b.slice(o+4, o+4+len)), o+4+len];
-}
-function encodeStrVec(arr: string[]): Uint8Array {
-  return concat([encodeUint32(arr.length), ...arr.map(encodeStr)]);
-}
-function decodeStrVec(b: Uint8Array, o: number): [string[], number] {
-  const count = decodeUint32(b, o); o += 4;
-  const res: string[] = [];
-  for (let i = 0; i < count; i++) { const [s, n] = decodeStr(b, o); res.push(s); o = n; }
-  return [res, o];
-}
-function encodeU64Vec(arr: bigint[]): Uint8Array {
-  return concat([encodeUint32(arr.length), ...arr.map(encodeUint64)]);
-}
-function decodeU64Vec(b: Uint8Array, o: number): [bigint[], number] {
-  const count = decodeUint32(b, o); o += 4;
-  const res: bigint[] = [];
-  for (let i = 0; i < count; i++) { res.push(decodeUint64(b, o)); o += 8; }
-  return [res, o];
-}
-function concat(arrays: Uint8Array[]): Uint8Array {
-  const total = arrays.reduce((s, a) => s + a.length, 0);
-  const out = new Uint8Array(total);
-  let pos = 0;
-  for (const a of arrays) { out.set(a, pos); pos += a.length; }
-  return out;
+export interface DelegationData {
+  delegator_lock_hash: Uint8Array;
+  delegate_lock_hash: Uint8Array;
+  poll_type_hash: Uint8Array;
+  expires_epoch: bigint;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+export interface EncodedScript {
+  code_hash: string;
+  hash_type: "type" | "data" | "data1" | "data2";
+  args: string;
+}
 
-export function encodePollData(p: PollData): Uint8Array {
+function assertCodec(condition: boolean, message: string): void {
+  if (!condition) throw new Error(message);
+}
+
+function encodeUint32(value: number): Uint8Array {
+  const bytes = new Uint8Array(4);
+  bytes[0] = value & 0xff;
+  bytes[1] = (value >> 8) & 0xff;
+  bytes[2] = (value >> 16) & 0xff;
+  bytes[3] = (value >> 24) & 0xff;
+  return bytes;
+}
+
+function decodeUint32(bytes: Uint8Array, offset = 0): number {
+  return bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24);
+}
+
+function encodeUint64(value: bigint): Uint8Array {
+  const bytes = new Uint8Array(8);
+  let current = value;
+  for (let index = 0; index < 8; index += 1) {
+    bytes[index] = Number(current & 0xffn);
+    current >>= 8n;
+  }
+  return bytes;
+}
+
+function decodeUint64(bytes: Uint8Array, offset = 0): bigint {
+  let result = 0n;
+  for (let index = 7; index >= 0; index -= 1) {
+    result = (result << 8n) | BigInt(bytes[offset + index]);
+  }
+  return result;
+}
+
+function encodeString(value: string): Uint8Array {
+  const textBytes = new TextEncoder().encode(value);
+  const output = new Uint8Array(4 + textBytes.length);
+  output.set(encodeUint32(textBytes.length), 0);
+  output.set(textBytes, 4);
+  return output;
+}
+
+function decodeString(bytes: Uint8Array, offset: number): [string, number] {
+  const length = decodeUint32(bytes, offset);
+  return [new TextDecoder().decode(bytes.slice(offset + 4, offset + 4 + length)), offset + 4 + length];
+}
+
+function encodeStringVec(values: string[]): Uint8Array {
+  return concat([encodeUint32(values.length), ...values.map(encodeString)]);
+}
+
+function decodeStringVec(bytes: Uint8Array, offset: number): [string[], number] {
+  const count = decodeUint32(bytes, offset);
+  let currentOffset = offset + 4;
+  const values: string[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const [value, nextOffset] = decodeString(bytes, currentOffset);
+    values.push(value);
+    currentOffset = nextOffset;
+  }
+
+  return [values, currentOffset];
+}
+
+function encodeUint64Vec(values: bigint[]): Uint8Array {
+  return concat([encodeUint32(values.length), ...values.map(encodeUint64)]);
+}
+
+function decodeUint64Vec(bytes: Uint8Array, offset: number): [bigint[], number] {
+  const count = decodeUint32(bytes, offset);
+  let currentOffset = offset + 4;
+  const values: bigint[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    values.push(decodeUint64(bytes, currentOffset));
+    currentOffset += 8;
+  }
+
+  return [values, currentOffset];
+}
+
+function encodeBytes32Vec(values: Uint8Array[]): Uint8Array {
+  for (const value of values) {
+    assertCodec(value.length === 32, "counted voter lock hash must be 32 bytes");
+  }
+
+  return concat([encodeUint32(values.length), ...values]);
+}
+
+function decodeBytes32Vec(bytes: Uint8Array, offset: number): [Uint8Array[], number] {
+  const count = decodeUint32(bytes, offset);
+  let currentOffset = offset + 4;
+  const values: Uint8Array[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    values.push(bytes.slice(currentOffset, currentOffset + 32));
+    currentOffset += 32;
+  }
+
+  return [values, currentOffset];
+}
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  return output;
+}
+
+function encodeBytes(bytes: Uint8Array): Uint8Array {
+  return concat([encodeUint32(bytes.length), bytes]);
+}
+
+function decodeBytes(bytes: Uint8Array, offset: number): [Uint8Array, number] {
+  const length = decodeUint32(bytes, offset);
+  return [bytes.slice(offset + 4, offset + 4 + length), offset + 4 + length];
+}
+
+function hashTypeToByte(hashType: EncodedScript["hash_type"]): number {
+  switch (hashType) {
+    case "data": return 0;
+    case "type": return 1;
+    case "data1": return 2;
+    case "data2": return 4;
+  }
+}
+
+function byteToHashType(value: number): EncodedScript["hash_type"] {
+  switch (value) {
+    case 0: return "data";
+    case 1: return "type";
+    case 2: return "data1";
+    case 4: return "data2";
+    default: throw new Error(`Unknown hash_type byte: ${value}`);
+  }
+}
+
+function encodeScript(script: EncodedScript): Uint8Array {
+  const codeHashBytes = hexToBytes(script.code_hash);
+  assertCodec(codeHashBytes.length === 32, "script.code_hash must be 32 bytes");
   return concat([
-    encodeStr(p.question),
-    encodeStrVec(p.options),
-    encodeU64Vec(p.vote_counts),
-    encodeUint64(p.deadline),
-    p.creator,
-    new Uint8Array([p.is_closed ? 1 : 0]),
-    encodeUint64(p.total_voters),
+    codeHashBytes,
+    new Uint8Array([hashTypeToByte(script.hash_type)]),
+    encodeBytes(hexToBytes(script.args)),
   ]);
 }
 
-export function decodePollData(buf: Uint8Array): PollData {
-  let o = 0;
-  const [question, o1] = decodeStr(buf, o); o = o1;
-  const [options, o2]  = decodeStrVec(buf, o); o = o2;
-  const [vote_counts, o3] = decodeU64Vec(buf, o); o = o3;
-  const deadline    = decodeUint64(buf, o); o += 8;
-  const creator     = buf.slice(o, o+32); o += 32;
-  const is_closed   = buf[o] === 1; o += 1;
-  const total_voters = decodeUint64(buf, o);
-  return { question, options, vote_counts, deadline, creator, is_closed, total_voters };
+function decodeScript(bytes: Uint8Array, offset: number): [EncodedScript, number] {
+  const code_hash = bytesToHex(bytes.slice(offset, offset + 32));
+  offset += 32;
+  const hash_type = byteToHashType(bytes[offset]);
+  offset += 1;
+  const [argsBytes, nextOffset] = decodeBytes(bytes, offset);
+  return [{ code_hash, hash_type, args: bytesToHex(argsBytes) }, nextOffset];
 }
 
-export function encodeVoteData(v: VoteData): Uint8Array {
+export function encodePollData(poll: PollData): Uint8Array {
+  assertCodec(poll.creator.length === 32, "creator must be 32 bytes");
+  assertCodec(poll.udt_type_hash.length === 32, "udt_type_hash must be 32 bytes");
+
   return concat([
-    v.poll_type_hash,
-    v.voter_lock_hash,
-    new Uint8Array([v.option_index]),
-    encodeUint64(v.voted_at_epoch),
+    encodeString(poll.question),
+    encodeStringVec(poll.options),
+    encodeUint64Vec(poll.vote_counts),
+    encodeUint64(poll.deadline),
+    poll.creator,
+    new Uint8Array([poll.is_closed ? 1 : 0]),
+    encodeUint64(poll.total_voters),
+    encodeUint64(poll.creator_deposit),
+    encodeUint64(poll.pending_intent_count),
+    encodeBytes32Vec(poll.counted_voter_lock_hashes),
+    new Uint8Array([poll.token_weighted ? 1 : 0]),
+    poll.udt_type_hash,
   ]);
 }
 
-export function decodeVoteData(buf: Uint8Array): VoteData {
-  let o = 0;
-  const poll_type_hash  = buf.slice(o, o+32); o += 32;
-  const voter_lock_hash = buf.slice(o, o+32); o += 32;
-  const option_index    = buf[o]; o += 1;
-  const voted_at_epoch  = decodeUint64(buf, o);
-  return { poll_type_hash, voter_lock_hash, option_index, voted_at_epoch };
+export function decodePollData(bytes: Uint8Array): PollData {
+  let offset = 0;
+  const [question, nextQuestionOffset] = decodeString(bytes, offset);
+  offset = nextQuestionOffset;
+  const [options, nextOptionsOffset] = decodeStringVec(bytes, offset);
+  offset = nextOptionsOffset;
+  const [vote_counts, nextCountsOffset] = decodeUint64Vec(bytes, offset);
+  offset = nextCountsOffset;
+
+  const deadline = decodeUint64(bytes, offset);
+  offset += 8;
+  const creator = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const is_closed = bytes[offset] === 1;
+  offset += 1;
+  const total_voters = decodeUint64(bytes, offset);
+  offset += 8;
+  const creator_deposit = decodeUint64(bytes, offset);
+  offset += 8;
+  const pending_intent_count = decodeUint64(bytes, offset);
+  offset += 8;
+  const [counted_voter_lock_hashes, nextRegistryOffset] = decodeBytes32Vec(bytes, offset);
+  offset = nextRegistryOffset;
+  const token_weighted = bytes[offset] === 1;
+  offset += 1;
+  const udt_type_hash = bytes.slice(offset, offset + 32);
+
+  return {
+    question,
+    options,
+    vote_counts,
+    deadline,
+    creator,
+    is_closed,
+    total_voters,
+    creator_deposit,
+    pending_intent_count,
+    counted_voter_lock_hashes,
+    token_weighted,
+    udt_type_hash,
+  };
 }
 
-// ─── Convenience ─────────────────────────────────────────────────────────────
+export function encodeVoteIntentData(intent: VoteIntentData): Uint8Array {
+  assertCodec(intent.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+  assertCodec(intent.voter_lock_hash.length === 32, "voter_lock_hash must be 32 bytes");
+
+  return concat([
+    intent.poll_type_hash,
+    intent.voter_lock_hash,
+    new Uint8Array([intent.option_index]),
+    encodeUint64(intent.voted_at_epoch),
+    new Uint8Array([intent.aggregated ? 1 : 0]),
+    encodeScript(intent.refund_lock),
+  ]);
+}
+
+export function decodeVoteIntentData(bytes: Uint8Array): VoteIntentData {
+  assertCodec(bytes.length >= 74, `VoteIntentData too short: ${bytes.length}`);
+
+  let offset = 0;
+  const poll_type_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const voter_lock_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const option_index = bytes[offset];
+  offset += 1;
+  const voted_at_epoch = decodeUint64(bytes, offset);
+  offset += 8;
+  const aggregated = bytes[offset] === 1;
+  offset += 1;
+  const [refund_lock] = decodeScript(bytes, offset);
+
+  return { poll_type_hash, voter_lock_hash, option_index, voted_at_epoch, aggregated, refund_lock };
+}
+
+export function encodeDelegationData(delegation: DelegationData): Uint8Array {
+  assertCodec(delegation.delegator_lock_hash.length === 32, "delegator_lock_hash must be 32 bytes");
+  assertCodec(delegation.delegate_lock_hash.length === 32, "delegate_lock_hash must be 32 bytes");
+  assertCodec(delegation.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+
+  return concat([
+    delegation.delegator_lock_hash,
+    delegation.delegate_lock_hash,
+    delegation.poll_type_hash,
+    encodeUint64(delegation.expires_epoch),
+  ]);
+}
+
+export function decodeDelegationData(bytes: Uint8Array): DelegationData {
+  assertCodec(bytes.length >= 104, `DelegationData too short: ${bytes.length}`);
+
+  let offset = 0;
+  const delegator_lock_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const delegate_lock_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const poll_type_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const expires_epoch = decodeUint64(bytes, offset);
+
+  return { delegator_lock_hash, delegate_lock_hash, poll_type_hash, expires_epoch };
+}
 
 export function hexToBytes(hex: string): Uint8Array {
-  const h = hex.startsWith("0x") ? hex.slice(2) : hex;
-  const b = new Uint8Array(h.length / 2);
-  for (let i = 0; i < h.length; i += 2) b[i/2] = parseInt(h.slice(i, i+2), 16);
-  return b;
+  const normalized = hex.startsWith("0x") ? hex.slice(2) : hex;
+  const output = new Uint8Array(normalized.length / 2);
+
+  for (let index = 0; index < normalized.length; index += 2) {
+    output[index / 2] = parseInt(normalized.slice(index, index + 2), 16);
+  }
+
+  return output;
 }
 
-export function bytesToHex(b: Uint8Array): string {
-  return "0x" + Array.from(b).map(x => x.toString(16).padStart(2, "0")).join("");
+export function bytesToHex(bytes: Uint8Array): string {
+  return `0x${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }

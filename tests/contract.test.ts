@@ -1,187 +1,215 @@
-// /**
-//  * Contract Unit Tests
-//  * ====================
-//  * Tests the voting script logic in Node.js by injecting a mock TX_CONTEXT.
-//  * The contract reads TX_CONTEXT instead of CKB syscalls when not in CKB-VM.
-//  *
-//  * File: tests/contract.test.ts
-//  * Run:  cd backend/contract && npm test
-//  *      OR: npx jest tests/contract.test.ts (from project root)
-//  */
+/**
+ * Protocol Model Tests
+ * ====================
+ * Exercises the current poll, vote intent, aggregation, and delegation data
+ * model without requiring a full CKB-VM syscall harness.
+ */
 
-// import { encodePollData, decodePollData, encodeVoteData, PollData } from "../backend/contract/src/molecule";
-// import { hexToBytes, bytesToHex } from "../backend/contract/src/utils";
+declare const describe: (name: string, fn: () => void) => void;
+declare const test: (name: string, fn: () => void) => void;
+declare const expect: (value: unknown) => any;
 
-// // ─── Test helpers ─────────────────────────────────────────────────────────────
+import {
+  decodeDelegationData,
+  decodePollData,
+  decodeVoteIntentData,
+  EncodedScript,
+  encodeDelegationData,
+  encodePollData,
+  encodeVoteIntentData,
+  PollData,
+  VoteIntentData,
+} from "../backend/contract/src/molecule";
 
-// function makeCreator(): Uint8Array {
-//   return new Uint8Array(32).fill(0xab);
-// }
+const CREATOR_DEPOSIT_SHANNONS = 500n * 100_000_000n;
 
-// function makePoll(overrides: Partial<PollData> = {}): PollData {
-//   return {
-//     question:    "What is your favourite chain?",
-//     options:     ["CKB", "Ethereum", "Solana"],
-//     vote_counts: [0n, 0n, 0n],
-//     deadline:    200n,
-//     creator:     makeCreator(),
-//     is_closed:   false,
-//     total_voters: 0n,
-//     ...overrides,
-//   };
-// }
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
 
-// // ─── Molecule encoding tests ───────────────────────────────────────────────────
+function makeScript(overrides: Partial<EncodedScript> = {}): EncodedScript {
+  return {
+    code_hash: `0x${"44".repeat(32)}`,
+    hash_type: "type",
+    args: "0x9988",
+    ...overrides,
+  };
+}
 
-// describe("PollData molecule encoding", () => {
-//   test("round-trips basic poll", () => {
-//     const poll = makePoll();
-//     const encoded = encodePollData(poll);
-//     const decoded = decodePollData(encoded);
+function makePoll(overrides: Partial<PollData> = {}): PollData {
+  return {
+    question: "Should the protocol adopt token-weighted voting later?",
+    options: ["Yes", "No", "Need research"],
+    vote_counts: [0n, 0n, 0n],
+    deadline: 200n,
+    creator: new Uint8Array(32).fill(0xab),
+    is_closed: false,
+    total_voters: 0n,
+    creator_deposit: CREATOR_DEPOSIT_SHANNONS,
+    pending_intent_count: 0n,
+    counted_voter_lock_hashes: [],
+    token_weighted: false,
+    udt_type_hash: new Uint8Array(32),
+    ...overrides,
+  };
+}
 
-//     expect(decoded.question).toBe(poll.question);
-//     expect(decoded.options).toEqual(poll.options);
-//     expect(decoded.vote_counts).toEqual(poll.vote_counts);
-//     expect(decoded.deadline).toBe(poll.deadline);
-//     expect(decoded.is_closed).toBe(poll.is_closed);
-//     expect(decoded.total_voters).toBe(poll.total_voters);
-//     expect(bytesToHex(decoded.creator)).toBe(bytesToHex(poll.creator));
-//   });
+function makeIntent(overrides: Partial<VoteIntentData> = {}): VoteIntentData {
+  return {
+    poll_type_hash: new Uint8Array(32).fill(0x31),
+    voter_lock_hash: new Uint8Array(32).fill(0x32),
+    option_index: 0,
+    voted_at_epoch: 120n,
+    aggregated: false,
+    refund_lock: makeScript(),
+    ...overrides,
+  };
+}
 
-//   test("round-trips poll with votes", () => {
-//     const poll = makePoll({ vote_counts: [5n, 2n, 100n], total_voters: 107n });
-//     const decoded = decodePollData(encodePollData(poll));
-//     expect(decoded.vote_counts).toEqual([5n, 2n, 100n]);
-//     expect(decoded.total_voters).toBe(107n);
-//   });
+describe("PollData encoding", () => {
+  test("round-trips the v3 poll layout", () => {
+    const poll = makePoll({
+      vote_counts: [5n, 2n, 1n],
+      total_voters: 8n,
+      pending_intent_count: 3n,
+      counted_voter_lock_hashes: [
+        new Uint8Array(32).fill(0x01),
+        new Uint8Array(32).fill(0x02),
+        new Uint8Array(32).fill(0x03),
+        new Uint8Array(32).fill(0x04),
+        new Uint8Array(32).fill(0x05),
+        new Uint8Array(32).fill(0x06),
+        new Uint8Array(32).fill(0x07),
+        new Uint8Array(32).fill(0x08),
+      ],
+    });
+    const decoded = decodePollData(encodePollData(poll));
 
-//   test("round-trips closed poll", () => {
-//     const poll = makePoll({ is_closed: true });
-//     const decoded = decodePollData(encodePollData(poll));
-//     expect(decoded.is_closed).toBe(true);
-//   });
+    expect(decoded).toEqual(poll);
+  });
 
-//   test("handles unicode question", () => {
-//     const poll = makePoll({ question: "¿Cuál es tu cadena favorita? 🔗" });
-//     const decoded = decodePollData(encodePollData(poll));
-//     expect(decoded.question).toBe(poll.question);
-//   });
+  test("supports token-weighted future fields without changing layout", () => {
+    const poll = makePoll({
+      token_weighted: true,
+      udt_type_hash: new Uint8Array(32).fill(0xcd),
+    });
+    const decoded = decodePollData(encodePollData(poll));
 
-//   test("handles 10 options", () => {
-//     const options = Array.from({ length: 10 }, (_, i) => `Option ${i + 1}`);
-//     const poll = makePoll({ options, vote_counts: new Array(10).fill(0n) });
-//     const decoded = decodePollData(encodePollData(poll));
-//     expect(decoded.options.length).toBe(10);
-//     expect(decoded.options[9]).toBe("Option 10");
-//   });
+    expect(decoded.token_weighted).toBe(true);
+    expect(decoded.udt_type_hash).toEqual(poll.udt_type_hash);
+  });
+});
 
-//   test("encodes deadline correctly", () => {
-//     const poll = makePoll({ deadline: 9999999n });
-//     const decoded = decodePollData(encodePollData(poll));
-//     expect(decoded.deadline).toBe(9999999n);
-//   });
-// });
+describe("VoteIntentData encoding", () => {
+  test("round-trips intent cells with embedded refund locks", () => {
+    const intent = makeIntent({ option_index: 2 });
+    const encoded = encodeVoteIntentData(intent);
+    const decoded = decodeVoteIntentData(encoded);
 
-// // ─── VoteData molecule tests ───────────────────────────────────────────────────
+    expect(encoded.length).toBeGreaterThan(74);
+    expect(decoded).toEqual(intent);
+  });
 
-// describe("VoteData molecule encoding", () => {
-//   test("round-trips vote data", () => {
-//     const vote = {
-//       poll_type_hash:  new Uint8Array(32).fill(0x11),
-//       voter_lock_hash: new Uint8Array(32).fill(0x22),
-//       option_index:    2,
-//       voted_at_epoch:  150n,
-//     };
-//     const encoded = encodeVoteData(vote);
-//     expect(encoded.length).toBe(32 + 32 + 1 + 8); // 73 bytes
+  test("preserves aggregated status after batching", () => {
+    const decoded = decodeVoteIntentData(encodeVoteIntentData(makeIntent({ aggregated: true })));
+    expect(decoded.aggregated).toBe(true);
+  });
+});
 
-//     // We can import decodeVoteData too if needed
-//     // For now just check size
-//     expect(encoded[64]).toBe(2); // option_index at byte 64
-//   });
-// });
+describe("DelegationData encoding", () => {
+  test("round-trips scoped delegations", () => {
+    const delegation = {
+      delegator_lock_hash: new Uint8Array(32).fill(0x41),
+      delegate_lock_hash: new Uint8Array(32).fill(0x42),
+      poll_type_hash: new Uint8Array(32).fill(0x43),
+      expires_epoch: 300n,
+    };
 
-// // ─── Contract logic simulation ────────────────────────────────────────────────
-// // These tests simulate what the contract validates by running the same
-// // assertions against encoded data without the full VM harness.
+    expect(decodeDelegationData(encodeDelegationData(delegation))).toEqual(delegation);
+  });
+});
 
-// describe("Poll validation rules", () => {
-//   test("rejects poll with 0 options", () => {
-//     const poll = makePoll({ options: [], vote_counts: [] });
-//     const encoded = encodePollData(poll);
-//     const decoded = decodePollData(encoded);
-//     expect(decoded.options.length).toBeLessThan(2);
-//     // Contract would reject: "Poll must have at least 2 options"
-//   });
+describe("Aggregation model", () => {
+  test("increments vote counts and total voters by processed intents", () => {
+    const before = makePoll({
+      vote_counts: [3n, 1n, 0n],
+      total_voters: 4n,
+      pending_intent_count: 2n,
+      counted_voter_lock_hashes: [
+        new Uint8Array(32).fill(0x91),
+        new Uint8Array(32).fill(0x92),
+        new Uint8Array(32).fill(0x93),
+        new Uint8Array(32).fill(0x94),
+      ],
+    });
+    const intents = [makeIntent({ option_index: 0 }), makeIntent({ option_index: 2 })];
+    const nextCounts = [...before.vote_counts];
 
-//   test("rejects poll where vote_counts.length != options.length", () => {
-//     // Directly test the shape invariant
-//     const poll = makePoll({ options: ["A", "B"], vote_counts: [0n] });
-//     // Encoding itself succeeds, but contract checks this
-//     const encoded = encodePollData(poll);
-//     const decoded = decodePollData(encoded);
-//     expect(decoded.vote_counts.length).not.toBe(decoded.options.length);
-//   });
+    for (const intent of intents) {
+      nextCounts[intent.option_index] += 1n;
+    }
 
-//   test("state transition: cast_vote increments correct count", () => {
-//     const before = makePoll({ vote_counts: [3n, 1n, 7n], total_voters: 11n });
-//     const optionIndex = 1; // voting for index 1
+    const after = {
+      ...before,
+      vote_counts: nextCounts,
+      total_voters: before.total_voters + BigInt(intents.length),
+      pending_intent_count: 0n,
+      counted_voter_lock_hashes: [
+        ...before.counted_voter_lock_hashes,
+        ...intents.map((intent) => intent.voter_lock_hash),
+      ],
+    };
 
-//     // Simulate what the contract validates:
-//     const newCounts = [...before.vote_counts];
-//     newCounts[optionIndex] += 1n;
-//     const after: PollData = {
-//       ...before,
-//       vote_counts:  newCounts,
-//       total_voters: before.total_voters + 1n,
-//     };
+    expect(after.vote_counts).toEqual([4n, 1n, 1n]);
+    expect(after.total_voters).toBe(6n);
+    expect(after.pending_intent_count).toBe(0n);
+    expect(after.counted_voter_lock_hashes).toHaveLength(6);
+  });
 
-//     // Assertions the contract makes:
-//     expect(after.vote_counts[0]).toBe(3n); // unchanged
-//     expect(after.vote_counts[1]).toBe(2n); // incremented
-//     expect(after.vote_counts[2]).toBe(7n); // unchanged
-//     expect(after.total_voters).toBe(12n);
-//     expect(after.question).toBe(before.question);
-//     expect(after.deadline).toBe(before.deadline);
-//   });
+  test("registry-based uniqueness rejects double-counting the same voter", () => {
+    const before = makePoll({
+      total_voters: 1n,
+      counted_voter_lock_hashes: [new Uint8Array(32).fill(0x32)],
+    });
+    const duplicateIntent = makeIntent({ voter_lock_hash: new Uint8Array(32).fill(0x32) });
 
-//   test("state transition: close_poll flips is_closed only", () => {
-//     const before = makePoll({ vote_counts: [5n, 3n], total_voters: 8n });
-//     const after: PollData = { ...before, is_closed: true };
+    const alreadyCounted = before.counted_voter_lock_hashes.some(
+      (entry) => equalBytes(entry, duplicateIntent.voter_lock_hash)
+    );
 
-//     // Assertions the contract makes:
-//     expect(after.is_closed).toBe(true);
-//     expect(after.question).toBe(before.question);
-//     expect(after.total_voters).toBe(before.total_voters);
-//     expect(after.vote_counts).toEqual(before.vote_counts);
-//   });
+    expect(alreadyCounted).toBe(true);
+  });
 
-//   test("capacity calculation: 100 bytes data + 130 bytes overhead = 230 CKB minimum", () => {
-//     const dataLen = 100;
-//     const lockBytes = 32 + 1 + 20; // typical secp256k1 lock
-//     const overhead = 8;
-//     const total = lockBytes + dataLen + overhead;
-//     const shannons = BigInt(total) * 100_000_000n;
-//     // 161 bytes * 1 CKByte/byte = 161 CKByte minimum
-//     expect(shannons).toBe(16100000000n);
-//   });
-// });
+  test("marks aggregated intents without changing voter identity", () => {
+    const pending = makeIntent({ option_index: 1, aggregated: false });
+    const aggregated = { ...pending, aggregated: true };
 
-// // ─── Hex utils ────────────────────────────────────────────────────────────────
+    expect(aggregated.voter_lock_hash).toEqual(pending.voter_lock_hash);
+    expect(aggregated.refund_lock).toEqual(pending.refund_lock);
+    expect(aggregated.option_index).toBe(pending.option_index);
+    expect(aggregated.aggregated).toBe(true);
+  });
+});
 
-// describe("hexToBytes / bytesToHex", () => {
-//   test("roundtrip", () => {
-//     const hex = "0xdeadbeef01020304";
-//     expect(bytesToHex(hexToBytes(hex))).toBe(hex);
-//   });
+describe("Close model", () => {
+  test("closing a poll only flips is_closed in the poll body", () => {
+    const before = makePoll({
+      vote_counts: [5n, 4n, 1n],
+      total_voters: 10n,
+      pending_intent_count: 0n,
+      counted_voter_lock_hashes: Array.from({ length: 10 }, (_, index) =>
+        new Uint8Array(32).fill(index + 1)
+      ),
+    });
+    const after = { ...before, is_closed: true };
 
-//   test("handles 0x prefix", () => {
-//     expect(hexToBytes("0xab").length).toBe(1);
-//     expect(hexToBytes("ab").length).toBe(1);
-//   });
-
-//   test("32-byte zero hash", () => {
-//     const zero = "0x" + "00".repeat(32);
-//     expect(hexToBytes(zero).length).toBe(32);
-//   });
-// });
+    expect(after.question).toBe(before.question);
+    expect(after.vote_counts).toEqual(before.vote_counts);
+    expect(after.total_voters).toBe(before.total_voters);
+    expect(after.is_closed).toBe(true);
+  });
+});

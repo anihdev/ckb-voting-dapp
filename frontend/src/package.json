@@ -2,11 +2,15 @@
   "name": "ckb-voting-frontend",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
-    "test": "vitest run ../tests/frontend.test.ts"
+    "test": "vitest run --root ../.. tests/molecule.test.ts"
   },
   "dependencies": {
     "@ckb-ccc/connector-react": "^1.0.0",

@@ -2,7 +2,7 @@
  * useCKB Hook
  * ===========
  * Provides wallet connection state and the CCC signer.
- * Must be wrapped in <CccProvider> (done in App.tsx).
+ * Must be wrapped in <Provider> from @ckb-ccc/connector-react.
  *
  * File: frontend/src/hooks/useCKB.ts
  * Usage:
@@ -11,7 +11,8 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { ccc } from "@ckb-ccc/core";
-import { useCcc } from "@ckb-ccc/connector-react";
+import { useCcc, useSigner } from "@ckb-ccc/connector-react";
+import { getSignerAddressObj } from "../lib/ckb";
 
 export interface CKBState {
   signer:      ccc.Signer | null;
@@ -26,7 +27,8 @@ export interface CKBState {
 }
 
 export function useCKB(): CKBState {
-  const { open, disconnect: cccDisconnect, signer } = useCcc();
+  const { open, disconnect: cccDisconnect } = useCcc();
+  const signer = useSigner() ?? null;
 
   const [address, setAddress]   = useState<string | null>(null);
   const [balance, setBalance]   = useState<bigint>(0n);
@@ -41,8 +43,7 @@ export function useCKB(): CKBState {
       return;
     }
     setLoading(true);
-    signer
-      .getAddressObjSecp256k1()
+    getSignerAddressObj(signer as any)
       .then((addr) => setAddress(addr.toString()))
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
@@ -52,7 +53,7 @@ export function useCKB(): CKBState {
     if (!signer) return;
     try {
       const client = signer.client;
-      const addr   = await signer.getAddressObjSecp256k1();
+      const addr   = await getSignerAddressObj(signer as any);
       const bal    = await client.getBalanceSingle(addr.script);
       setBalance(bal);
     } catch (e) {

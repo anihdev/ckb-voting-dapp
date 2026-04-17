@@ -1,162 +1,142 @@
-// /**
-//  * Frontend Molecule Tests
-//  * =======================
-//  * Tests that the frontend molecule codec produces identical bytes to the
-//  * backend codec. This ensures no encoding mismatch between what we send
-//  * and what the contract expects.
-//  *
-//  * File: tests/molecule.test.ts
-//  * Run:  cd frontend && npm test
-//  */
+/**
+ * Molecule Codec Tests
+ * ====================
+ * Verifies that backend and frontend serialize the same bytes for poll,
+ * vote intent, and delegation cells.
+ */
 
-// import { describe, test, expect } from "vitest";
-// import {
-//   encodePollData,
-//   decodePollData,
-//   encodeVoteData,
-//   decodeVoteData,
-//   hexToBytes,
-//   bytesToHex,
-//   PollData,
-//   VoteData,
-// } from "../frontend/src/lib/molecule";
+import { describe, expect, test } from "vitest";
+import {
+  decodeDelegationData as decodeBackendDelegationData,
+  decodePollData as decodeBackendPollData,
+  decodeVoteIntentData as decodeBackendVoteIntentData,
+  encodeDelegationData as encodeBackendDelegationData,
+  encodePollData as encodeBackendPollData,
+  encodeVoteIntentData as encodeBackendVoteIntentData,
+} from "../backend/contract/src/molecule";
+import {
+  bytesToHex,
+  decodeDelegationData,
+  decodePollData,
+  decodeVoteIntentData,
+  encodeDelegationData,
+  encodePollData,
+  encodeVoteIntentData,
+  hexToBytes,
+  EncodedScript,
+  PollData,
+  VoteIntentData,
+  DelegationData,
+} from "../frontend/src/lib/molecule";
 
-// function makePoll(overrides: Partial<PollData> = {}): PollData {
-//   return {
-//     question:    "Frontend test poll?",
-//     options:     ["Yes", "No", "Maybe"],
-//     vote_counts: [0n, 0n, 0n],
-//     deadline:    500n,
-//     creator:     new Uint8Array(32).fill(0xcc),
-//     is_closed:   false,
-//     total_voters: 0n,
-//     ...overrides,
-//   };
-// }
+function makeScript(overrides: Partial<EncodedScript> = {}): EncodedScript {
+  return {
+    code_hash: `0x${"13".repeat(32)}`,
+    hash_type: "type",
+    args: "0x1234",
+    ...overrides,
+  };
+}
 
-// describe("frontend/lib/molecule — PollData", () => {
-//   test("encodes and decodes correctly", () => {
-//     const poll = makePoll();
-//     const buf  = encodePollData(poll);
-//     const back = decodePollData(buf);
-//     expect(back.question).toBe(poll.question);
-//     expect(back.options).toEqual(poll.options);
-//     expect(back.vote_counts).toEqual(poll.vote_counts);
-//     expect(back.deadline).toBe(poll.deadline);
-//     expect(back.is_closed).toBe(false);
-//     expect(back.total_voters).toBe(0n);
-//     expect(bytesToHex(back.creator)).toBe(bytesToHex(poll.creator));
-//   });
+function makePoll(overrides: Partial<PollData> = {}): PollData {
+  return {
+    question: "Should Nervos governance use intent cells?",
+    options: ["Yes", "No", "Abstain"],
+    vote_counts: [10n, 2n, 1n],
+    deadline: 512n,
+    creator: new Uint8Array(32).fill(0x11),
+    is_closed: false,
+    total_voters: 13n,
+    creator_deposit: 500n * 100_000_000n,
+    pending_intent_count: 2n,
+    counted_voter_lock_hashes: Array.from({ length: 13 }, (_, index) =>
+      new Uint8Array(32).fill(index + 1)
+    ),
+    token_weighted: false,
+    udt_type_hash: new Uint8Array(32),
+    ...overrides,
+  };
+}
 
-//   test("encoded bytes are deterministic", () => {
-//     const poll = makePoll();
-//     const a = encodePollData(poll);
-//     const b = encodePollData(poll);
-//     expect(bytesToHex(a)).toBe(bytesToHex(b));
-//   });
+function makeIntent(overrides: Partial<VoteIntentData> = {}): VoteIntentData {
+  return {
+    poll_type_hash: new Uint8Array(32).fill(0xaa),
+    voter_lock_hash: new Uint8Array(32).fill(0xbb),
+    option_index: 1,
+    voted_at_epoch: 42n,
+    aggregated: false,
+    refund_lock: makeScript(),
+    ...overrides,
+  };
+}
 
-//   test("minimal poll (2 options)", () => {
-//     const poll = makePoll({ options: ["A", "B"], vote_counts: [0n, 0n] });
-//     const back = decodePollData(encodePollData(poll));
-//     expect(back.options.length).toBe(2);
-//   });
+function makeDelegation(overrides: Partial<DelegationData> = {}): DelegationData {
+  return {
+    delegator_lock_hash: new Uint8Array(32).fill(0x21),
+    delegate_lock_hash: new Uint8Array(32).fill(0x22),
+    poll_type_hash: new Uint8Array(32).fill(0x23),
+    expires_epoch: 999n,
+    ...overrides,
+  };
+}
 
-//   test("large vote counts survive encoding", () => {
-//     const poll = makePoll({
-//       vote_counts: [1_000_000n, 999_999n, 500_000n],
-//       total_voters: 2_499_999n,
-//     });
-//     const back = decodePollData(encodePollData(poll));
-//     expect(back.vote_counts[0]).toBe(1_000_000n);
-//     expect(back.total_voters).toBe(2_499_999n);
-//   });
+describe("poll codec parity", () => {
+  test("frontend and backend encode the same poll bytes", () => {
+    const poll = makePoll();
+    const frontend = encodePollData(poll);
+    const backend = encodeBackendPollData(poll as any);
 
-//   test("closed poll flag roundtrips", () => {
-//     const poll = makePoll({ is_closed: true });
-//     const back = decodePollData(encodePollData(poll));
-//     expect(back.is_closed).toBe(true);
-//   });
-// });
+    expect(bytesToHex(frontend)).toBe(bytesToHex(backend));
+    expect(decodePollData(frontend)).toEqual(poll);
+    expect(decodeBackendPollData(backend)).toEqual(poll);
+  });
 
-// describe("frontend/lib/molecule — VoteData", () => {
-//   const sampleVote: VoteData = {
-//     poll_type_hash:  new Uint8Array(32).fill(0xaa),
-//     voter_lock_hash: new Uint8Array(32).fill(0xbb),
-//     option_index:    1,
-//     voted_at_epoch:  42n,
-//   };
+  test("question length is still written as little-endian uint32", () => {
+    const encoded = encodePollData(makePoll({ question: "Hello" }));
+    expect(Array.from(encoded.slice(0, 4))).toEqual([5, 0, 0, 0]);
+  });
+});
 
-//   test("encodes to exactly 73 bytes", () => {
-//     const buf = encodeVoteData(sampleVote);
-//     expect(buf.length).toBe(73); // 32 + 32 + 1 + 8
-//   });
+describe("vote intent codec parity", () => {
+  test("frontend and backend encode the same intent bytes", () => {
+    const intent = makeIntent();
+    const frontend = encodeVoteIntentData(intent);
+    const backend = encodeBackendVoteIntentData(intent as any);
 
-//   test("decodes correctly", () => {
-//     const buf  = encodeVoteData(sampleVote);
-//     const back = decodeVoteData(buf);
-//     expect(back.option_index).toBe(1);
-//     expect(back.voted_at_epoch).toBe(42n);
-//     expect(bytesToHex(back.poll_type_hash)).toBe(bytesToHex(sampleVote.poll_type_hash));
-//     expect(bytesToHex(back.voter_lock_hash)).toBe(bytesToHex(sampleVote.voter_lock_hash));
-//   });
+    expect(frontend.length).toBeGreaterThan(74);
+    expect(bytesToHex(frontend)).toBe(bytesToHex(backend));
+    expect(decodeVoteIntentData(frontend)).toEqual(intent);
+    expect(decodeBackendVoteIntentData(backend)).toEqual(intent);
+  });
 
-//   test("option_index 0 encodes correctly", () => {
-//     const buf = encodeVoteData({ ...sampleVote, option_index: 0 });
-//     const back = decodeVoteData(buf);
-//     expect(back.option_index).toBe(0);
-//   });
+  test("aggregated flag flips the final byte only", () => {
+    const pending = encodeVoteIntentData(makeIntent({ aggregated: false }));
+    const counted = encodeVoteIntentData(makeIntent({ aggregated: true }));
 
-//   test("option_index 9 encodes correctly", () => {
-//     const buf = encodeVoteData({ ...sampleVote, option_index: 9 });
-//     const back = decodeVoteData(buf);
-//     expect(back.option_index).toBe(9);
-//   });
-// });
+    expect(pending.slice(0, 73)).toEqual(counted.slice(0, 73));
+    expect(pending[73]).toBe(0);
+    expect(counted[73]).toBe(1);
+  });
+});
 
-// describe("hexToBytes / bytesToHex utils", () => {
-//   test("roundtrips", () => {
-//     const cases = ["0x", "0x00", "0xdeadbeef", "0x" + "ff".repeat(32)];
-//     for (const hex of cases) {
-//       expect(bytesToHex(hexToBytes(hex))).toBe(hex);
-//     }
-//   });
+describe("delegation codec parity", () => {
+  test("frontend and backend encode the same delegation bytes", () => {
+    const delegation = makeDelegation();
+    const frontend = encodeDelegationData(delegation);
+    const backend = encodeBackendDelegationData(delegation as any);
 
-//   test("no 0x prefix also works", () => {
-//     expect(hexToBytes("deadbeef")[0]).toBe(0xde);
-//   });
-// });
+    expect(frontend.length).toBe(104);
+    expect(bytesToHex(frontend)).toBe(bytesToHex(backend));
+    expect(decodeDelegationData(frontend)).toEqual(delegation);
+    expect(decodeBackendDelegationData(backend)).toEqual(delegation);
+  });
+});
 
-// describe("backend ↔ frontend codec compatibility", () => {
-//   /**
-//    * This test manually checks that the byte layout is identical.
-//    * The simplest way: encode on frontend, decode on backend (or vice versa).
-//    * Since we can't import backend in vitest without ts-jest setup,
-//    * we instead validate the byte-level structure directly.
-//    */
-//   test("PollData layout: first 4 bytes are question length (little-endian)", () => {
-//     const question = "Hello";
-//     const poll = makePoll({ question });
-//     const buf  = encodePollData(poll);
-//     // First 4 bytes should be length of "Hello" = 5 in little-endian
-//     expect(buf[0]).toBe(5);
-//     expect(buf[1]).toBe(0);
-//     expect(buf[2]).toBe(0);
-//     expect(buf[3]).toBe(0);
-//     // Next 5 bytes should be "Hello"
-//     expect(new TextDecoder().decode(buf.slice(4, 9))).toBe("Hello");
-//   });
-
-//   test("PollData layout: is_closed byte is 0x00 for false", () => {
-//     const poll = makePoll({ is_closed: false });
-//     const buf  = encodePollData(poll);
-//     // Find is_closed byte: after question, options, vote_counts, deadline (8), creator (32)
-//     // We can verify by encoding closed=true and finding the differing byte
-//     const buf2 = encodePollData({ ...poll, is_closed: true });
-//     let diffIdx = -1;
-//     for (let i = 0; i < buf.length; i++) {
-//       if (buf[i] !== buf2[i]) { diffIdx = i; break; }
-//     }
-//     expect(buf[diffIdx]).toBe(0);  // false = 0x00
-//     expect(buf2[diffIdx]).toBe(1); // true  = 0x01
-//   });
-// });
+describe("hex utilities", () => {
+  test("hex strings round-trip", () => {
+    const values = ["0x", "0x00", "0xdeadbeef", `0x${"ff".repeat(32)}`];
+    for (const value of values) {
+      expect(bytesToHex(hexToBytes(value))).toBe(value);
+    }
+  });
+});

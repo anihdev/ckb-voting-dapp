@@ -1,10 +1,11 @@
 # Ignore files for CKB Voting DApp
 
-  deployment/
+deployment/
 
 # Dependencies
 node_modules/
 .pnpm-store/
+.vite/
 
 # Build outputs
 dist/
@@ -19,6 +20,7 @@ coverage/
 # Environment
 .env
 .env.local
+.env.*.local
 
 # Logs
 logs
@@ -44,3 +46,8 @@ Thumbs.db
 *.temp
 *.bak
 *~
+.vercel/
+
+# Documentation
+*.md
+!README.md

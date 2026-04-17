@@ -1,11 +1,32 @@
-frontend/src/index.css
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
+  :root {
+    color: #1f1915;
+    background:
+      radial-gradient(circle at top, #f5ead8 0%, #efe8dc 36%, #e0dbd2 65%, #d6d1c9 100%);
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    font-family: "Avenir Next", "Segoe UI", sans-serif;
     -webkit-font-smoothing: antialiased;
+    color: #1f1915;
+    background: transparent;
+  }
+
+  a {
+    color: inherit;
+  }
+
+  ::selection {
+    background: rgba(120, 78, 39, 0.18);
+    color: #231a14;
   }
 }

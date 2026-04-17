@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc && node scripts/bundle.js",
     "dev": "ts-node src/index.ts",
-    "test": "jest --testPathPattern=../../tests/contract",
+    "test": "jest --config jest.config.js",
     "lint": "eslint src/**/*.ts"
   },
   "dependencies": {},

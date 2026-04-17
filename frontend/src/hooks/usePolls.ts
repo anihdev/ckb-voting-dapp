@@ -1,387 +1,518 @@
 /**
  * usePolls Hook
  * =============
- * Core business logic for the voting dApp.
- * Handles: fetching polls, creating, voting, closing.
- *
- * File: frontend/src/hooks/usePolls.ts
+ * Indexes governance poll and intent cells and exposes transaction flows that
+ * follow the contract's six-operation model, including off-chain duplicate
+ * intent checks and delegated voting authority discovery.
  */
 
-import { useState, useCallback } from "react";
+import { useCallback, useState } from "react";
 import { ccc } from "@ckb-ccc/core";
 import {
-  VOTING_SCRIPT_CODE_HASH,
-  buildPollTypeScript,
-  buildVoteReceiptTypeScript,
+  buildAggregateVotesTx,
+  buildClosePollTx,
+  buildCreatePollTx,
+  buildCreateVoteIntentTx,
+  buildDelegateTx,
+  buildGovernanceTypeScript,
+  buildRevokeDelegationTx,
+  getTipEpoch,
+  getSignerLockHashHex,
+  hashScript,
   OP,
-  estimatePollCellCapacity,
-  ckbToShannons,
+  signAndSendTx,
+  validateCreatePollInput,
 } from "../lib/ckb";
 import {
-  encodePollData,
-  decodePollData,
-  encodeVoteData,
-  hexToBytes,
   bytesToHex,
-  PollData,
+  decodeDelegationData,
+  decodePollData,
+  decodeVoteIntentData,
 } from "../lib/molecule";
-import { Poll, TxState } from "../lib/types";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
+import {
+  DelegateParams,
+  DelegationRecord,
+  Poll,
+  TxState,
+  VoteAuthorityOption,
+  VoteIntent,
+} from "../lib/types";
 
 export interface CreatePollParams {
-  question:         string;
-  options:          string[];
-  durationEpochs:   number;
+  question: string;
+  options: string[];
+  durationEpochs: number;
 }
 
 export interface CastVoteParams {
-  poll:        Poll;
+  poll: Poll;
   optionIndex: number;
+  authorityId?: string;
 }
 
-// ─── Hook ─────────────────────────────────────────────────────────────────────
+function deriveWinnerIndex(voteCounts: bigint[]): number | null {
+  if (voteCounts.length === 0) return null;
 
-export function usePolls(signer: ccc.Signer | null) {
-  const [polls,   setPolls]   = useState<Poll[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [txState, setTxState] = useState<TxState>({
-    status: "idle", txHash: null, error: null,
+  let maxVotes = 0n;
+  let maxIndex = -1;
+  let isTie = false;
+
+  voteCounts.forEach((count, index) => {
+    if (count > maxVotes) {
+      maxVotes = count;
+      maxIndex = index;
+      isTie = false;
+    } else if (count > 0n && count === maxVotes) {
+      isTie = true;
+    }
   });
 
-  // ── Fetch all polls ────────────────────────────────────────────────────────
+  if (maxVotes === 0n || isTie) return null;
+  return maxIndex;
+}
+
+async function waitForTx(client: any, txHash: string): Promise<void> {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    try {
+      const tx = await client.getTransaction(txHash);
+      if (tx) return;
+    } catch {
+      // Keep polling while the network indexes the transaction.
+    }
+  }
+}
+
+export function usePolls(signer: any | null) {
+  const [polls, setPolls] = useState<Poll[]>([]);
+  const [intents, setIntents] = useState<Record<string, VoteIntent[]>>({});
+  const [delegations, setDelegations] = useState<DelegationRecord[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [txState, setTxState] = useState<TxState>({ status: "idle", txHash: null, error: null });
+  const [pollCells, setPollCells] = useState<Record<string, any>>({});
+  const [intentCells, setIntentCells] = useState<Record<string, any[]>>({});
+  const [delegationCells, setDelegationCells] = useState<Record<string, any>>({});
 
   const fetchPolls = useCallback(async () => {
     if (!signer) return;
+
     setLoading(true);
+    setLoadError(null);
     try {
       const client = signer.client;
-      const pollTypeScript = ccc.Script.from({
-        codeHash: VOTING_SCRIPT_CODE_HASH,
-        hashType: "data1",
-        args: "0x" + OP.CREATE_POLL.toString(16).padStart(2, "0"),
-      });
+      const pollScript = buildGovernanceTypeScript(OP.CREATE_POLL);
+      const nextPolls: Poll[] = [];
+      const nextIntents: Record<string, VoteIntent[]> = {};
+      const nextIntentCells: Record<string, any[]> = {};
+      const nextPollCells: Record<string, any> = {};
+      const currentLockHashHex = await getSignerLockHashHex(signer);
+      const tipEpoch = await getTipEpoch(client);
 
-      // Search for all live cells matching the voting type script
-      const results: Poll[] = [];
       for await (const cell of client.findCells({
-        script: pollTypeScript,
+        script: pollScript,
         scriptType: "type",
         scriptSearchMode: "prefix",
       })) {
         try {
-          const data = hexToBytes(ccc.hexFrom(cell.outputData ?? "0x"));
-          const pollData = decodePollData(data);
+          const pollBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
+          const pollData = decodePollData(pollBytes);
+          const pollId = hashScript(cell.cellOutput?.type ?? cell.output?.type);
+          const voteCounts = pollData.vote_counts;
+          const totalVotes = voteCounts.reduce((sum, count) => sum + count, 0n);
+          nextPollCells[pollId] = cell;
 
-          // Compute a stable poll ID from the type script hash
-          const typeScript = cell.output.type!;
-          const typeScriptHash = ccc.hashCkb(
-            ccc.bytesFrom(typeScript.codeHash),
-            ccc.bytesFrom([typeScript.hashType === "data" ? 0 : typeScript.hashType === "type" ? 1 : 2]),
-            ccc.bytesFrom(typeScript.args)
-          );
-          const pollId = ccc.hexFrom(typeScriptHash);
-
-          const totalVotes = pollData.vote_counts.reduce((s, v) => s + v, 0n);
-          let winnerIndex: number | null = null;
-          if (totalVotes > 0n) {
-            let max = -1n;
-            pollData.vote_counts.forEach((v, i) => {
-              if (v > max) { max = v; winnerIndex = i; }
-            });
-          }
-
-          results.push({
-            id:         pollId,
+          nextPolls.push({
+            id: pollId,
             outPoint: {
               txHash: cell.outPoint.txHash,
-              index:  Number(cell.outPoint.index),
+              index: Number(cell.outPoint.index),
             },
-            question:    pollData.question,
-            options:     pollData.options,
-            voteCounts:  pollData.vote_counts,
-            deadline:    pollData.deadline,
-            creator:     bytesToHex(pollData.creator),
-            isClosed:    pollData.is_closed,
+            question: pollData.question,
+            options: pollData.options,
+            voteCounts,
+            deadline: pollData.deadline,
+            creator: bytesToHex(pollData.creator),
+            isClosed: pollData.is_closed,
             totalVoters: pollData.total_voters,
+            creatorDeposit: pollData.creator_deposit,
+            pendingIntentCount: pollData.pending_intent_count,
+            tokenWeighted: pollData.token_weighted,
+            udtTypeHash: bytesToHex(pollData.udt_type_hash),
             totalVotes,
-            winnerIndex,
+            winnerIndex: deriveWinnerIndex(voteCounts),
+            authorityOptions: [],
+            outstandingIntentCount: 0,
           });
-        } catch (e) {
-          console.warn("Failed to decode poll cell:", e);
+
+          nextIntents[pollId] = [];
+        } catch (error) {
+          console.warn("Failed to decode poll cell", error);
         }
       }
-      setPolls(results);
-    } catch (e) {
-      console.error("fetchPolls error:", e);
+
+      for (const poll of nextPolls) {
+        const intentScript = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, poll.id);
+        const nextIntentCellsForPoll: any[] = [];
+        for await (const cell of client.findCells({
+          script: intentScript,
+          scriptType: "type",
+          scriptSearchMode: "exact",
+        })) {
+          try {
+            const intentBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
+            if (intentBytes.length < 74) continue;
+
+            const intentData = decodeVoteIntentData(intentBytes);
+            nextIntentCellsForPoll.push(cell);
+            nextIntents[poll.id].push({
+              id: `${cell.outPoint.txHash}:${cell.outPoint.index}`,
+              pollId: poll.id,
+              outPoint: {
+                txHash: cell.outPoint.txHash,
+                index: Number(cell.outPoint.index),
+              },
+              voterLockHash: bytesToHex(intentData.voter_lock_hash),
+              optionIndex: intentData.option_index,
+              votedAtEpoch: intentData.voted_at_epoch,
+              aggregated: intentData.aggregated,
+              capacity: BigInt(cell.cellOutput?.capacity ?? cell.output?.capacity ?? 0),
+            });
+          } catch (error) {
+            console.warn("Failed to decode intent cell", error);
+          }
+        }
+
+        nextIntentCells[poll.id] = nextIntentCellsForPoll;
+      }
+
+      const nextDelegations: DelegationRecord[] = [];
+      const nextDelegationCells: Record<string, any> = {};
+      const delegationScript = buildGovernanceTypeScript(OP.DELEGATE);
+
+      for await (const cell of client.findCells({
+        script: delegationScript,
+        scriptType: "type",
+        scriptSearchMode: "prefix",
+      })) {
+        try {
+          const delegationBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
+          if (delegationBytes.length !== 104) continue;
+
+          const delegation = decodeDelegationData(delegationBytes);
+          const delegatorLockHash = bytesToHex(delegation.delegator_lock_hash);
+          const delegateLockHash = bytesToHex(delegation.delegate_lock_hash);
+
+          if (
+            delegatorLockHash !== currentLockHashHex &&
+            delegateLockHash !== currentLockHashHex
+          ) {
+            continue;
+          }
+
+          const id = `${cell.outPoint.txHash}:${cell.outPoint.index}`;
+          nextDelegationCells[id] = cell;
+          nextDelegations.push({
+            id,
+            outPoint: {
+              txHash: cell.outPoint.txHash,
+              index: Number(cell.outPoint.index),
+            },
+            delegatorLockHash,
+            delegateLockHash,
+            pollId:
+              bytesToHex(delegation.poll_type_hash) === `0x${"00".repeat(32)}`
+                ? null
+                : bytesToHex(delegation.poll_type_hash),
+            expiresEpoch: delegation.expires_epoch,
+            capacity: BigInt((cell.cellOutput ?? cell.output).capacity),
+          });
+        } catch (error) {
+          console.warn("Failed to decode delegation cell", error);
+        }
+      }
+
+      for (const poll of nextPolls) {
+        const pollIntents = nextIntents[poll.id] ?? [];
+        const authorityOptions: VoteAuthorityOption[] = [];
+
+        const directIntents = pollIntents.filter(
+          (intent) => intent.voterLockHash === currentLockHashHex
+        );
+
+        authorityOptions.push({
+          id: "self",
+          mode: "self",
+          label: "Vote as connected wallet",
+          voterLockHash: currentLockHashHex,
+          delegationId: null,
+          hasIntent: directIntents.length > 0,
+          hasPendingIntent: directIntents.some((intent) => !intent.aggregated),
+          hasAggregatedIntent: directIntents.some((intent) => intent.aggregated),
+        });
+
+        const applicableDelegations = nextDelegations
+          .filter((delegation) => delegation.delegateLockHash === currentLockHashHex)
+          .filter((delegation) => delegation.pollId === null || delegation.pollId === poll.id)
+          .filter((delegation) => delegation.expiresEpoch === 0n || delegation.expiresEpoch >= tipEpoch);
+
+        for (const delegation of applicableDelegations) {
+          const delegatedIntents = pollIntents.filter(
+            (intent) => intent.voterLockHash === delegation.delegatorLockHash
+          );
+
+          authorityOptions.push({
+            id: delegation.id,
+            mode: "delegation",
+            label: `Vote for ${delegation.delegatorLockHash.slice(0, 14)}...`,
+            voterLockHash: delegation.delegatorLockHash,
+            delegationId: delegation.id,
+            hasIntent: delegatedIntents.length > 0,
+            hasPendingIntent: delegatedIntents.some((intent) => !intent.aggregated),
+            hasAggregatedIntent: delegatedIntents.some((intent) => intent.aggregated),
+          });
+        }
+
+        poll.authorityOptions = authorityOptions;
+        poll.outstandingIntentCount = pollIntents.length;
+      }
+
+      setPolls(nextPolls);
+      setIntents(nextIntents);
+      setPollCells(nextPollCells);
+      setIntentCells(nextIntentCells);
+      setDelegations(nextDelegations);
+      setDelegationCells(nextDelegationCells);
+    } catch (error: any) {
+      setLoadError(error?.message ?? String(error));
     } finally {
       setLoading(false);
     }
   }, [signer]);
 
-  // ── Create Poll ────────────────────────────────────────────────────────────
-
   const createPoll = useCallback(
-    async ({ question, options, durationEpochs }: CreatePollParams) => {
+    async (params: CreatePollParams) => {
       if (!signer) throw new Error("Wallet not connected");
 
+      const validationError = validateCreatePollInput(params);
+      if (validationError) throw new Error(validationError);
+
       setTxState({ status: "building", txHash: null, error: null });
-
       try {
-        // Get current epoch from RPC
-        const client = signer.client;
-        const tipHeader = await client.getTipHeader();
-        const currentEpoch = BigInt(tipHeader.epoch);
-        const deadline = currentEpoch + BigInt(durationEpochs);
-
-        // Get creator lock hash for poll data
-        const creatorAddr = await signer.getAddressObjSecp256k1();
-        const creatorLockHash = ccc.hashCkb(
-          ccc.bytesFrom(creatorAddr.script.codeHash),
-          ccc.bytesFrom([creatorAddr.script.hashType === "type" ? 1 : 0]),
-          ccc.bytesFrom(creatorAddr.script.args)
-        );
-
-        // Encode poll cell data
-        const pollData: PollData = {
-          question,
-          options,
-          vote_counts:  new Array(options.length).fill(0n),
-          deadline,
-          creator:      new Uint8Array(creatorLockHash),
-          is_closed:    false,
-          total_voters: 0n,
-        };
-        const encodedData = encodePollData(pollData);
-        const dataHex = bytesToHex(encodedData);
-
-        // Build type script for the poll cell
-        const pollTypeScript = buildPollTypeScript(OP.CREATE_POLL);
-
-        // Estimate capacity
-        const capacity = estimatePollCellCapacity(encodedData.length);
-
-        // Build transaction
-        const tx = ccc.Transaction.from({
-          outputs: [{
-            lock:     creatorAddr.script,
-            type:     pollTypeScript,
-            capacity: capacity,
-          }],
-          outputsData: [dataHex],
-        });
-
-        // CCC auto-selects input UTXOs and adds change output
-        await tx.completeInputsByCapacity(signer);
-        await tx.completeFeeBy(signer, 1000);
-
+        const tx = await buildCreatePollTx(signer, params);
         setTxState({ status: "signing", txHash: null, error: null });
-        await signer.signTransaction(tx);
-
-        setTxState({ status: "sending", txHash: null, error: null });
-        const txHash = await client.sendTransaction(tx);
-
+        const txHash = await signAndSendTx(signer, tx);
         setTxState({ status: "confirming", txHash, error: null });
 
-        // Wait for confirmation (non-blocking - UI can show txHash immediately)
-        waitForTx(client, txHash).then(() => {
+        waitForTx(signer.client, txHash).then(async () => {
           setTxState({ status: "success", txHash, error: null });
-          fetchPolls(); // refresh list
+          await fetchPolls();
         });
 
         return txHash;
-      } catch (e: any) {
-        setTxState({ status: "error", txHash: null, error: e.message ?? String(e) });
-        throw e;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
       }
     },
-    [signer, fetchPolls]
+    [fetchPolls, signer]
   );
-
-  // ── Cast Vote ──────────────────────────────────────────────────────────────
 
   const castVote = useCallback(
-    async ({ poll, optionIndex }: CastVoteParams) => {
+    async ({ poll, optionIndex, authorityId }: CastVoteParams) => {
       if (!signer) throw new Error("Wallet not connected");
 
+      const selectedAuthority =
+        poll.authorityOptions.find((authority) => authority.id === (authorityId ?? "self")) ??
+        poll.authorityOptions[0];
+
+      if (!selectedAuthority) throw new Error("No voting authority is available for this poll");
+      if (selectedAuthority.hasIntent) {
+        throw new Error("This voting authority already has an indexed intent for the poll");
+      }
+
+      const delegationCell =
+        selectedAuthority.delegationId !== null
+          ? delegationCells[selectedAuthority.delegationId]
+          : undefined;
+
       setTxState({ status: "building", txHash: null, error: null });
-
       try {
-        const client  = signer.client;
-        const voterAddr = await signer.getAddressObjSecp256k1();
-
-        // Load the current poll cell
-        const pollOutPoint = ccc.OutPoint.from({
-          txHash: poll.outPoint.txHash,
-          index:  poll.outPoint.index,
+        const tx = await buildCreateVoteIntentTx(signer, {
+          pollTypeHash: poll.id,
+          optionIndex,
+          delegationCell,
         });
-        const pollCell = await client.getCell(pollOutPoint);
-        if (!pollCell) throw new Error("Poll cell not found on chain");
-
-        // Decode current state
-        const pollRawData = hexToBytes(ccc.hexFrom(pollCell.outputData ?? "0x"));
-        const pollData    = decodePollData(pollRawData);
-
-        // Update state
-        const newVoteCounts = [...pollData.vote_counts];
-        newVoteCounts[optionIndex] += 1n;
-        const updatedPoll: PollData = {
-          ...pollData,
-          vote_counts:  newVoteCounts,
-          total_voters: pollData.total_voters + 1n,
-        };
-        const updatedDataHex = bytesToHex(encodePollData(updatedPoll));
-
-        // Build vote receipt data
-        const voterLockHash = ccc.hashCkb(
-          ccc.bytesFrom(voterAddr.script.codeHash),
-          ccc.bytesFrom([voterAddr.script.hashType === "type" ? 1 : 0]),
-          ccc.bytesFrom(voterAddr.script.args)
-        );
-        const tipHeader   = await client.getTipHeader();
-        const currentEpoch = BigInt(tipHeader.epoch);
-        const receiptData = encodeVoteData({
-          poll_type_hash:  hexToBytes(poll.id),
-          voter_lock_hash: new Uint8Array(voterLockHash),
-          option_index:    optionIndex,
-          voted_at_epoch:  currentEpoch,
-        });
-        const receiptDataHex = bytesToHex(receiptData);
-
-        // Receipt type script uses the poll's type hash as part of args
-        const receiptTypeScript = buildVoteReceiptTypeScript(poll.id);
-
-        // Minimum capacity for vote receipt cell (~130 bytes data)
-        const receiptCapacity = estimatePollCellCapacity(receiptData.length);
-
-        // Build witness: option_index in input_type field of witness at index 1
-        const optionByte = new Uint8Array([optionIndex]);
-
-        const tx = ccc.Transaction.from({
-          inputs: [
-            // Input 0: poll cell (being consumed and recreated)
-            { previousOutput: pollOutPoint },
-          ],
-          outputs: [
-            // Output 0: updated poll cell (same type script, updated data)
-            {
-              lock:     pollCell.output.lock,
-              type:     pollCell.output.type,
-              capacity: pollCell.output.capacity,
-            },
-            // Output 1: vote receipt (proves voter voted)
-            {
-              lock:     voterAddr.script,
-              type:     receiptTypeScript,
-              capacity: receiptCapacity,
-            },
-          ],
-          outputsData: [updatedDataHex, receiptDataHex],
-          witnesses: [
-            "0x", // placeholder for input 0 (poll cell — no lock witness needed from voter for poll)
-            ccc.WitnessArgs.from({
-              lock:       new Uint8Array(0),
-              inputType:  optionByte, // option_index byte validated by contract
-              outputType: new Uint8Array(0),
-            }).toBytes(),
-          ],
-        });
-
-        await tx.completeInputsByCapacity(signer);
-        await tx.completeFeeBy(signer, 1000);
-
         setTxState({ status: "signing", txHash: null, error: null });
-        await signer.signTransaction(tx);
-
-        setTxState({ status: "sending", txHash: null, error: null });
-        const txHash = await client.sendTransaction(tx);
-
+        const txHash = await signAndSendTx(signer, tx);
         setTxState({ status: "confirming", txHash, error: null });
-        waitForTx(client, txHash).then(() => {
+
+        waitForTx(signer.client, txHash).then(async () => {
           setTxState({ status: "success", txHash, error: null });
-          fetchPolls();
+          await fetchPolls();
         });
 
         return txHash;
-      } catch (e: any) {
-        setTxState({ status: "error", txHash: null, error: e.message ?? String(e) });
-        throw e;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
       }
     },
-    [signer, fetchPolls]
+    [delegationCells, fetchPolls, signer]
   );
-
-  // ── Close Poll ─────────────────────────────────────────────────────────────
 
   const closePoll = useCallback(
     async (poll: Poll) => {
       if (!signer) throw new Error("Wallet not connected");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+
+      const outstandingIntentCells = intentCells[poll.id] ?? [];
+
       setTxState({ status: "building", txHash: null, error: null });
-
       try {
-        const client = signer.client;
-        const creatorAddr = await signer.getAddressObjSecp256k1();
-
-        const pollOutPoint = ccc.OutPoint.from({
-          txHash: poll.outPoint.txHash,
-          index:  poll.outPoint.index,
+        const tx = await buildClosePollTx(signer, {
+          pollCell,
+          intentCells: outstandingIntentCells,
         });
-        const pollCell = await client.getCell(pollOutPoint);
-        if (!pollCell) throw new Error("Poll cell not found");
-
-        const rawData  = hexToBytes(ccc.hexFrom(pollCell.outputData ?? "0x"));
-        const pollData = decodePollData(rawData);
-
-        const closedPoll: PollData = { ...pollData, is_closed: true };
-        const closedDataHex = bytesToHex(encodePollData(closedPoll));
-
-        const tx = ccc.Transaction.from({
-          inputs: [
-            { previousOutput: pollOutPoint },   // index 0: poll cell
-          ],
-          outputs: [{
-            lock:     pollCell.output.lock,
-            type:     pollCell.output.type,
-            capacity: pollCell.output.capacity,
-          }],
-          outputsData: [closedDataHex],
-        });
-
-        // CCC will add the creator's cell as input[1] automatically (for fee + auth)
-        await tx.completeInputsByCapacity(signer);
-        await tx.completeFeeBy(signer, 1000);
-
         setTxState({ status: "signing", txHash: null, error: null });
-        await signer.signTransaction(tx);
-
-        setTxState({ status: "sending", txHash: null, error: null });
-        const txHash = await client.sendTransaction(tx);
-
+        const txHash = await signAndSendTx(signer, tx);
         setTxState({ status: "confirming", txHash, error: null });
-        waitForTx(client, txHash).then(() => {
+
+        waitForTx(signer.client, txHash).then(async () => {
           setTxState({ status: "success", txHash, error: null });
-          fetchPolls();
+          await fetchPolls();
         });
+
         return txHash;
-      } catch (e: any) {
-        setTxState({ status: "error", txHash: null, error: e.message ?? String(e) });
-        throw e;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
       }
     },
-    [signer, fetchPolls]
+    [fetchPolls, intentCells, pollCells, signer]
   );
 
-  return { polls, loading, txState, fetchPolls, createPoll, castVote, closePoll };
-}
+  const aggregatePoll = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+      const pollCell = pollCells[poll.id];
+      const pendingIntentCells = (intentCells[poll.id] ?? []).filter((cell) => {
+        try {
+          const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+          return !decoded.aggregated;
+        } catch {
+          return false;
+        }
+      });
 
-async function waitForTx(client: ccc.Client, txHash: string): Promise<void> {
-  for (let i = 0; i < 60; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
-    try {
-      const tx = await client.getTransaction(txHash);
-      if (tx) return;
-    } catch (_) {}
-  }
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+      if (pendingIntentCells.length === 0) throw new Error("No pending intent cells to aggregate");
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildAggregateVotesTx(signer, {
+          pollCell,
+          intentCells: pendingIntentCells.slice(0, 50),
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [fetchPolls, intentCells, pollCells, signer]
+  );
+
+  const createDelegation = useCallback(
+    async (params: DelegateParams) => {
+      if (!signer) throw new Error("Wallet not connected");
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildDelegateTx(signer, {
+          delegateLockHash: params.delegateLockHash,
+          pollTypeHash: params.pollId,
+          expiresEpoch: params.expiresEpoch,
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [fetchPolls, signer]
+  );
+
+  const revokeDelegation = useCallback(
+    async (delegationId: string) => {
+      if (!signer) throw new Error("Wallet not connected");
+
+      const delegationCell = delegationCells[delegationId];
+      if (!delegationCell) throw new Error("Delegation cell is not currently indexed");
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildRevokeDelegationTx(signer, {
+          delegationCell,
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [delegationCells, fetchPolls, signer]
+  );
+
+  const currentEpoch = useCallback(async (): Promise<bigint> => {
+    if (!signer) return 0n;
+    return getTipEpoch(signer.client);
+  }, [signer]);
+
+  return {
+    polls,
+    intents,
+    delegations,
+    loading,
+    loadError,
+    txState,
+    fetchPolls,
+    createPoll,
+    castVote,
+    aggregatePoll,
+    closePoll,
+    createDelegation,
+    revokeDelegation,
+    currentEpoch,
+  };
 }

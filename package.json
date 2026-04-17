@@ -1,0 +1,24 @@
+{
+  "name": "ckb-voting-dapp",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "pnpm build:contract && pnpm build:frontend",
+    "build:contract": "pnpm --filter ckb-voting-contract build",
+    "build:frontend": "pnpm --filter ckb-voting-frontend build",
+    "test": "pnpm test:contract && pnpm test:frontend",
+    "test:contract": "pnpm --filter ckb-voting-contract test",
+    "test:frontend": "pnpm --filter ckb-voting-frontend test",
+    "dev:frontend": "pnpm --filter ckb-voting-frontend dev",
+    "deploy:contract": "pnpm --filter ckb-voting-deploy deploy",
+    "deploy:vercel": "pnpm exec vercel deploy",
+    "deploy:vercel:prod": "pnpm exec vercel deploy --prod"
+  },
+  "devDependencies": {
+    "vercel": "^51.4.0"
+  }
+}

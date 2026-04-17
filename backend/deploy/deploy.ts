@@ -90,9 +90,10 @@ async function deploy(): Promise<void> {
   console.log(`Contract TX hash:  ${txHash}`);
   console.log(`Contract out_point: { tx_hash: "${txHash}", index: "0x0" }`);
   console.log(`Code hash (blake2b of data): ${codeHash}`);
-  console.log("\nPaste into frontend/src/lib/ckb.ts:");
-  console.log(`  VOTING_SCRIPT_CODE_HASH = "${codeHash}"`);
-  console.log(`  VOTING_SCRIPT_TX_HASH   = "${txHash}"`);
+  console.log("\nFrontend env values:");
+  console.log(`VITE_GOVERNANCE_CODE_HASH=${codeHash}`);
+  console.log(`VITE_GOVERNANCE_SCRIPT_TX_HASH=${txHash}`);
+  console.log(`VITE_CKB_RPC_URL=${RPC_URL}`);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -108,8 +109,8 @@ async function waitForConfirmation(
     await sleep(POLL_INTERVAL);
     attempts++;
     try {
-      const tx = await client.getTransaction(txHash);
-      if (tx && tx.timeAddedToPool) {
+      const tx = await client.getTransaction(txHash) as any;
+      if (tx && (tx.timeAddedToPool || tx.txStatus || tx.transaction)) {
         console.log(`  Confirmed after ~${attempts * 5}s`);
         return;
       }
