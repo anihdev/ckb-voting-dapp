@@ -44,19 +44,22 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke }: Pr
       <div className="mb-4">
         <h2 className="text-lg font-semibold text-gray-800">Delegation</h2>
         <p className="mt-1 text-sm text-gray-500">
-          Delegate voting power globally or to a specific poll. Delegation cells lock 61 CKB until revoked.
+          Delegate voting power globally or to a specific poll. Delegation cells lock at least 61 CKB and may require more occupied capacity depending on script size.
         </p>
       </div>
 
       <form onSubmit={submitDelegation} className="space-y-4">
         <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">Delegate lock hash</label>
+          <label className="mb-1 block text-sm font-medium text-gray-700">Delegate address or lock hash</label>
           <input
             value={delegateLockHash}
             onChange={(event) => setDelegateLockHash(event.target.value)}
-            placeholder="0x..."
+            placeholder="ckt1... or 0x..."
             className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
+          <div className="mt-1 text-xs text-gray-500">
+            Paste a normal CKB address and the app will derive the required lock hash automatically.
+          </div>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">

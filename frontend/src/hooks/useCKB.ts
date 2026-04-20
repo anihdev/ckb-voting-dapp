@@ -12,11 +12,12 @@
 import { useState, useEffect, useCallback } from "react";
 import { ccc } from "@ckb-ccc/core";
 import { useCcc, useSigner } from "@ckb-ccc/connector-react";
-import { getSignerAddressObj } from "../lib/ckb";
+import { getSignerAddressObj, hashScript } from "../lib/ckb";
 
 export interface CKBState {
   signer:      ccc.Signer | null;
   address:     string | null;
+  lockScriptHash: string | null;
   balance:     bigint;
   isConnected: boolean;
   isLoading:   boolean;
@@ -31,6 +32,7 @@ export function useCKB(): CKBState {
   const signer = useSigner() ?? null;
 
   const [address, setAddress]   = useState<string | null>(null);
+  const [lockScriptHash, setLockScriptHash] = useState<string | null>(null);
   const [balance, setBalance]   = useState<bigint>(0n);
   const [isLoading, setLoading] = useState(false);
   const [error, setError]       = useState<string | null>(null);
@@ -39,12 +41,16 @@ export function useCKB(): CKBState {
   useEffect(() => {
     if (!signer) {
       setAddress(null);
+      setLockScriptHash(null);
       setBalance(0n);
       return;
     }
     setLoading(true);
     getSignerAddressObj(signer as any)
-      .then((addr) => setAddress(addr.toString()))
+      .then((addr) => {
+        setAddress(addr.toString());
+        setLockScriptHash(hashScript(addr.script));
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, [signer]);
@@ -69,6 +75,7 @@ export function useCKB(): CKBState {
   return {
     signer,
     address,
+    lockScriptHash,
     balance,
     isConnected: !!signer && !!address,
     isLoading,

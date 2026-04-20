@@ -9,7 +9,7 @@ import { useCKB } from "../hooks/useCKB";
 import { shannonsToCkb } from "../lib/ckb";
 
 export function WalletConnect() {
-  const { address, balance, isConnected, isLoading, connect, disconnect, error } = useCKB();
+  const { address, lockScriptHash, balance, isConnected, isLoading, connect, disconnect, error } = useCKB();
 
   if (isLoading) {
     return (
@@ -41,11 +41,18 @@ export function WalletConnect() {
         <span className="ml-1 text-stone-500">CKB</span>
       </div>
 
-      <div className="flex items-center gap-2 rounded-full border border-stone-300/70 bg-white/75 px-4 py-2">
-        <div className="h-2 w-2 rounded-full bg-emerald-500" />
-        <span className="font-mono text-sm text-stone-700">
-          {address.slice(0, 10)}...{address.slice(-6)}
-        </span>
+      <div className="rounded-full border border-stone-300/70 bg-white/75 px-4 py-2 text-right">
+        <div className="flex items-center justify-end gap-2">
+          <div className="h-2 w-2 rounded-full bg-emerald-500" />
+          <span className="font-mono text-sm text-stone-700">
+            {address.slice(0, 10)}...{address.slice(-6)}
+          </span>
+        </div>
+        {lockScriptHash && (
+          <div className="mt-1 font-mono text-[10px] text-stone-500">
+            lock {lockScriptHash.slice(0, 14)}...{lockScriptHash.slice(-8)}
+          </div>
+        )}
       </div>
 
       <button

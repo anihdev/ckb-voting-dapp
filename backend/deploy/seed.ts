@@ -6,7 +6,8 @@
  */
 
 import { ccc } from "@ckb-ccc/core";
-import { encodePollData } from "../contract/src/molecule";
+import { randomBytes } from "crypto";
+import { decodePollData, encodePollData } from "../contract/src/molecule";
 import { RPC_URL } from "./config";
 
 const PRIVATE_KEY = process.env.CKB_PRIVATE_KEY;
@@ -68,12 +69,39 @@ async function main(): Promise<void> {
   const client = new ccc.ClientPublicTestnet({ url: RPC_URL });
   const signer = new ccc.SignerCkbPrivateKey(client, PRIVATE_KEY);
   const signerAddress = await signer.getAddressObjSecp256k1();
+  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const creatorLockHash = (ccc as any).bytesFrom(ccc.hashCkb(signerAddress.script.toBytes()));
+  const pollScript = ccc.Script.from({
+    codeHash: GOVERNANCE_CODE_HASH,
+    hashType: SCRIPT_HASH_TYPE,
+    args: "0x01",
+  });
 
   console.log(`Seeder address: ${signerAddress.toString()}`);
 
+  const existingPolls = new Set<string>();
+  for await (const cell of client.findCells({
+    script: pollScript,
+    scriptType: "type",
+    scriptSearchMode: "prefix",
+  })) {
+    try {
+      const poll = decodePollData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+      const key = `${poll.question}::${poll.options.join("||")}`;
+      existingPolls.add(key);
+    } catch {
+      // Ignore malformed or non-matching cells while scanning for known demos.
+    }
+  }
+
   for (const [index, poll] of DEMO_POLLS.entries()) {
+    const pollKey = `${poll.question}::${poll.options.join("||")}`;
+    if (existingPolls.has(pollKey)) {
+      console.log(`Skipped poll ${index + 1}/${DEMO_POLLS.length}: already indexed on this deployment`);
+      continue;
+    }
+
     const pollData = encodePollData({
       question: poll.question,
       options: poll.options,
@@ -99,13 +127,15 @@ async function main(): Promise<void> {
           depType: "code",
         },
       ],
+      // The governance script reads the current epoch from header deps.
+      headerDeps: [tipHeader.hash],
       outputs: [
         {
           lock: signerAddress.script,
           type: ccc.Script.from({
             codeHash: GOVERNANCE_CODE_HASH,
             hashType: SCRIPT_HASH_TYPE,
-            args: "0x01",
+            args: `0x01${randomBytes(32).toString("hex")}`,
           }),
           capacity: CREATOR_DEPOSIT_SHANNONS + estimateCellCapacity(pollData.length),
         },
@@ -119,6 +149,7 @@ async function main(): Promise<void> {
     const txHash = await client.sendTransaction(tx);
 
     console.log(`Seeded poll ${index + 1}/${DEMO_POLLS.length}: ${txHash}`);
+    existingPolls.add(pollKey);
   }
 
   console.log("=== Seeding complete ===");

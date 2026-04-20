@@ -17,6 +17,17 @@ The canonical protocol source is:
 
 Everything else in the repo is expected to align to those two files.
 
+## Execution Status
+
+There are currently two contract layers in the repo:
+
+- `backend/contract`: the TypeScript reference contract that still defines protocol semantics and codec truth
+- `backend/contracts-rust`: the real CKB-VM migration target that will replace the reference implementation for testnet/mainnet deployment
+
+The Rust migration is now the forward path. The TypeScript contract remains in-repo as the protocol oracle while the Rust implementation reaches parity.
+
+The Rust contract uses a plain Cargo workspace. Capsule is not required for this repo.
+
 ## Verified Status
 
 Current verified state:
@@ -27,6 +38,7 @@ Current verified state:
 - delegated vote refunds use an embedded `refund_lock` script
 - the UI supports poll creation, vote intents, aggregation, close, delegation, and revocation
 - the frontend now performs off-chain duplicate-intent checks for the voting authorities the connected wallet controls
+- a Rust governance contract scaffold exists and the first validation slice has been ported
 
 Verified commands:
 
@@ -119,6 +131,7 @@ ckb-voting-dapp/
 
 - Node.js 20+
 - pnpm 10+
+- Rust `1.81.0` with `riscv64imac-unknown-none-elf`
 - OffCKB if you want a local CKB devnet
 
 Install:
@@ -128,6 +141,7 @@ corepack enable
 corepack prepare pnpm@latest --activate
 pnpm install
 pnpm approve-builds
+rustup target add riscv64imac-unknown-none-elf
 ```
 
 Approve `esbuild` when prompted.
@@ -141,6 +155,8 @@ pnpm test
 pnpm build
 pnpm dev:frontend
 pnpm build:contract
+pnpm build:contract:rust
+pnpm check:contract:rust
 pnpm build:frontend
 pnpm deploy:contract
 ```
@@ -178,11 +194,32 @@ This is only for deployment or seeding scripts. Do not expose it in Vercel.
 Build and deploy the contract:
 
 ```bash
-pnpm build:contract
+pnpm build:contract:rust
 CKB_PRIVATE_KEY=0x... pnpm deploy:contract
 ```
 
 The deploy script prints the resulting code hash and transaction hash. Put those values into your frontend environment.
+
+During migration, `pnpm build:contract` still builds the TypeScript reference artifact for protocol parity work. The deployable path now targets the Rust ELF built from `backend/contracts-rust/target/riscv64imac-unknown-none-elf/release/governance-contract`.
+
+For repeated redeploys, recycle the previous code cell instead of paying fresh occupied capacity:
+
+```bash
+PREVIOUS_CONTRACT_TX_HASH=0x<old_deploy_tx_hash> \
+PREVIOUS_CONTRACT_INDEX=0 \
+CKB_PRIVATE_KEY=0x... \
+pnpm deploy:contract
+```
+
+This consumes the old code cell as an input and reuses its capacity for the new deployment.
+
+If one old code cell is still too small for the new ELF, recycle multiple older deployments together:
+
+```bash
+PREVIOUS_CONTRACT_OUTPOINTS=0x<tx_hash_a>:0,0x<tx_hash_b>:0 \
+CKB_PRIVATE_KEY=0x... \
+pnpm deploy:contract
+```
 
 Relevant files:
 

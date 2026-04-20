@@ -4,10 +4,12 @@
   "scripts": {
     "deploy": "ts-node -P tsconfig.json deploy.ts",
     "seed": "ts-node -P tsconfig.json seed.ts",
-    "build-contract": "cd ../contract && pnpm build"
+    "smoke": "ts-node -P tsconfig.json smoke.ts",
+    "build-contract": "cd ../contracts-rust && cargo build --release -p governance-contract"
   },
   "dependencies": {
-    "@ckb-ccc/core": "^1.0.0"
+    "@ckb-ccc/core": "^1.0.0",
+    "dotenv": "^16.6.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -9,12 +9,14 @@
   "scripts": {
     "build": "pnpm build:contract && pnpm build:frontend",
     "build:contract": "pnpm --filter ckb-voting-contract build",
+    "build:contract:rust": "cd backend/contracts-rust && cargo build --release -p governance-contract",
     "build:frontend": "pnpm --filter ckb-voting-frontend build",
     "test": "pnpm test:contract && pnpm test:frontend",
     "test:contract": "pnpm --filter ckb-voting-contract test",
     "test:frontend": "pnpm --filter ckb-voting-frontend test",
+    "check:contract:rust": "cd backend/contracts-rust && cargo check -p governance-contract",
     "dev:frontend": "pnpm --filter ckb-voting-frontend dev",
-    "deploy:contract": "pnpm --filter ckb-voting-deploy deploy",
+    "deploy:contract": "pnpm build:contract:rust && pnpm --filter ckb-voting-deploy run deploy",
     "deploy:vercel": "pnpm exec vercel deploy",
     "deploy:vercel:prod": "pnpm exec vercel deploy --prod"
   },

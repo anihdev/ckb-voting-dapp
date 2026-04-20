@@ -10,6 +10,8 @@ node_modules/
 # Build outputs
 dist/
 build/
+backend/contracts-rust/target/
+frontend/src/dist/
 
 # TypeScript
 *.tsbuildinfo

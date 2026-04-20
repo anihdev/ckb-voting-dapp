@@ -32,6 +32,7 @@ import {
 
 const SCRIPT_HASH_TYPE = "data1";
 const ZERO_HASH_32 = `0x${"00".repeat(32)}`;
+const AGGREGATE_FEE_RESERVE_SHANNONS = 1_000_000n;
 
 export const GOVERNANCE_CODE_HASH =
   (import.meta as any).env?.VITE_GOVERNANCE_CODE_HASH ??
@@ -85,6 +86,13 @@ export function estimateCellCapacity(dataBytes: number, extraScriptBytes = 61): 
   return BigInt(dataBytes + extraScriptBytes) * SHANNONS_PER_CKB;
 }
 
+function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
+  const lockBytes = (ccc as any).Script.from(lockScript).toBytes().length;
+  const typeBytes = typeScript ? (ccc as any).Script.from(typeScript).toBytes().length : 0;
+  const occupiedBytes = 8 + lockBytes + typeBytes + dataBytes + 32;
+  return BigInt(occupiedBytes) * SHANNONS_PER_CKB;
+}
+
 function encodeOpArgs(op: number, scopeHex = "0x"): string {
   return `0x${op.toString(16).padStart(2, "0")}${scopeHex.replace(/^0x/, "")}`;
 }
@@ -109,12 +117,12 @@ export function buildGovernanceCellDep(): any {
 
 export function hashScript(script: any): string {
   const normalized = normalizeScript(script);
-  const hashTypeByte =
-    normalized.hash_type === "type" ? "01" : normalized.hash_type === "data1" ? "02" : "00";
-
-  return `0x${hashTypeByte}${String(normalized.code_hash).replace(/^0x/, "")}${String(normalized.args).replace(/^0x/, "")}`
-    .slice(0, 66)
-    .padEnd(66, "0");
+  const serialized = (ccc as any).Script.from({
+    codeHash: normalized.code_hash,
+    hashType: normalized.hash_type,
+    args: normalized.args,
+  }).toBytes();
+  return ccc.hexFrom((ccc as any).hashCkb(serialized));
 }
 
 export async function getSignerAddressObj(signer: any): Promise<any> {
@@ -165,6 +173,7 @@ export async function buildCreatePollTx(
   }
 ): Promise<any> {
   const client = signer.client;
+  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const creatorLockHash = await getSignerLockHash(signer);
 
@@ -184,13 +193,15 @@ export async function buildCreatePollTx(
   });
 
   const signerAddress = await getSignerAddressObj(signer);
+  const pollScope = generateRandomScopeHex();
   const capacity = CREATOR_DEPOSIT_SHANNONS + estimateCellCapacity(pollData.length);
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
+    headerDeps: [tipHeader.hash],
     outputs: [
       {
         lock: signerAddress.script,
-        type: buildGovernanceTypeScript(OP.CREATE_POLL),
+        type: buildGovernanceTypeScript(OP.CREATE_POLL, pollScope),
         capacity,
       },
     ],
@@ -211,6 +222,7 @@ export async function buildCreateVoteIntentTx(
   }
 ): Promise<any> {
   const client = signer.client;
+  const tipHeader = await client.getTipHeader();
   const epoch = await getTipEpoch(client);
   const signerLockHash = await getSignerLockHash(signer);
   const voterLockHash = input.delegationCell
@@ -234,9 +246,12 @@ export async function buildCreateVoteIntentTx(
       signerAddress.script
     ),
   });
+  const intentType = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, input.pollTypeHash);
+  const intentCapacity = estimateOutputCapacity(signerAddress.script, intentType, intentData.length);
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
+    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(signerAuthCell) },
       ...(input.delegationCell ? [{ previousOutput: getOutPoint(input.delegationCell) }] : []),
@@ -244,8 +259,8 @@ export async function buildCreateVoteIntentTx(
     outputs: [
       {
         lock: signerAddress.script,
-        type: buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, input.pollTypeHash),
-        capacity: VOTER_DEPOSIT_SHANNONS,
+        type: intentType,
+        capacity: intentCapacity > VOTER_DEPOSIT_SHANNONS ? intentCapacity : VOTER_DEPOSIT_SHANNONS,
       },
     ],
     outputsData: [bytesToHex(intentData)],
@@ -265,22 +280,27 @@ export async function buildDelegateTx(
   signer: any,
   input: { delegateLockHash: string; pollTypeHash?: string; expiresEpoch?: bigint }
 ): Promise<any> {
+  const tipHeader = await signer.client.getTipHeader();
   const signerAddress = await getSignerAddressObj(signer);
   const delegatorLockHash = await getSignerLockHash(signer);
+  const delegateLockHash = await resolveDelegateLockHash(signer, input.delegateLockHash);
   const delegationData = encodeDelegationData({
     delegator_lock_hash: delegatorLockHash,
-    delegate_lock_hash: (ccc as any).bytesFrom(input.delegateLockHash),
+    delegate_lock_hash: (ccc as any).bytesFrom(delegateLockHash),
     poll_type_hash: (ccc as any).bytesFrom(input.pollTypeHash ?? ZERO_HASH_HEX),
     expires_epoch: input.expiresEpoch ?? 0n,
   });
+  const delegationType = buildGovernanceTypeScript(OP.DELEGATE, input.pollTypeHash ?? ZERO_HASH_HEX);
+  const delegationCapacity = estimateOutputCapacity(signerAddress.script, delegationType, delegationData.length);
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
+    headerDeps: [tipHeader.hash],
     outputs: [
       {
         lock: signerAddress.script,
-        type: buildGovernanceTypeScript(OP.DELEGATE, input.pollTypeHash ?? ZERO_HASH_HEX),
-        capacity: DELEGATION_MIN_SHANNONS,
+        type: delegationType,
+        capacity: delegationCapacity > DELEGATION_MIN_SHANNONS ? delegationCapacity : DELEGATION_MIN_SHANNONS,
       },
     ],
     outputsData: [bytesToHex(delegationData)],
@@ -330,8 +350,33 @@ function denormalizeScript(script: EncodedScript): any {
   };
 }
 
+async function resolveDelegateLockHash(signer: any, input: string): Promise<string> {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    throw new Error("Delegate address or lock hash is required");
+  }
+
+  if (/^0x[0-9a-fA-F]{64}$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith("ckt1") || trimmed.startsWith("ckb1")) {
+    const address = await (ccc as any).Address.fromString(trimmed, signer.client);
+    return hashScript(address.script);
+  }
+
+  throw new Error("Enter a valid CKB address or 32-byte lock hash");
+}
+
+function generateRandomScopeHex(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return ccc.hexFrom(bytes);
+}
+
 async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = []): Promise<any> {
   const signerAddress = await getSignerAddressObj(signer);
+  let fallbackCell: any | null = null;
 
   for await (const cell of signer.client.findCells({
     script: signerAddress.script,
@@ -339,9 +384,21 @@ async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = [])
     scriptSearchMode: "exact",
   })) {
     const outPointKey = `${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`;
-    if (!excludedOutPoints.includes(outPointKey)) {
+    if (excludedOutPoints.includes(outPointKey)) {
+      continue;
+    }
+
+    const type = getCellType(cell);
+    const outputData = (cell.outputData ?? "0x") as string;
+    if (!type && (outputData === "0x" || outputData === "0x0" || outputData.length <= 2)) {
       return cell;
     }
+
+    fallbackCell = fallbackCell ?? cell;
+  }
+
+  if (fallbackCell) {
+    return fallbackCell;
   }
 
   throw new Error("No signer auth cell available");
@@ -351,6 +408,7 @@ export async function buildAggregateVotesTx(
   signer: any,
   input: { pollCell: any; intentCells: any[] }
 ): Promise<any> {
+  const tipHeader = await signer.client.getTipHeader();
   const pollOutput = getCellOutput(input.pollCell);
   const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const nextVoteCounts = [...previousPoll.vote_counts];
@@ -390,6 +448,7 @@ export async function buildAggregateVotesTx(
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
+    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(input.pollCell) },
       ...input.intentCells.map((cell) => ({ previousOutput: getOutPoint(cell) })),
@@ -398,7 +457,7 @@ export async function buildAggregateVotesTx(
       {
         lock: pollOutput.lock,
         type: pollOutput.type,
-        capacity: getCellCapacity(input.pollCell),
+        capacity: getCellCapacity(input.pollCell) - AGGREGATE_FEE_RESERVE_SHANNONS,
       },
       ...nextIntentOutputs.map((item) => item.output),
     ],
@@ -406,8 +465,6 @@ export async function buildAggregateVotesTx(
     witnesses: new Array(input.intentCells.length + 1).fill("0x"),
   });
 
-  await tx.completeInputsByCapacity(signer);
-  await tx.completeFeeBy(signer, 1000);
   return tx;
 }
 
@@ -492,6 +549,10 @@ export async function buildRevokeDelegationTx(
 }
 
 export async function signAndSendTx(signer: any, tx: any): Promise<string> {
+  if (typeof signer?.sendTransaction === "function") {
+    return signer.sendTransaction(tx);
+  }
+
   await signer.signTransaction(tx);
   return signer.client.sendTransaction(tx);
 }

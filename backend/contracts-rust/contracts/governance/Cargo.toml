@@ -1,0 +1,11 @@
+[package]
+name = "governance-contract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ckb-std = { workspace = true }
+
+[features]
+default = []
+native-simulator = []

@@ -1,7 +1,7 @@
 /**
  * Deploy Script
  * =============
- * Deploys the voting contract script to CKB testnet.
+ * Deploys the Rust-built governance ELF to CKB testnet.
  * The contract binary is stored in a cell's data field.
  * Its type hash becomes the "voting type script code_hash".
  *
@@ -9,7 +9,7 @@
  * Run:  CKB_PRIVATE_KEY=0x... npx ts-node deploy/deploy.ts
  *
  * Prerequisites:
- *   npm install @ckb-ccc/core
+ *   pnpm build:contract:rust
  *   Your deployer address must have testnet CKB.
  *   Get testnet CKB: https://faucet.nervos.org/
  */
@@ -17,7 +17,14 @@
 import { ccc } from "@ckb-ccc/core";
 import * as fs from "fs";
 import * as path from "path";
-import { CONTRACT_PATH, RPC_URL, MIN_CONFIRMATIONS } from "./config";
+import {
+  CONTRACT_PATH,
+  RPC_URL,
+  MIN_CONFIRMATIONS,
+  PREVIOUS_CONTRACT_TX_HASH,
+  PREVIOUS_CONTRACT_INDEX,
+  PREVIOUS_CONTRACT_OUTPOINTS,
+} from "./config";
 
 // ─── Read private key from environment ───────────────────────────────────────
 const PRIVATE_KEY = process.env.CKB_PRIVATE_KEY;
@@ -39,23 +46,32 @@ async function deploy(): Promise<void> {
   const deployerAddress = await signer.getAddressObjSecp256k1();
   console.log(`Deployer address: ${deployerAddress.toString()}`);
 
-  // 3. Read compiled contract binary
+  // 3. Read the compiled RISC-V ELF artifact
   const contractPath = path.resolve(__dirname, CONTRACT_PATH);
   if (!fs.existsSync(contractPath)) {
     console.error(`❌  Contract not found at ${contractPath}`);
-    console.error("    Run: cd backend/contract && npm run build");
+    console.error("    Run: pnpm build:contract:rust");
     process.exit(1);
   }
 
   const contractCode = fs.readFileSync(contractPath);
+  console.log(`Contract ELF: ${contractPath}`);
   console.log(`Contract size: ${(contractCode.length / 1024).toFixed(1)} KB`);
 
-  // 4. Build the deploy transaction
-  //    The contract goes into a cell's data field.
-  //    We use a simple secp256k1 lock for the code cell (deployer controls it).
+  // 4. Build the deploy transaction. When a previous code cell out point is
+  //    supplied, we consume it first so its capacity is recycled into the new
+  //    deployment instead of paying fresh occupied capacity every iteration.
   const contractData = ccc.bytesFrom(contractCode);
+  const recycledInputs = parseRecycledOutPoints();
+  if (recycledInputs.length > 0) {
+    console.log("Recycling previous code cells:");
+    for (const input of recycledInputs) {
+      console.log(`  - ${input.previousOutput.txHash}:${input.previousOutput.index}`);
+    }
+  }
 
   const tx = ccc.Transaction.from({
+    inputs: recycledInputs,
     outputs: [
       {
         // Code cell: no type script, data = contract binary
@@ -66,7 +82,7 @@ async function deploy(): Promise<void> {
     outputsData: [contractData],
   });
 
-  // 5. Complete inputs (CCC auto-selects UTXOs)
+  // 5. Complete any additional inputs needed after recycling.
   await tx.completeInputsByCapacity(signer);
   await tx.completeFeeBy(signer, 1000); // 1000 shannons/KB fee rate
 
@@ -90,6 +106,14 @@ async function deploy(): Promise<void> {
   console.log(`Contract TX hash:  ${txHash}`);
   console.log(`Contract out_point: { tx_hash: "${txHash}", index: "0x0" }`);
   console.log(`Code hash (blake2b of data): ${codeHash}`);
+  if (recycledInputs.length > 0) {
+    console.log("Recycled old out_points:");
+    for (const input of recycledInputs) {
+      console.log(
+        `  { tx_hash: "${input.previousOutput.txHash}", index: "0x${Number(input.previousOutput.index).toString(16)}" }`
+      );
+    }
+  }
   console.log("\nFrontend env values:");
   console.log(`VITE_GOVERNANCE_CODE_HASH=${codeHash}`);
   console.log(`VITE_GOVERNANCE_SCRIPT_TX_HASH=${txHash}`);
@@ -138,6 +162,41 @@ async function computeDataHash(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRecycledOutPoints(): Array<{ previousOutput: { txHash: string; index: number } }> {
+  if (PREVIOUS_CONTRACT_OUTPOINTS) {
+    return PREVIOUS_CONTRACT_OUTPOINTS.split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [txHash, rawIndex = "0"] = entry.split(":");
+        if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+          throw new Error(`Invalid recycled contract tx hash: ${entry}`);
+        }
+        const index = Number(rawIndex);
+        if (!Number.isInteger(index) || index < 0) {
+          throw new Error(`Invalid recycled contract index: ${entry}`);
+        }
+        return {
+          previousOutput: {
+            txHash,
+            index,
+          },
+        };
+      });
+  }
+
+  if (PREVIOUS_CONTRACT_TX_HASH) {
+    return [{
+      previousOutput: {
+        txHash: PREVIOUS_CONTRACT_TX_HASH,
+        index: PREVIOUS_CONTRACT_INDEX,
+      },
+    }];
+  }
+
+  return [];
 }
 
 // ─── Run ──────────────────────────────────────────────────────────────────────
