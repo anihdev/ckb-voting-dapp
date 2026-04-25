@@ -86,7 +86,7 @@ export function estimateCellCapacity(dataBytes: number, extraScriptBytes = 61): 
   return BigInt(dataBytes + extraScriptBytes) * SHANNONS_PER_CKB;
 }
 
-function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
+export function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
   const lockBytes = (ccc as any).Script.from(lockScript).toBytes().length;
   const typeBytes = typeScript ? (ccc as any).Script.from(typeScript).toBytes().length : 0;
   const occupiedBytes = 8 + lockBytes + typeBytes + dataBytes + 32;
@@ -194,14 +194,17 @@ export async function buildCreatePollTx(
 
   const signerAddress = await getSignerAddressObj(signer);
   const pollScope = generateRandomScopeHex();
-  const capacity = CREATOR_DEPOSIT_SHANNONS + estimateCellCapacity(pollData.length);
+  const pollType = buildGovernanceTypeScript(OP.CREATE_POLL, pollScope);
+  const capacity =
+    CREATOR_DEPOSIT_SHANNONS +
+    estimateOutputCapacity(signerAddress.script, pollType, pollData.length);
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
     headerDeps: [tipHeader.hash],
     outputs: [
       {
         lock: signerAddress.script,
-        type: buildGovernanceTypeScript(OP.CREATE_POLL, pollScope),
+        type: pollType,
         capacity,
       },
     ],
@@ -445,6 +448,15 @@ export async function buildAggregateVotesTx(
         : 0n,
     counted_voter_lock_hashes: [...previousPoll.counted_voter_lock_hashes, ...appendedVoters],
   });
+  const updatedPollMinCapacity = estimateOutputCapacity(
+    pollOutput.lock,
+    pollOutput.type,
+    updatedPoll.length
+  );
+  const updatedPollCandidateCapacity = getCellCapacity(input.pollCell) - AGGREGATE_FEE_RESERVE_SHANNONS;
+  const updatedPollCapacity = updatedPollCandidateCapacity > updatedPollMinCapacity
+    ? updatedPollCandidateCapacity
+    : updatedPollMinCapacity;
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
@@ -457,7 +469,7 @@ export async function buildAggregateVotesTx(
       {
         lock: pollOutput.lock,
         type: pollOutput.type,
-        capacity: getCellCapacity(input.pollCell) - AGGREGATE_FEE_RESERVE_SHANNONS,
+        capacity: updatedPollCapacity,
       },
       ...nextIntentOutputs.map((item) => item.output),
     ],
@@ -484,8 +496,15 @@ export async function buildClosePollTx(
     ...previousPoll,
     is_closed: true,
   });
-
-  const closedPollCapacity = getCellCapacity(input.pollCell) - previousPoll.creator_deposit;
+  const closedPollMinCapacity = estimateOutputCapacity(
+    pollOutput.lock,
+    pollOutput.type,
+    closedPoll.length
+  );
+  const closedPollCandidateCapacity = getCellCapacity(input.pollCell) - previousPoll.creator_deposit;
+  const closedPollCapacity = closedPollCandidateCapacity > closedPollMinCapacity
+    ? closedPollCandidateCapacity
+    : closedPollMinCapacity;
 
   const voterReturns = input.intentCells.map((cell) => ({
     lock: denormalizeScript(decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x")).refund_lock),

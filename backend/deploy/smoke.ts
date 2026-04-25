@@ -80,10 +80,6 @@ function governanceCellDep() {
   };
 }
 
-function estimateCellCapacity(dataBytes: number, extraScriptBytes = 61): bigint {
-  return BigInt(dataBytes + extraScriptBytes) * SHANNONS_PER_CKB;
-}
-
 function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
   const lockBytes = (ccc as any).Script.from(lockScript).toBytes().length;
   const typeBytes = typeScript ? (ccc as any).Script.from(typeScript).toBytes().length : 0;
@@ -185,7 +181,9 @@ async function main(): Promise<void> {
     udt_type_hash: new Uint8Array(32),
   };
   const pollBytes = encodePollData(pollData);
-  const pollCapacity = CREATOR_DEPOSIT_SHANNONS + estimateCellCapacity(pollBytes.length);
+  const pollCapacity =
+    CREATOR_DEPOSIT_SHANNONS +
+    estimateOutputCapacity(signerAddress.script, pollType, pollBytes.length);
 
   const createPollTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
@@ -289,6 +287,15 @@ async function main(): Promise<void> {
   };
   const aggregatedPollBytes = encodePollData(aggregatedPollData);
   const aggregatedIntentBytes = encodeVoteIntentData({ ...intentData, aggregated: true });
+  const aggregatedPollMinCapacity = estimateOutputCapacity(
+    signerAddress.script,
+    pollType,
+    aggregatedPollBytes.length
+  );
+  const aggregatedPollCandidateCapacity = pollCell.cellOutput.capacity - AGGREGATE_FEE_RESERVE_SHANNONS;
+  const aggregatedPollCapacity = aggregatedPollCandidateCapacity > aggregatedPollMinCapacity
+    ? aggregatedPollCandidateCapacity
+    : aggregatedPollMinCapacity;
 
   const aggregateTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
@@ -301,7 +308,7 @@ async function main(): Promise<void> {
       {
         lock: signerAddress.script,
         type: pollType,
-        capacity: pollCapacity - AGGREGATE_FEE_RESERVE_SHANNONS,
+        capacity: aggregatedPollCapacity,
       },
       {
         lock: signerAddress.script,
@@ -322,7 +329,7 @@ async function main(): Promise<void> {
     cellOutput: {
       lock: signerAddress.script,
       type: pollType,
-      capacity: pollCapacity - AGGREGATE_FEE_RESERVE_SHANNONS,
+      capacity: aggregatedPollCapacity,
     },
     outputData: ccc.hexFrom(aggregatedPollBytes),
   };
@@ -345,6 +352,15 @@ async function main(): Promise<void> {
     ...aggregatedPollData,
     is_closed: true,
   });
+  const closedPollMinCapacity = estimateOutputCapacity(
+    signerAddress.script,
+    pollType,
+    closedPollBytes.length
+  );
+  const closedPollCandidateCapacity = aggregatedPollCell.cellOutput.capacity - CREATOR_DEPOSIT_SHANNONS;
+  const closedPollCapacity = closedPollCandidateCapacity > closedPollMinCapacity
+    ? closedPollCandidateCapacity
+    : closedPollMinCapacity;
   const closeTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
     inputs: [
@@ -356,7 +372,7 @@ async function main(): Promise<void> {
       {
         lock: signerAddress.script,
         type: pollType,
-        capacity: aggregatedPollCell.cellOutput.capacity - CREATOR_DEPOSIT_SHANNONS,
+        capacity: closedPollCapacity,
       },
       {
         lock: signerAddress.script,

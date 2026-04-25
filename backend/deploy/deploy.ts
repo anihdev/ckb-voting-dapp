@@ -29,7 +29,7 @@ import {
 // ─── Read private key from environment ───────────────────────────────────────
 const PRIVATE_KEY = process.env.CKB_PRIVATE_KEY;
 if (!PRIVATE_KEY) {
-  console.error("❌  Set CKB_PRIVATE_KEY env var before running deploy");
+  console.error("Set CKB_PRIVATE_KEY env var before running deploy");
   process.exit(1);
 }
 
@@ -49,8 +49,8 @@ async function deploy(): Promise<void> {
   // 3. Read the compiled RISC-V ELF artifact
   const contractPath = path.resolve(__dirname, CONTRACT_PATH);
   if (!fs.existsSync(contractPath)) {
-    console.error(`❌  Contract not found at ${contractPath}`);
-    console.error("    Run: pnpm build:contract:rust");
+    console.error(`Contract not found at ${contractPath}`);
+    console.error("Run: pnpm build:contract:rust");
     process.exit(1);
   }
 
