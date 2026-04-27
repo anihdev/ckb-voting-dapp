@@ -10,12 +10,6 @@ This repository is built around the CKB cell model rather than an account-style 
 - delegation is encoded as a first-class cell
 - close returns locked deposits through verified refund paths
 
-The canonical protocol source is:
-
-- [backend/contract/src/index.ts](/home/anihdev/ckb-voting-dapp/backend/contract/src/index.ts)
-- [backend/contract/src/molecule.ts](/home/anihdev/ckb-voting-dapp/backend/contract/src/molecule.ts)
-
-Everything else in the repo is expected to align to those two files.
 
 ## Execution Status
 
