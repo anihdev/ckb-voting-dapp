@@ -1,57 +1,39 @@
 /**
  * App.tsx
  * =======
- * Root component. Wires CCC with an explicit testnet client, adds a runtime
- * error boundary, and renders a more intentional production shell.
+ * Governance dashboard shell aligned to the intent-cell protocol flow.
  */
 
-import React, { Component, Suspense, lazy, useEffect, useState } from "react";
+import React, { Component, Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 import { Provider } from "@ckb-ccc/connector-react";
 import { ccc } from "@ckb-ccc/core";
 import { useCKB } from "./hooks/useCKB";
 import { usePolls } from "./hooks/usePolls";
-import { CKB_RPC_URL, getTipEpoch, validateRuntimeConfig } from "./lib/ckb";
+import { CKB_RPC_URL, getTipEpoch, shannonsToCkb, validateRuntimeConfig } from "./lib/ckb";
 import { WalletConnect } from "./components/WalletConnect";
 
-const CreatePoll = lazy(() =>
-  import("./components/CreatePoll").then((module) => ({ default: module.CreatePoll }))
-);
-const DelegatePower = lazy(() =>
-  import("./components/DelegatePower").then((module) => ({ default: module.DelegatePower }))
-);
-const PollList = lazy(() =>
-  import("./components/PollList").then((module) => ({ default: module.PollList }))
-);
+const CreatePoll = lazy(() => import("./components/CreatePoll").then((module) => ({ default: module.CreatePoll })));
+const DelegatePower = lazy(() => import("./components/DelegatePower").then((module) => ({ default: module.DelegatePower })));
+const PollList = lazy(() => import("./components/PollList").then((module) => ({ default: module.PollList })));
 
 const defaultClient = new ccc.ClientPublicTestnet({ url: CKB_RPC_URL });
 
-class AppErrorBoundary extends Component<
-  { children: React.ReactNode },
-  { error: string | null }
-> {
+class AppErrorBoundary extends Component<{ children: React.ReactNode }, { error: string | null }> {
   state = { error: null as string | null };
 
   static getDerivedStateFromError(error: Error) {
-    return { error: error.message || "Unknown runtime error" };
+    return { error: error.message || "Unknown error" };
   }
 
   render() {
     if (this.state.error) {
       return (
-        <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#f6e8d8,_#efe9df_40%,_#d7d4cb_100%)] px-4 py-10">
-          <div className="mx-auto max-w-3xl rounded-[28px] border border-stone-300/70 bg-white/85 p-8 shadow-[0_24px_70px_rgba(63,49,35,0.14)] backdrop-blur">
-            <div className="mb-3 text-xs font-semibold uppercase tracking-[0.28em] text-rose-700">
-              Runtime Error
-            </div>
-            <h1 className="font-['Iowan_Old_Style','Palatino_Linotype','Book_Antiqua',Georgia,serif] text-3xl text-stone-900">
-              The app hit a client-side error instead of rendering a blank page.
-            </h1>
-            <p className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-              {this.state.error}
-            </p>
-            <p className="mt-4 text-sm text-stone-600">
-              Refresh after reconnecting the wallet. If this persists, the current message is now visible for debugging.
-            </p>
+        <div className="app-shell" style={{ padding: "60px 32px" }}>
+          <div className="panel" style={{ maxWidth: 640, margin: "0 auto" }}>
+            <div className="kicker" style={{ marginBottom: 12 }}>Runtime Error</div>
+            <h1 className="section-title" style={{ marginBottom: 16 }}>The app hit a client-side error.</h1>
+            <div className="alert alert-error">{this.state.error}</div>
+            <p className="hint" style={{ marginTop: 12 }}>Reconnect your wallet and refresh. Error detail is visible above.</p>
           </div>
         </div>
       );
@@ -63,7 +45,7 @@ class AppErrorBoundary extends Component<
 
 function InnerApp() {
   const configError = validateRuntimeConfig();
-  const { signer, address, isConnected, error: walletError } = useCKB();
+  const { signer, address, lockScriptHash, balance, isConnected, connect, error: walletError } = useCKB();
   const {
     polls,
     delegations,
@@ -75,179 +57,320 @@ function InnerApp() {
     castVote,
     aggregatePoll,
     closePoll,
+    forceClose,
     createDelegation,
     revokeDelegation,
   } = usePolls(signer);
 
   const [currentEpoch, setCurrentEpoch] = useState<bigint>(0n);
+  const [lastSyncedAt, setLastSyncedAt] = useState<number>(Date.now());
+  const [secondsSinceSync, setSecondsSinceSync] = useState<number>(0);
+
+  const syncDashboard = useCallback(async () => {
+    if (!signer) return;
+    await fetchPolls();
+    const epoch = await getTipEpoch(signer.client);
+    setCurrentEpoch(epoch);
+    setLastSyncedAt(Date.now());
+    setSecondsSinceSync(0);
+  }, [fetchPolls, signer]);
 
   useEffect(() => {
-    if (signer) {
-      fetchPolls().catch(console.error);
-      getTipEpoch(signer.client).then(setCurrentEpoch).catch(console.error);
-    }
-  }, [signer, fetchPolls]);
+    if (!signer) return;
+    syncDashboard().catch(console.error);
+
+    const id = setInterval(() => {
+      syncDashboard().catch(console.error);
+    }, 30000);
+
+    return () => clearInterval(id);
+  }, [signer, syncDashboard]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setSecondsSinceSync(Math.max(0, Math.floor((Date.now() - lastSyncedAt) / 1000)));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [lastSyncedAt]);
+
+  const protocolTimeline = useMemo(() => {
+    type State = "completed" | "live" | "pending";
+
+    const hasPolls = polls.length > 0;
+    const hasIntent = polls.some((poll) => poll.totalVoters > 0n || poll.pendingIntentCount > 0n);
+    const hasAggregated = polls.some((poll) => poll.totalVotes > 0n);
+    const hasExpiredOpen = polls.some((poll) => !poll.isClosed && currentEpoch > poll.deadline);
+    const hasClosed = polls.some((poll) => poll.isClosed);
+    const hasDelegation = delegations.length > 0;
+
+    return [
+      {
+        op: "CREATE_POLL",
+        label: "Create poll cell",
+        detail: "Lock creator deposit and initialize governance state.",
+        state: hasPolls ? ("completed" as State) : ("live" as State),
+      },
+      {
+        op: "CREATE_VOTE_INTENT",
+        label: "Record vote intent",
+        detail: "Store independent voter intent cells.",
+        state: hasIntent ? ("completed" as State) : hasPolls ? ("live" as State) : ("pending" as State),
+      },
+      {
+        op: "AGGREGATE_VOTES",
+        label: "Aggregate intents",
+        detail: "Batch-consume pending intents and update tally.",
+        state: hasAggregated ? ("completed" as State) : hasIntent ? ("live" as State) : ("pending" as State),
+      },
+      {
+        op: "CLOSE_POLL",
+        label: "Close or recover",
+        detail: "Creator closes after deadline, then force-close after grace.",
+        state: hasClosed ? ("completed" as State) : hasExpiredOpen ? ("live" as State) : ("pending" as State),
+      },
+      {
+        op: "DELEGATE",
+        label: "Delegate authority",
+        detail: "Issue delegation cells globally or per poll.",
+        state: hasDelegation ? ("completed" as State) : hasPolls ? ("live" as State) : ("pending" as State),
+      },
+      {
+        op: "REVOKE_DELEGATION",
+        label: "Revoke delegation",
+        detail: "Consume delegation cell to revoke authority.",
+        state: hasDelegation ? ("live" as State) : ("pending" as State),
+      },
+    ] as const;
+  }, [currentEpoch, delegations, polls]);
 
   const sectionFallback = (
-    <div className="rounded-[24px] border border-stone-300/60 bg-white/80 px-5 py-6 text-sm text-stone-500 shadow-[0_14px_40px_rgba(68,55,40,0.08)] backdrop-blur">
-      Loading interface...
+    <div className="card-shell" style={{ padding: 24 }}>
+      <div className="skeleton" style={{ height: 18, width: 160, borderRadius: 6 }} />
+      <div className="skeleton" style={{ height: 14, width: "80%", marginTop: 12, borderRadius: 6 }} />
+      <div className="skeleton" style={{ height: 14, width: "60%", marginTop: 8, borderRadius: 6 }} />
     </div>
   );
 
   return (
-    <div className="min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_top,_#f5ead8,_#efe8dc_32%,_#e5e1d8_58%,_#d6d1c9_100%)] text-stone-900">
-      <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(120deg,rgba(104,72,41,0.06),transparent_40%,rgba(28,65,67,0.06))]" />
-
-      <nav className="sticky top-0 z-50 border-b border-stone-300/50 bg-white/70 backdrop-blur-xl">
-        <div className="mx-auto flex h-20 max-w-6xl items-center justify-between px-5">
-          <div className="flex items-center gap-4">
-            <div className="grid h-12 w-12 place-items-center rounded-2xl border border-stone-300/70 bg-stone-900 text-lg text-stone-50 shadow-[0_10px_24px_rgba(41,31,24,0.25)]">
-              CG
-            </div>
+    <div className="app-shell">
+      <nav className="top-nav">
+        <div className="nav-inner">
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div className="logo-mark">CG</div>
             <div>
-              <div className="font-['Iowan_Old_Style','Palatino_Linotype','Book_Antiqua',Georgia,serif] text-2xl leading-tight text-stone-900">
-                CKB Governance
-              </div>
-              <div className="text-xs uppercase tracking-[0.24em] text-stone-500">
-                Intent-cell protocol on Nervos
-              </div>
+              <div className="logo-name">CKB Governance</div>
+              <div className="logo-tagline">Voting protocol | Nervos</div>
             </div>
           </div>
           <WalletConnect />
         </div>
       </nav>
 
-      <main className="relative mx-auto max-w-6xl px-5 py-10">
-        <section className="grid gap-6 lg:grid-cols-[1.4fr,0.9fr]">
-          <div className="rounded-[34px] border border-stone-300/60 bg-white/78 p-7 shadow-[0_30px_80px_rgba(52,39,28,0.13)] backdrop-blur">
-            <div className="mb-4 text-xs font-semibold uppercase tracking-[0.28em] text-amber-800">
-              Live Testnet Deployment
-            </div>
-            <h1 className="max-w-3xl font-['Iowan_Old_Style','Palatino_Linotype','Book_Antiqua',Georgia,serif] text-4xl leading-tight text-stone-900 sm:text-5xl">
-              Deposit-backed governance with independent vote intents, delegation, and close-time refunds.
-            </h1>
-            <p className="mt-4 max-w-2xl text-sm leading-7 text-stone-600 sm:text-base">
-              This app is designed around the CKB cell model. Votes are recorded as separate intent cells, aggregation updates shared tally state in batches, and refunds follow verified spend paths.
-            </p>
-            <div className="mt-6 flex flex-wrap gap-3 text-xs font-medium uppercase tracking-[0.18em] text-stone-600">
-              <span className="rounded-full border border-stone-300/70 bg-stone-50 px-4 py-2">Testnet</span>
-              <span className="rounded-full border border-stone-300/70 bg-stone-50 px-4 py-2">6 operations</span>
-              <span className="rounded-full border border-stone-300/70 bg-stone-50 px-4 py-2">Intent aggregation</span>
-              <span className="rounded-full border border-stone-300/70 bg-stone-50 px-4 py-2">Delegation cells</span>
-            </div>
+      <main className="dashboard-main">
+        <div className="hero" style={{ paddingLeft: 0, paddingRight: 0 }}>
+          <a
+            className="hero-kicker"
+            href="https://github.com/anihdev/ckb-voting-dapp"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open repository"
+            style={{ textDecoration: "none" }}
+          >
+            <span className="hero-kicker-dot" />
+            Live | Testnet
+          </a>
+          <h1 className="hero-title">
+            On-chain <span>governance</span>
+            <br />
+            control panel.
+          </h1>
+          <p className="hero-desc">
+            Votes are recorded as independent intent cells and counted later through aggregation.
+            This reduces shared-cell contention and keeps governance state explicit on-chain.
+          </p>
+          <p className="hero-desc" style={{ marginTop: 8 }}>
+            Deposits stay inside governance cells as capacity. Delegation controls authority, not
+            ownership. Close paths return funds through verified spend rules.
+          </p>
+          <div className="hero-chips">
+            <span className="chip">Testnet</span>
+            <span className="chip">6 operations</span>
+            <span className="chip">Intent aggregation</span>
+            <span className="chip">Delegation cells</span>
+            <span className="chip">Permissionless force-close</span>
           </div>
-
-          <div className="rounded-[34px] border border-stone-300/60 bg-stone-900 p-7 text-stone-100 shadow-[0_30px_80px_rgba(31,25,21,0.24)]">
-            <div className="mb-4 text-xs font-semibold uppercase tracking-[0.28em] text-stone-300">
-              Network Status
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1">
-              <div className="rounded-2xl border border-stone-700 bg-stone-800/80 px-4 py-4">
-                <div className="text-xs uppercase tracking-[0.2em] text-stone-400">Current Epoch</div>
-                <div className="mt-2 text-2xl font-semibold">{currentEpoch.toString()}</div>
-              </div>
-              <div className="rounded-2xl border border-stone-700 bg-stone-800/80 px-4 py-4">
-                <div className="text-xs uppercase tracking-[0.2em] text-stone-400">Indexed Polls</div>
-                <div className="mt-2 text-2xl font-semibold">{polls.length}</div>
-              </div>
-              <div className="rounded-2xl border border-stone-700 bg-stone-800/80 px-4 py-4">
-                <div className="text-xs uppercase tracking-[0.2em] text-stone-400">Active Delegations</div>
-                <div className="mt-2 text-2xl font-semibold">{delegations.length}</div>
-              </div>
-              <div className="rounded-2xl border border-stone-700 bg-stone-800/80 px-4 py-4">
-                <div className="text-xs uppercase tracking-[0.2em] text-stone-400">Wallet</div>
-                <div className="mt-2 text-sm text-stone-300">
-                  {isConnected && address ? `${address.slice(0, 16)}...${address.slice(-10)}` : "Not connected"}
-                </div>
-              </div>
-            </div>
+          <div className="hero-note">
+            This protocol uses intent cells for voting. Aggregation is a separate on-chain step -
+            aggregate before deadline to keep tally state current.
           </div>
-        </section>
-
-        <div className="mt-8 space-y-5">
-          {configError && (
-            <div className="rounded-2xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-700 shadow-sm">
-              <div className="font-semibold">Deployment config required</div>
-              <div className="mt-1">{configError}</div>
-              <div className="mt-2 text-xs text-rose-600">Current RPC: {CKB_RPC_URL}</div>
-            </div>
-          )}
-
-          {walletError && (
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-800 shadow-sm">
-              <div className="font-semibold">Wallet connection warning</div>
-              <div className="mt-1">{walletError}</div>
-            </div>
-          )}
-
-          {loadError && (
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-800 shadow-sm">
-              <div className="font-semibold">Indexer query warning</div>
-              <div className="mt-1">{loadError}</div>
-            </div>
-          )}
+          <div style={{ marginTop: 12, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-3)" }}>
+            Last synced {secondsSinceSync}s ago | auto-refresh every 30s
+          </div>
         </div>
 
-        {!isConnected && (
-          <section className="mt-8 rounded-[32px] border border-stone-300/60 bg-white/75 p-8 shadow-[0_24px_60px_rgba(63,49,35,0.12)] backdrop-blur">
-            <div className="max-w-3xl">
-              <div className="mb-3 text-xs font-semibold uppercase tracking-[0.28em] text-stone-500">
-                Connect To Continue
+        <div className="stats-row" style={{ padding: "0 0 40px" }}>
+          <div className="status-metric">
+            <div className="metric-label">Current Epoch</div>
+            <div className="metric-value">{currentEpoch.toString()}</div>
+            <span className="status-pill status-pill-neutral" style={{ marginTop: 8 }}>Testnet</span>
+          </div>
+          <div className="status-metric">
+            <div className="metric-label">Indexed Polls</div>
+            <div className="metric-value">{polls.length}</div>
+            <span className="status-pill status-pill-ok" style={{ marginTop: 8 }}>On-chain</span>
+          </div>
+          <div className="status-metric">
+            <div className="metric-label">Active Delegations</div>
+            <div className="metric-value">{delegations.length}</div>
+            <span className="status-pill status-pill-ok" style={{ marginTop: 8 }}>Cells</span>
+          </div>
+          <div className="status-metric">
+            <div className="metric-label">Available Balance</div>
+            {isConnected ? (
+              <div className="metric-value mono">{shannonsToCkb(balance)} CKB</div>
+            ) : (
+              <div className="metric-value mono">-</div>
+            )}
+            {isConnected && address && (
+              <div className="hint" style={{ marginTop: 6, fontFamily: "var(--font-mono)" }}>
+                {address.slice(0, 10)}...{address.slice(-6)}
               </div>
-              <h2 className="font-['Iowan_Old_Style','Palatino_Linotype','Book_Antiqua',Georgia,serif] text-3xl text-stone-900">
-                Connect a CKB wallet to create polls, vote with intents, aggregate results, and test the live refund flow.
-              </h2>
-              <p className="mt-4 text-sm leading-7 text-stone-600">
-                The hosted app uses CKB testnet. If your wallet has no funds yet, use the faucet below before submitting transactions.
-              </p>
-              <div className="mt-5">
-                <a
-                  href="https://faucet.nervos.org/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex rounded-full border border-stone-300 bg-stone-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-stone-700"
-                >
-                  Open Testnet Faucet
-                </a>
+            )}
+            <span className={`status-pill ${isConnected ? "status-pill-ok" : "status-pill-warn"}`} style={{ marginTop: 8 }}>
+              {isConnected ? "Connected" : "Disconnected"}
+            </span>
+          </div>
+        </div>
+
+        {(configError || walletError || loadError) && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
+            {configError && (
+              <div className="alert alert-error">
+                <strong>Deployment config required</strong>
+                <div style={{ marginTop: 4 }}>{configError}</div>
+                <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontSize: 10 }}>RPC: {CKB_RPC_URL}</div>
               </div>
-            </div>
-          </section>
+            )}
+            {walletError && (
+              <div className="alert alert-warn">
+                <strong>Wallet warning</strong>
+                <div style={{ marginTop: 4 }}>{walletError}</div>
+              </div>
+            )}
+            {loadError && (
+              <div className="alert alert-warn">
+                <strong>Indexer query warning</strong>
+                <div style={{ marginTop: 4 }}>{loadError}</div>
+              </div>
+            )}
+          </div>
         )}
 
-        <div className="mt-8 grid gap-6 xl:grid-cols-[1fr,1fr]">
-          {isConnected && (
-            <Suspense fallback={sectionFallback}>
-              <CreatePoll onSubmit={createPoll} txState={txState} />
-            </Suspense>
-          )}
+        {!isConnected && (
+          <div className="card-shell ui-enter" style={{ padding: 32, marginBottom: 32 }}>
+            <div className="kicker" style={{ marginBottom: 12 }}>Connect to continue</div>
+            <h2 className="section-title" style={{ fontSize: 26, maxWidth: 500, marginBottom: 12 }}>
+              Connect a CKB wallet to create polls, submit vote intents, aggregate results, and test refund flows.
+            </h2>
+            <p style={{ color: "var(--ink-2)", fontSize: 13, lineHeight: 1.7, maxWidth: 480 }}>
+              The app runs on CKB testnet. If your wallet has no funds, use the faucet before submitting transactions.
+            </p>
+            <div style={{ marginTop: 20 }}>
+              <a
+                href="https://faucet.nervos.org/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-primary"
+                style={{ display: "inline-block", borderRadius: 9999, padding: "11px 24px", textDecoration: "none" }}
+              >
+                Open Testnet Faucet -&gt;
+              </a>
+            </div>
+          </div>
+        )}
 
-          {isConnected && (
-            <Suspense fallback={sectionFallback}>
-              <DelegatePower
-                delegations={delegations}
-                txState={txState}
-                onDelegate={createDelegation}
-                onRevoke={revokeDelegation}
-              />
-            </Suspense>
-          )}
+        <Suspense fallback={sectionFallback}>
+          <PollList
+            polls={polls}
+            loading={loading}
+            isConnected={isConnected}
+            voterAddress={address}
+            voterLockHash={lockScriptHash}
+            txState={txState}
+            currentEpoch={currentEpoch}
+            onVote={(poll, optionIndex, authorityId, weightUnits) =>
+              castVote({ poll, optionIndex, authorityId, weightUnits })
+            }
+            onAggregate={aggregatePoll}
+            onClose={closePoll}
+            onForceClose={forceClose}
+            onRefresh={() => {
+              void syncDashboard();
+            }}
+            onConnectWallet={connect}
+          />
+        </Suspense>
+
+        {isConnected && (
+          <div id="creator-tools" style={{ marginTop: 20 }}>
+            <div className="kicker" style={{ marginBottom: 10 }}>Creator and Delegation Tools</div>
+            <div className="action-grid">
+              <Suspense fallback={sectionFallback}>
+                <DelegatePower
+                  delegations={delegations}
+                  txState={txState}
+                  onDelegate={createDelegation}
+                  onRevoke={revokeDelegation}
+                />
+              </Suspense>
+              <Suspense fallback={sectionFallback}>
+                <CreatePoll onSubmit={createPoll} txState={txState} />
+              </Suspense>
+            </div>
+          </div>
+        )}
+
+        <div className="card-shell ui-enter-delay-1" style={{ marginBottom: 20, overflow: "hidden", padding: 0 }}>
+          <div style={{ padding: "16px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div className="card-title">Protocol Timeline</div>
+            <div className="card-sub">Live operation state</div>
+          </div>
+
+          <div className="protocol-strip">
+            {protocolTimeline.map((step) => (
+              <div key={step.op} className={`protocol-cell ${step.state}`}>
+                <div
+                  style={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 9,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.14em",
+                    color:
+                      step.state === "completed" ? "var(--teal)" : step.state === "live" ? "var(--amber)" : "var(--ink-3)",
+                    marginBottom: 5,
+                  }}
+                >
+                  {step.state === "completed" ? "Done" : step.state === "live" ? "Live" : "Pending"}
+                </div>
+                <div
+                  style={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 10,
+                    color: "var(--ink-3)",
+                    marginBottom: 3,
+                    letterSpacing: "0.06em",
+                  }}
+                >
+                  {step.op}
+                </div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: step.state === "pending" ? "var(--ink-2)" : "var(--ink)" }}>
+                  {step.label}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
 
-        <div className="mt-8">
-          <Suspense fallback={sectionFallback}>
-            <PollList
-              polls={polls}
-              loading={loading}
-              voterAddress={address}
-              txState={txState}
-              currentEpoch={currentEpoch}
-              onVote={(poll, optionIndex, authorityId) => castVote({ poll, optionIndex, authorityId })}
-              onAggregate={aggregatePoll}
-              onClose={closePoll}
-              onRefresh={fetchPolls}
-            />
-          </Suspense>
-        </div>
       </main>
     </div>
   );
@@ -255,18 +378,12 @@ function InnerApp() {
 
 export default function App() {
   return (
-    <AppErrorBoundary>
-      <Provider
-        defaultClient={defaultClient}
-        clientOptions={[
-          {
-            client: defaultClient,
-            name: "CKB Testnet",
-          },
-        ]}
-      >
-        <InnerApp />
-      </Provider>
-    </AppErrorBoundary>
+    <div className="governance-theme">
+      <AppErrorBoundary>
+        <Provider defaultClient={defaultClient} clientOptions={[{ client: defaultClient, name: "CKB Testnet" }]}>
+          <InnerApp />
+        </Provider>
+      </AppErrorBoundary>
+    </div>
   );
 }

@@ -1,110 +1,113 @@
 # CKB Governance Protocol
 
-Deposit-backed on-chain governance on Nervos CKB with intent-cell voting, permissionless aggregation, delegation, and deterministic refunds.
+Deposit-backed, UTXO-native governance on Nervos CKB built around vote intent cells, aggregation, delegation, and close-time refunds.
 
-This repository is built around the CKB cell model rather than an account-style voting app:
+This repository is the protocol implementation, not a tutorial demo. The contract is the source of truth and the frontend mirrors that contract model.
 
-- polls are cells with locked creator deposits
-- votes are independent intent cells
-- aggregation updates shared tally state in batches
-- delegation is encoded as a first-class cell
-- close returns locked deposits through verified refund paths
+## Table of Contents
 
+- [Why This Exists](#why-this-exists)
+- [Protocol Model](#protocol-model)
+- [Data Layout (Codec Truth)](#data-layout-codec-truth)
+- [Current Implementation Status](#current-implementation-status)
+- [Repository Structure](#repository-structure)
+- [Tech Stack](#tech-stack)
+- [Local Setup](#local-setup)
+- [Environment Variables](#environment-variables)
+- [Development Commands](#development-commands)
+- [Deploy, Seed, and Smoke Test](#deploy-seed-and-smoke-test)
+- [Frontend and Indexing Behavior](#frontend-and-indexing-behavior)
+- [Testing Scope](#testing-scope)
+- [Known Tradeoffs and Limitations](#known-tradeoffs-and-limitations)
+- [Roadmap](#roadmap)
 
-## Execution Status
+## Why This Exists
 
-There are currently two contract layers in the repo:
+Most voting apps map poorly to CKB if they rely on account-style shared mutable state. This protocol is designed around CKB cell lifecycle mechanics:
 
-- `backend/contract`: the TypeScript reference contract that still defines protocol semantics and codec truth
-- `backend/contracts-rust`: the real CKB-VM migration target that will replace the reference implementation for testnet/mainnet deployment
+- creator stake is locked as poll cell capacity
+- voter participation is represented as independent vote intent cells
+- tally mutation is explicit and batched through aggregation
+- delegation is a first-class on-chain cell
+- close paths return deposits through validated spend rules
 
-The Rust migration is now the forward path. The TypeScript contract remains in-repo as the protocol oracle while the Rust implementation reaches parity.
+This reduces voter-vs-voter shared-cell contention in the submission path and keeps economic backing on-chain.
 
-The Rust contract uses a plain Cargo workspace. Capsule is not required for this repo.
+## Protocol Model
 
-## Verified Status
+Contract opcodes:
 
-Current verified state:
+1. `CREATE_POLL` (`0x01`)
+2. `CREATE_VOTE_INTENT` (`0x02`)
+3. `AGGREGATE_VOTES` (`0x03`)
+4. `CLOSE_POLL` (`0x04`)
+5. `DELEGATE` (`0x05`)
+6. `REVOKE_DELEGATION` (`0x06`)
 
-- contract codec and protocol model tests pass
-- frontend codec tests pass
-- frontend production build passes
-- delegated vote refunds use an embedded `refund_lock` script
-- the UI supports poll creation, vote intents, aggregation, close, delegation, and revocation
-- the frontend now performs off-chain duplicate-intent checks for the voting authorities the connected wallet controls
-- a Rust governance contract scaffold exists and the first validation slice has been ported
+Primary lifecycle:
 
-Verified commands:
+1. Creator creates poll and locks creator deposit in the poll cell.
+2. Voters (or delegates) submit vote intent cells with voter deposit and refund lock.
+3. Aggregator batches pending intents, marks them aggregated, and updates poll tally state.
+4. After deadline, poll closes and deposits are returned through validated outputs.
+5. Delegation cells can be created and revoked independently.
 
-```bash
-pnpm --filter ckb-voting-contract test
-pnpm --filter ckb-voting-frontend test
-pnpm --filter ckb-voting-frontend build
-```
+`CLOSE_POLL` supports two closure modes:
 
-## Protocol
+- creator-authorized close after deadline
+- permissionless force-close after `deadline + FORCE_CLOSE_GRACE_EPOCHS`
 
-The contract currently models six operations:
+## Data Layout (Codec Truth)
 
-1. `CREATE_POLL`
-2. `CREATE_VOTE_INTENT`
-3. `AGGREGATE_VOTES`
-4. `CLOSE_POLL`
-5. `DELEGATE`
-6. `REVOKE_DELEGATION`
+Authoritative files:
 
-### Polls
+- `backend/contracts-rust/contracts/governance/src/entry.rs`
+- `backend/contracts-rust/contracts/governance/src/codec.rs`
 
-Poll cells store:
+### Poll Cell (`PollData`)
 
-- question
-- options
-- per-option vote counts
-- deadline
-- creator lock hash
-- creator deposit
-- pending intent count
-- token-weighting fields reserved for a later xUDT upgrade
+- `question: Vec<u8>`
+- `options: Vec<Vec<u8>>`
+- `vote_counts: Vec<u64>`
+- `deadline: u64`
+- `creator: [u8; 32]` (lock hash)
+- `is_closed: bool`
+- `total_voters: u64`
+- `creator_deposit: u64`
+- `pending_intent_count: u64`
+- `counted_voter_lock_hashes: Vec<[u8; 32]>`
+- `token_weighted: bool`
+- `udt_type_hash: [u8; 32]` (reserved for future token-weighted extension)
 
-### Vote Intents
+### Vote Intent Cell (`VoteIntentData`)
 
-Vote intents store:
+- `poll_type_hash: [u8; 32]`
+- `voter_lock_hash: [u8; 32]`
+- `option_index: u8`
+- `voted_at_epoch: u64`
+- `aggregated: bool`
+- `refund_lock: EncodedScript`
 
-- poll type hash
-- voter lock hash
-- selected option
-- vote epoch
-- aggregated flag
-- full refund lock script
+### Delegation Cell (`DelegationData`)
 
-The refund lock script is important because close must be able to return deposits to the exact voter lock even when the vote was created through delegation.
+- `delegator_lock_hash: [u8; 32]`
+- `delegate_lock_hash: [u8; 32]`
+- `poll_type_hash: [u8; 32]` (global when zero hash)
+- `expires_epoch: u64` (0 = no expiry)
 
-### Delegation
+## Current Implementation Status
 
-Delegation cells store:
+Status reflects current repository behavior (April 2026 contract branch state):
 
-- delegator lock hash
-- delegate lock hash
-- optional poll scope
-- optional expiry epoch
+- Rust governance contract implements all six opcode validators.
+- Frontend transaction builders exist for all six operations.
+- Frontend UI exposes create, vote intent, aggregate, close, force-close, delegate, revoke.
+- Off-chain discovery uses indexer/RPC `findCells` queries for polls, intents, delegations.
+- Shared frontend molecule codec mirrors contract byte layout.
+- Deploy tooling is Rust-ELF based (`backend/deploy`), with optional code-cell recycling.
+- Seeding and smoke scripts exist for testnet lifecycle exercises.
 
-## Why CKB
-
-This design uses properties that matter specifically on CKB:
-
-- deposits live in cell capacity, not in an app-level balance table
-- voting can happen without every voter fighting over the same shared cell
-- the lifecycle of a vote is visible as cell creation, aggregation, and final consumption
-- authority transfer is explicit through delegation cells
-
-The main architectural move is the vote-intent pattern:
-
-- voters create their own intent cells
-- an aggregator batches those intents into the poll tally later
-
-That removes voter-vs-voter shared-cell contention from the main voting path.
-
-## Repository Layout
+## Repository Structure
 
 ```text
 ckb-voting-dapp/
@@ -112,21 +115,40 @@ ckb-voting-dapp/
 ├── README.md
 ├── package.json
 ├── pnpm-workspace.yaml
-├── vercel.json
 ├── backend/
-│   ├── contract/
+│   ├── contracts-rust/
+│   │   └── contracts/governance/src/
+│   │       ├── entry.rs
+│   │       ├── codec.rs
+│   │       ├── constants.rs
+│   │       └── helpers.rs
 │   └── deploy/
 ├── frontend/
 │   └── src/
+│       ├── lib/
+│       ├── hooks/
+│       └── components/
 └── tests/
 ```
 
-## Prerequisites
+## Tech Stack
 
-- Node.js 20+
-- pnpm 10+
-- Rust `1.81.0` with `riscv64imac-unknown-none-elf`
-- OffCKB if you want a local CKB devnet
+- Smart contract: Rust + `ckb-std` (`no_std`, CKB-VM target)
+- Frontend: Vite + React + TypeScript
+- CKB SDK: `@ckb-ccc/core` and `@ckb-ccc/connector-react`
+- Package manager: `pnpm`
+- Tests: Vitest (invoked through frontend workspace script)
+- Hosting: Vercel (configured via `vercel.json`)
+
+## Local Setup
+
+Prerequisites:
+
+- Node.js `>=20`
+- `pnpm >=10`
+- Rust toolchain `1.81.0`
+- Rust target `riscv64imac-unknown-none-elf`
+- Testnet CKB for deployment and transaction testing
 
 Install:
 
@@ -138,28 +160,11 @@ pnpm approve-builds
 rustup target add riscv64imac-unknown-none-elf
 ```
 
-Approve `esbuild` when prompted.
-
-## Workspace Commands
-
-From the repository root:
-
-```bash
-pnpm test
-pnpm build
-pnpm dev:frontend
-pnpm build:contract
-pnpm build:contract:rust
-pnpm check:contract:rust
-pnpm build:frontend
-pnpm deploy:contract
-```
-
 ## Environment Variables
 
-Use [.env.example](/home/anihdev/ckb-voting-dapp/.env.example) as the base template.
+Start from `.env.example`.
 
-### Frontend
+Required for frontend runtime:
 
 ```env
 VITE_GOVERNANCE_CODE_HASH=0x...
@@ -167,151 +172,133 @@ VITE_GOVERNANCE_SCRIPT_TX_HASH=0x...
 VITE_CKB_RPC_URL=https://testnet.ckb.dev/rpc
 ```
 
-What each value is for:
-
-- `VITE_GOVERNANCE_CODE_HASH`: the deployed governance script code hash; the frontend uses this to discover protocol cells and build matching type scripts
-- `VITE_GOVERNANCE_SCRIPT_TX_HASH`: the transaction hash that created the script cell; useful for explorer links and deployment bookkeeping
-- `VITE_CKB_RPC_URL`: the public CKB RPC endpoint used by the hosted dApp
-
-Without the correct `VITE_GOVERNANCE_CODE_HASH`, the frontend cannot find your live polls, intents, or delegations.
-
-### Backend Deploy
+Required for deploy/seed/smoke scripts:
 
 ```env
 CKB_PRIVATE_KEY=0x...
 ```
 
-This is only for deployment or seeding scripts. Do not expose it in Vercel.
+Optional deploy helpers:
 
-## Contract Deployment
+```env
+GOVERNANCE_ELF_PATH=../contracts-rust/target/riscv64imac-unknown-none-elf/release/governance-contract
+PREVIOUS_CONTRACT_TX_HASH=0x...
+PREVIOUS_CONTRACT_INDEX=0
+PREVIOUS_CONTRACT_OUTPOINTS=0x...:0,0x...:0
+```
 
-Build and deploy the contract:
+## Development Commands
+
+From repo root:
+
+```bash
+pnpm build                    # build rust contract + frontend
+pnpm build:contract:rust      # cargo build for governance contract
+pnpm check:contract:rust      # cargo check for governance contract
+pnpm build:frontend           # vite build
+pnpm dev:frontend             # local frontend dev server
+pnpm test                     # frontend workspace test command
+pnpm deploy:contract          # build + deploy script
+```
+
+## Deploy, Seed, and Smoke Test
+
+### 1) Build and deploy contract
 
 ```bash
 pnpm build:contract:rust
 CKB_PRIVATE_KEY=0x... pnpm deploy:contract
 ```
 
-The deploy script prints the resulting code hash and transaction hash. Put those values into your frontend environment.
+Deployment prints:
 
-During migration, `pnpm build:contract` still builds the TypeScript reference artifact for protocol parity work. The deployable path now targets the Rust ELF built from `backend/contracts-rust/target/riscv64imac-unknown-none-elf/release/governance-contract`.
+- governance code hash (`VITE_GOVERNANCE_CODE_HASH`)
+- governance script transaction hash (`VITE_GOVERNANCE_SCRIPT_TX_HASH`)
 
-For repeated redeploys, recycle the previous code cell instead of paying fresh occupied capacity:
+### 2) Optional: recycle previous code-cell capacity
 
 ```bash
-PREVIOUS_CONTRACT_TX_HASH=0x<old_deploy_tx_hash> \
+PREVIOUS_CONTRACT_TX_HASH=0x... \
 PREVIOUS_CONTRACT_INDEX=0 \
 CKB_PRIVATE_KEY=0x... \
 pnpm deploy:contract
 ```
 
-This consumes the old code cell as an input and reuses its capacity for the new deployment.
-
-If one old code cell is still too small for the new ELF, recycle multiple older deployments together:
+or multiple recycled outpoints:
 
 ```bash
-PREVIOUS_CONTRACT_OUTPOINTS=0x<tx_hash_a>:0,0x<tx_hash_b>:0 \
+PREVIOUS_CONTRACT_OUTPOINTS=0x...:0,0x...:0 \
 CKB_PRIVATE_KEY=0x... \
 pnpm deploy:contract
 ```
 
-Relevant files:
-
-- [backend/deploy/deploy.ts](/home/anihdev/ckb-voting-dapp/backend/deploy/deploy.ts)
-- [backend/deploy/config.ts](/home/anihdev/ckb-voting-dapp/backend/deploy/config.ts)
-
-## Vercel Hosting
-
-The repo now includes [vercel.json](/home/anihdev/ckb-voting-dapp/vercel.json), so Vercel can build the frontend from the monorepo root without guessing paths.
-
-Current Vercel settings encoded in the repo:
-
-- install command: `pnpm install --frozen-lockfile`
-- build command: `pnpm build:frontend`
-- output directory: `frontend/src/dist`
-- SPA rewrite to `index.html`
-
-### Deploy To Vercel
-
-1. Push the repository to GitHub.
-2. Import the repo into Vercel.
-3. Keep the project root as the repository root.
-4. Add the frontend env vars from `.env.example`.
-5. Deploy.
-
-### Required Vercel Environment Variables
-
-Add these in the Vercel dashboard:
-
-```env
-VITE_GOVERNANCE_CODE_HASH=0x...
-VITE_GOVERNANCE_SCRIPT_TX_HASH=0x...
-VITE_CKB_RPC_URL=https://testnet.ckb.dev/rpc
-```
-
-Full deployment steps are in [DEPLOYMENT.md](/home/anihdev/ckb-voting-dapp/DEPLOYMENT.md).
-
-## Testing Live
-
-To test the hosted app live:
-
-1. Deploy the contract to CKB testnet.
-2. Copy the emitted code hash and script transaction hash into Vercel env vars.
-3. Redeploy the frontend.
-4. Open the Vercel URL.
-5. Connect a CCC-compatible wallet on testnet.
-6. Fund the wallet from the Nervos faucet.
-7. Create a poll, create vote intents, aggregate, delegate, revoke, and close.
-
-Useful testnet tools:
-
-- Faucet: https://faucet.nervos.org/
-- Explorer: https://pudge.explorer.nervos.org/
-- RPC: https://testnet.ckb.dev/rpc
-
-## Local Development
-
-Frontend only:
+### 3) Seed demo polls
 
 ```bash
-pnpm dev:frontend
+pnpm --filter ckb-voting-deploy run seed
 ```
 
-Contract and frontend verification:
+### 4) Run lifecycle smoke flow
 
 ```bash
-pnpm test
-pnpm build
+pnpm --filter ckb-voting-deploy run smoke
 ```
 
-## Current Guarantees
+The smoke script is testnet-facing and demonstrates the protocol flow with a private-key signer.
 
-What is implemented now:
+## Frontend and Indexing Behavior
 
-- intent-cell voting path
-- permissionless aggregation
-- creator deposit handling
-- voter deposit handling
-- delegated voting with verified refund locks
-- off-chain duplicate-intent prevention for controlled authorities
-- poll, intent, and delegation indexing in the frontend
+Current off-chain discovery is lightweight and query-based:
 
-## Next Protocol Extensions
+- polls: type-script prefix search on `CREATE_POLL`
+- intents: type-script exact search scoped by poll type hash
+- delegations: type-script prefix search on `DELEGATE`
 
-These are natural next upgrades, but they are not yet enforced by the current contract:
+UI states show:
+
+- aggregated tally (`vote_counts`)
+- indexed pending intents
+- authority options (self + delegated voter authorities)
+- close and force-close eligibility by epoch
+
+## Testing Scope
+
+Test files in `tests/` currently focus on:
+
+- codec round-trip invariants (`PollData`, `VoteIntentData`, `DelegationData`)
+- protocol model invariants for aggregation/close/delegation behaviors
+
+Current tests are not yet a full CKB-VM syscall harness for contract execution. They are useful for data/layout and model checks, but not sufficient alone for production-grade assurances.
+
+## Known Tradeoffs and Limitations
+
+- Intent submission reduces voter submission contention, but aggregation and close are still shared-state transitions that need coordination.
+- `pending_intent_count` is not yet strict end-to-end accounting; close currently treats it as a lower-bound invariant.
+- Token-weighted mode uses CKB-capacity weight units with a cap (`MAX_WEIGHT_UNITS_PER_INTENT`); xUDT-weighted voting is not implemented yet.
+- Indexing is direct RPC/indexer querying and does not yet include a dedicated aggregation coordinator or historical analytics service.
+- Tests do not yet provide exhaustive contract-level failure-path coverage for every opcode in a VM harness.
+
+## Roadmap
+
+### Phase 1: Repository honesty
+
+- keep docs synchronized with real implementation status
+- keep contract/frontend/test constants aligned
+
+### Phase 2: Protocol parity hardening
+
+- tighten pending intent accounting invariants
+- expand end-to-end tests across all six operations
+- keep frontend builders aligned with contract evolution
+
+### Phase 3: Production-grade polish
+
+- stronger indexing and UX state surfaces
+- improved deployment and observability workflows
+- clearer error reporting and transaction diagnostics
+
+### Phase 4: CKB-native extensions
 
 - xUDT-weighted voting
-- force-close or abandoned-poll recovery
-- richer proposal metadata
-- stronger on-chain uniqueness schemes
-
-## Tests
-
-Passing test suites:
-
-- [tests/contract.test.ts](/home/anihdev/ckb-voting-dapp/tests/contract.test.ts)
-- [tests/molecule.test.ts](/home/anihdev/ckb-voting-dapp/tests/molecule.test.ts)
-
-## License
-
-MIT
+- abandoned poll recovery improvements
+- richer proposal metadata flows

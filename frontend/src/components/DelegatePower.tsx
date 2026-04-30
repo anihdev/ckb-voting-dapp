@@ -40,52 +40,55 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke }: Pr
   };
 
   return (
-    <section className="rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+    <section className="card-shell">
       <div className="mb-4">
-        <h2 className="text-lg font-semibold text-gray-800">Delegation</h2>
-        <p className="mt-1 text-sm text-gray-500">
-          Delegate voting power globally or to a specific poll. Delegation cells lock at least 61 CKB and may require more occupied capacity depending on script size.
+        <h2 className="section-title">Delegation</h2>
+        <p className="subtle mt-1 text-sm">
+          Delegation authorizes another address to create intents for you (globally or per poll). It grants authority, not ownership, and can be revoked by consuming the delegation cell.
+        </p>
+        <p className="subtle mt-2 text-sm">
+          Delegation cells lock at least 61 CKB and may require more occupied capacity depending on script size.
         </p>
       </div>
 
       <form onSubmit={submitDelegation} className="space-y-4">
         <div>
-          <label className="mb-1 block text-sm font-medium text-gray-700">Delegate address or lock hash</label>
+          <label className="label">Delegate address or lock hash</label>
           <input
             value={delegateLockHash}
             onChange={(event) => setDelegateLockHash(event.target.value)}
             placeholder="ckt1... or 0x..."
-            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="input"
           />
-          <div className="mt-1 text-xs text-gray-500">
+          <div className="hint">
             Paste a normal CKB address and the app will derive the required lock hash automatically.
           </div>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
           <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">Poll scope</label>
+            <label className="label">Poll scope</label>
             <input
               value={pollId}
               onChange={(event) => setPollId(event.target.value)}
               placeholder="Leave empty for global delegation"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="input"
             />
           </div>
 
           <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">Expiry epoch</label>
+            <label className="label">Expiry epoch</label>
             <input
               value={expiresEpoch}
               onChange={(event) => setExpiresEpoch(event.target.value)}
               placeholder="0 for no expiry"
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="input"
             />
           </div>
         </div>
 
         {error && (
-          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
+          <div className="alert alert-error">
             {error}
           </div>
         )}
@@ -94,34 +97,34 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke }: Pr
 
         <button
           type="submit"
-          className="rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-slate-700"
+          className="btn-primary"
         >
           Create Delegation
         </button>
       </form>
 
       <div className="mt-6">
-        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-gray-500">Active delegations</h3>
+        <h3 className="mb-3 text-sm font-semibold uppercase tracking-[0.16em] subtle">Active delegations</h3>
         {delegations.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-gray-200 px-4 py-6 text-sm text-gray-400">
+          <div className="rounded-xl border border-dashed border-[var(--line)] px-4 py-6 text-sm subtle">
             No active delegations indexed for this wallet.
           </div>
         ) : (
           <div className="space-y-3">
             {delegations.map((delegation) => (
-              <div key={delegation.id} className="rounded-lg border border-gray-200 px-4 py-3">
+              <div key={delegation.id} className="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-4 py-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <div className="text-sm font-medium text-gray-800">
+                    <div className="text-sm font-medium text-[var(--ink)]">
                       Delegate: {delegation.delegateLockHash.slice(0, 14)}...
                     </div>
-                    <div className="mt-1 text-xs text-gray-500">
+                    <div className="mt-1 text-xs subtle">
                       Scope: {delegation.pollId ?? "Global"} | Expiry: {delegation.expiresEpoch.toString()}
                     </div>
                   </div>
                   <button
                     onClick={() => onRevoke(delegation.id)}
-                    className="rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-600 transition-colors hover:border-red-300 hover:text-red-500"
+                    className="btn-danger"
                   >
                     Revoke
                   </button>

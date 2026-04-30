@@ -16,6 +16,7 @@ export interface Poll {
   question: string;
   options: string[];
   voteCounts: bigint[];
+  createdEpoch: bigint | null;
   deadline: bigint;
   creator: string;
   isClosed: boolean;

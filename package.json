@@ -7,12 +7,10 @@
     "pnpm": ">=10.0.0"
   },
   "scripts": {
-    "build": "pnpm build:contract && pnpm build:frontend",
-    "build:contract": "pnpm --filter ckb-voting-contract build",
+    "build": "pnpm build:contract:rust && pnpm build:frontend",
     "build:contract:rust": "cd backend/contracts-rust && cargo build --release -p governance-contract",
     "build:frontend": "pnpm --filter ckb-voting-frontend build",
-    "test": "pnpm test:contract && pnpm test:frontend",
-    "test:contract": "pnpm --filter ckb-voting-contract test",
+    "test": "pnpm test:frontend",
     "test:frontend": "pnpm --filter ckb-voting-frontend test",
     "check:contract:rust": "cd backend/contracts-rust && cargo check -p governance-contract",
     "dev:frontend": "pnpm --filter ckb-voting-frontend dev",

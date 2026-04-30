@@ -1,6 +1,5 @@
 packages:
   - "frontend/src"
-  - "backend/contract"
   - "backend/deploy"
 allowBuilds:
   esbuild: true

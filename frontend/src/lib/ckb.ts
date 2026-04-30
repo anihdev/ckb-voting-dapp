@@ -6,11 +6,11 @@
  * validates hosted runtime config so production deployments do not silently
  * boot with placeholder governance hashes.
  */
-
 import { ccc } from "@ckb-ccc/core";
 import {
   CREATOR_DEPOSIT_SHANNONS,
   DELEGATION_MIN_SHANNONS,
+  MAX_WEIGHT_UNITS_PER_INTENT,
   MAX_DURATION_EPOCHS,
   MAX_OPTIONS,
   MIN_DURATION_EPOCHS,
@@ -18,6 +18,7 @@ import {
   SHANNONS_PER_CKB,
   VOTER_DEPOSIT_SHANNONS,
   ZERO_HASH_HEX,
+  FORCE_CLOSE_GRACE_EPOCHS,
 } from "./constants";
 import {
   bytesToHex,
@@ -52,14 +53,21 @@ export {
   CREATOR_DEPOSIT_SHANNONS,
   VOTER_DEPOSIT_SHANNONS,
   DELEGATION_MIN_SHANNONS,
+  MAX_WEIGHT_UNITS_PER_INTENT,
   MAX_OPTIONS,
   MIN_DURATION_EPOCHS,
   MAX_DURATION_EPOCHS,
   ZERO_HASH_HEX,
+  FORCE_CLOSE_GRACE_EPOCHS,
 };
 
+/**
+ * @notice Validates runtime env for hosted deployments.
+ * @dev Rejects placeholder governance hashes and malformed critical config.
+ */
 export function validateRuntimeConfig(): string | null {
   const isProduction = Boolean((import.meta as any).env?.PROD);
+  const isVercel = Boolean((import.meta as any).env?.VERCEL);
 
   if (!/^0x[0-9a-fA-F]{64}$/.test(GOVERNANCE_CODE_HASH) || GOVERNANCE_CODE_HASH === ZERO_HASH_32) {
     return isProduction
@@ -73,19 +81,44 @@ export function validateRuntimeConfig(): string | null {
       : "Set VITE_GOVERNANCE_SCRIPT_TX_HASH to build transactions with the deployed script cell dependency.";
   }
 
+  let parsedRpcUrl: URL;
+  try {
+    parsedRpcUrl = new URL(CKB_RPC_URL);
+  } catch {
+    return "VITE_CKB_RPC_URL must be a valid URL.";
+  }
+  if (!["http:", "https:"].includes(parsedRpcUrl.protocol)) {
+    return "VITE_CKB_RPC_URL must use http or https.";
+  }
+  if ((isProduction || isVercel) && parsedRpcUrl.protocol !== "https:") {
+    return "Hosted deployment must use an https RPC URL.";
+  }
+  if ((isProduction || isVercel) && ["localhost", "127.0.0.1"].includes(parsedRpcUrl.hostname)) {
+    return "Hosted deployment cannot use localhost RPC URL.";
+  }
+
   return null;
 }
 
+/**
+ * @notice Converts shannons to a fixed 8-decimal CKB string.
+ */
 export function shannonsToCkb(shannons: bigint): string {
   const whole = shannons / SHANNONS_PER_CKB;
   const fractional = shannons % SHANNONS_PER_CKB;
   return `${whole}.${fractional.toString().padStart(8, "0")}`;
 }
 
+/**
+ * @notice Estimates minimal occupied capacity from raw bytes.
+ */
 export function estimateCellCapacity(dataBytes: number, extraScriptBytes = 61): bigint {
   return BigInt(dataBytes + extraScriptBytes) * SHANNONS_PER_CKB;
 }
 
+/**
+ * @notice Estimates output capacity using serialized lock/type script sizes.
+ */
 export function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
   const lockBytes = (ccc as any).Script.from(lockScript).toBytes().length;
   const typeBytes = typeScript ? (ccc as any).Script.from(typeScript).toBytes().length : 0;
@@ -93,10 +126,42 @@ export function estimateOutputCapacity(lockScript: any, typeScript: any | undefi
   return BigInt(occupiedBytes) * SHANNONS_PER_CKB;
 }
 
+function sanitizeWeightUnits(
+  requestedWeightUnits: number | undefined,
+  tokenWeighted: boolean
+): bigint {
+  const normalized = BigInt(requestedWeightUnits ?? 1);
+  if (normalized < 1n) {
+    throw new Error("Vote weight must be at least 1");
+  }
+  if (normalized > MAX_WEIGHT_UNITS_PER_INTENT) {
+    throw new Error(`Vote weight cannot exceed ${MAX_WEIGHT_UNITS_PER_INTENT.toString()} units`);
+  }
+  if (!tokenWeighted && normalized !== 1n) {
+    throw new Error("Weighted vote amounts are only valid for token-weighted polls");
+  }
+  return normalized;
+}
+
+function computeIntentWeightUnits(intentCapacity: bigint, tokenWeighted: boolean): bigint {
+  if (!tokenWeighted) {
+    return 1n;
+  }
+  const rawUnits = intentCapacity / VOTER_DEPOSIT_SHANNONS;
+  if (rawUnits < 1n) {
+    throw new Error("Intent capacity is below the minimum weighted voting unit");
+  }
+  return rawUnits > MAX_WEIGHT_UNITS_PER_INTENT ? MAX_WEIGHT_UNITS_PER_INTENT : rawUnits;
+}
+
 function encodeOpArgs(op: number, scopeHex = "0x"): string {
   return `0x${op.toString(16).padStart(2, "0")}${scopeHex.replace(/^0x/, "")}`;
 }
 
+/**
+ * @notice Builds governance type scripts for operation dispatch.
+ * @dev Scope bytes are appended to the op-byte args layout used by the contract.
+ */
 export function buildGovernanceTypeScript(op: number, scopeHex = "0x"): any {
   return (ccc as any).Script.from({
     codeHash: GOVERNANCE_CODE_HASH,
@@ -105,6 +170,9 @@ export function buildGovernanceTypeScript(op: number, scopeHex = "0x"): any {
   });
 }
 
+/**
+ * @notice Builds the governance code cell dep used by all governance transactions.
+ */
 export function buildGovernanceCellDep(): any {
   return {
     outPoint: {
@@ -115,6 +183,9 @@ export function buildGovernanceCellDep(): any {
   };
 }
 
+/**
+ * @notice Computes a CKB script hash in hex format.
+ */
 export function hashScript(script: any): string {
   const normalized = normalizeScript(script);
   const serialized = (ccc as any).Script.from({
@@ -125,6 +196,9 @@ export function hashScript(script: any): string {
   return ccc.hexFrom((ccc as any).hashCkb(serialized));
 }
 
+/**
+ * @notice Resolves a signer-compatible address object across wallet implementations.
+ */
 export async function getSignerAddressObj(signer: any): Promise<any> {
   if (typeof signer?.getAddressObjSecp256k1 === "function") {
     return signer.getAddressObjSecp256k1();
@@ -141,15 +215,25 @@ export async function getSignerAddressObj(signer: any): Promise<any> {
   throw new Error("Connected wallet signer does not expose a compatible address method.");
 }
 
+/**
+ * @notice Returns signer lock hash bytes.
+ */
 export async function getSignerLockHash(signer: any): Promise<Uint8Array> {
   const address = await getSignerAddressObj(signer);
   return (ccc as any).bytesFrom(hashScript(address.script));
 }
 
+/**
+ * @notice Returns signer lock hash in `0x` hex format.
+ */
 export async function getSignerLockHashHex(signer: any): Promise<string> {
   return bytesToHex(await getSignerLockHash(signer));
 }
 
+/**
+ * @notice Reads chain tip epoch from client APIs.
+ * @dev Supports different return types used by CCC client variants.
+ */
 export async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
     const rawEpoch = await client.getTipEpoch();
@@ -162,6 +246,10 @@ export async function getTipEpoch(client: any): Promise<bigint> {
   return BigInt(String(tipHeader.epoch).split(",")[0]);
 }
 
+/**
+ * @notice Builds a CREATE_POLL transaction.
+ * @dev Initializes poll tally state and locks creator deposit on the poll cell.
+ */
 export async function buildCreatePollTx(
   signer: any,
   input: {
@@ -216,26 +304,57 @@ export async function buildCreatePollTx(
   return tx;
 }
 
+/**
+ * @notice Builds a CREATE_VOTE_INTENT transaction.
+ * @dev Creates one immutable pending intent per voting authority per poll.
+ */
 export async function buildCreateVoteIntentTx(
   signer: any,
   input: {
     pollTypeHash: string;
     optionIndex: number;
+    pollCell: any;
     delegationCell?: any;
+    weightUnits?: number;
   }
 ): Promise<any> {
   const client = signer.client;
   const tipHeader = await client.getTipHeader();
   const epoch = await getTipEpoch(client);
+  const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
+  const pollTypeHash = hashScript(getCellType(input.pollCell));
+  if (pollTypeHash.toLowerCase() !== input.pollTypeHash.toLowerCase()) {
+    throw new Error("Selected poll cell does not match the poll type hash");
+  }
+  if (pollData.is_closed) {
+    throw new Error("Poll is already closed");
+  }
+  if (epoch > pollData.deadline) {
+    throw new Error("Poll deadline has already passed");
+  }
+  const voteWeightUnits = sanitizeWeightUnits(input.weightUnits, pollData.token_weighted);
+
   const signerLockHash = await getSignerLockHash(signer);
   const voterLockHash = input.delegationCell
     ? decodeDelegationData((ccc as any).bytesFrom(input.delegationCell.outputData ?? "0x")).delegator_lock_hash
     : signerLockHash;
   const signerAddress = await getSignerAddressObj(signer);
+  const excludedOutPoints: string[] = [];
+  if (input.delegationCell) {
+    excludedOutPoints.push(
+      `${input.delegationCell.outPoint.txHash}:${Number(input.delegationCell.outPoint.index)}`
+    );
+  }
   const signerAuthCell = await findSignerAuthCell(
     signer,
-    input.delegationCell ? [`${input.delegationCell.outPoint.txHash}:${Number(input.delegationCell.outPoint.index)}`] : []
+    excludedOutPoints
   );
+  const refundLock = normalizeScript(
+    input.delegationCell?.cellOutput?.lock ??
+    input.delegationCell?.output?.lock ??
+    signerAddress.script
+  );
+  const intentLock = denormalizeScript(refundLock);
 
   const intentData = encodeVoteIntentData({
     poll_type_hash: (ccc as any).bytesFrom(input.pollTypeHash),
@@ -243,17 +362,29 @@ export async function buildCreateVoteIntentTx(
     option_index: input.optionIndex,
     voted_at_epoch: epoch,
     aggregated: false,
-    refund_lock: normalizeScript(
-      input.delegationCell?.cellOutput?.lock ??
-      input.delegationCell?.output?.lock ??
-      signerAddress.script
-    ),
+    refund_lock: refundLock,
   });
   const intentType = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, input.pollTypeHash);
-  const intentCapacity = estimateOutputCapacity(signerAddress.script, intentType, intentData.length);
+  const intentCapacity = estimateOutputCapacity(intentLock, intentType, intentData.length);
+  const weightedIntentCapacity = voteWeightUnits * VOTER_DEPOSIT_SHANNONS;
+  const maxWeightedIntentCapacity = MAX_WEIGHT_UNITS_PER_INTENT * VOTER_DEPOSIT_SHANNONS;
+  let outputIntentCapacity = [intentCapacity, weightedIntentCapacity]
+    .reduce((max, current) => (current > max ? current : max), 0n);
+
+  if (pollData.token_weighted && outputIntentCapacity > maxWeightedIntentCapacity) {
+    throw new Error(
+      `Weighted intent occupied capacity exceeds cap (${maxWeightedIntentCapacity / SHANNONS_PER_CKB} CKB)`
+    );
+  }
 
   const tx = (ccc as any).Transaction.from({
-    cellDeps: [buildGovernanceCellDep()],
+    cellDeps: [
+      buildGovernanceCellDep(),
+      {
+        outPoint: getOutPoint(input.pollCell),
+        depType: "code",
+      },
+    ],
     headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(signerAuthCell) },
@@ -261,9 +392,9 @@ export async function buildCreateVoteIntentTx(
     ],
     outputs: [
       {
-        lock: signerAddress.script,
+        lock: intentLock,
         type: intentType,
-        capacity: intentCapacity > VOTER_DEPOSIT_SHANNONS ? intentCapacity : VOTER_DEPOSIT_SHANNONS,
+        capacity: outputIntentCapacity,
       },
     ],
     outputsData: [bytesToHex(intentData)],
@@ -279,6 +410,10 @@ export async function buildCreateVoteIntentTx(
   return tx;
 }
 
+/**
+ * @notice Builds a DELEGATE transaction.
+ * @dev Creates a delegation cell scoped to all polls or one poll type hash.
+ */
 export async function buildDelegateTx(
   signer: any,
   input: { delegateLockHash: string; pollTypeHash?: string; expiresEpoch?: bigint }
@@ -407,6 +542,10 @@ async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = [])
   throw new Error("No signer auth cell available");
 }
 
+/**
+ * @notice Builds an AGGREGATE_VOTES transaction.
+ * @dev Consumes pending intents, marks them aggregated, and updates poll tallies.
+ */
 export async function buildAggregateVotesTx(
   signer: any,
   input: { pollCell: any; intentCells: any[] }
@@ -414,12 +553,18 @@ export async function buildAggregateVotesTx(
   const tipHeader = await signer.client.getTipHeader();
   const pollOutput = getCellOutput(input.pollCell);
   const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
+  const pollTypeHash = hashScript(pollOutput.type);
   const nextVoteCounts = [...previousPoll.vote_counts];
 
   const nextIntentOutputs = input.intentCells.map((cell) => {
     const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
-    nextVoteCounts[decoded.option_index] += 1n;
+    if (bytesToHex(decoded.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
+      throw new Error("Intent cell does not belong to the selected poll");
+    }
+    const weight = computeIntentWeightUnits(getCellCapacity(cell), previousPoll.token_weighted);
+    nextVoteCounts[decoded.option_index] += weight;
     return {
+      decoded,
       output: {
         lock: getCellLock(cell),
         type: getCellType(cell),
@@ -434,9 +579,7 @@ export async function buildAggregateVotesTx(
     };
   });
 
-  const appendedVoters = input.intentCells.map((cell) =>
-    decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x")).voter_lock_hash
-  );
+  const appendedVoters = nextIntentOutputs.map((item) => item.decoded.voter_lock_hash);
 
   const updatedPoll = encodePollData({
     ...previousPoll,
@@ -480,12 +623,39 @@ export async function buildAggregateVotesTx(
   return tx;
 }
 
+/**
+ * @notice Builds creator-authorized CLOSE_POLL transaction.
+ * @dev Returns creator deposit and refunds intent deposits through refund locks.
+ */
 export async function buildClosePollTx(
   signer: any,
   input: { pollCell: any; intentCells: any[] }
 ): Promise<any> {
+  const client = signer.client;
+  const tipHeader = await client.getTipHeader();
+  const currentEpoch = await getTipEpoch(client);
   const pollOutput = getCellOutput(input.pollCell);
   const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
+  const pollTypeHash = hashScript(pollOutput.type);
+  if (currentEpoch <= previousPoll.deadline) {
+    throw new Error("Poll cannot be closed before deadline");
+  }
+
+  const decodedIntents = input.intentCells.map((cell) => ({
+    cell,
+    decoded: (() => {
+      const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+      if (bytesToHex(decoded.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
+        throw new Error("Intent cell does not belong to the selected poll");
+      }
+      return decoded;
+    })(),
+  }));
+  const pendingIntentCount = decodedIntents.filter(({ decoded }) => !decoded.aggregated).length;
+  if (BigInt(pendingIntentCount) < previousPoll.pending_intent_count) {
+    throw new Error("Close requires at least the pending intents tracked on the poll state");
+  }
+
   const creatorAddress = await getSignerAddressObj(signer);
   const creatorAuthCell = await findSignerAuthCell(signer, [
     `${input.pollCell.outPoint.txHash}:${Number(input.pollCell.outPoint.index)}`,
@@ -495,6 +665,7 @@ export async function buildClosePollTx(
   const closedPoll = encodePollData({
     ...previousPoll,
     is_closed: true,
+    pending_intent_count: 0n,
   });
   const closedPollMinCapacity = estimateOutputCapacity(
     pollOutput.lock,
@@ -506,13 +677,14 @@ export async function buildClosePollTx(
     ? closedPollCandidateCapacity
     : closedPollMinCapacity;
 
-  const voterReturns = input.intentCells.map((cell) => ({
-    lock: denormalizeScript(decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x")).refund_lock),
+  const voterReturns = decodedIntents.map(({ cell, decoded }) => ({
+    lock: denormalizeScript(decoded.refund_lock),
     capacity: getCellCapacity(cell),
   }));
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
+    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(input.pollCell) },
       { previousOutput: getOutPoint(creatorAuthCell) },
@@ -543,6 +715,96 @@ export async function buildClosePollTx(
   return tx;
 }
 
+/**
+ * @notice Builds permissionless recovery CLOSE_POLL transaction after grace.
+ * @dev Mirrors contract force-close mode by closing without creator auth input.
+ */
+export async function buildForceCloseTx(
+  signer: any,
+  input: { pollCell: any; intentCells: any[] }
+): Promise<any> {
+  const client = signer.client;
+  const tipHeader = await client.getTipHeader();
+  const currentEpoch = await getTipEpoch(client);
+  const pollOutput = getCellOutput(input.pollCell);
+  const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
+  const pollTypeHash = hashScript(pollOutput.type);
+  const decodedIntents = input.intentCells.map((cell) => ({
+    cell,
+    decoded: (() => {
+      const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+      if (bytesToHex(decoded.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
+        throw new Error("Intent cell does not belong to the selected poll");
+      }
+      return decoded;
+    })(),
+  }));
+  const pendingIntentCount = decodedIntents.filter(({ decoded }) => !decoded.aggregated).length;
+  if (BigInt(pendingIntentCount) < previousPoll.pending_intent_count) {
+    throw new Error("Force-close requires at least the pending intents tracked on the poll state");
+  }
+
+  const allowEpoch = previousPoll.deadline + FORCE_CLOSE_GRACE_EPOCHS;
+  if (currentEpoch <= allowEpoch) {
+    throw new Error("Force-close not yet allowed by epoch");
+  }
+
+  const closedPoll = encodePollData({
+    ...previousPoll,
+    is_closed: true,
+    pending_intent_count: 0n,
+  });
+  const closedPollMinCapacity = estimateOutputCapacity(
+    pollOutput.lock,
+    pollOutput.type,
+    closedPoll.length
+  );
+  const closedPollCandidateCapacity = getCellCapacity(input.pollCell) - previousPoll.creator_deposit;
+  const closedPollCapacity = closedPollCandidateCapacity > closedPollMinCapacity
+    ? closedPollCandidateCapacity
+    : closedPollMinCapacity;
+
+  const voterReturns = decodedIntents.map(({ cell, decoded }) => ({
+    lock: denormalizeScript(decoded.refund_lock),
+    capacity: getCellCapacity(cell),
+  }));
+
+  const tx = (ccc as any).Transaction.from({
+    cellDeps: [buildGovernanceCellDep()],
+    headerDeps: [tipHeader.hash],
+    inputs: [
+      { previousOutput: getOutPoint(input.pollCell) },
+      ...input.intentCells.map((cell) => ({ previousOutput: getOutPoint(cell) })),
+    ],
+    outputs: [
+      {
+        lock: getCellLock(input.pollCell),
+        type: pollOutput.type,
+        capacity: closedPollCapacity,
+      },
+      {
+        lock: getCellLock(input.pollCell),
+        capacity: previousPoll.creator_deposit,
+      },
+      ...voterReturns,
+    ],
+    outputsData: [
+      bytesToHex(closedPoll),
+      "0x",
+      ...voterReturns.map(() => "0x"),
+    ],
+    witnesses: new Array(input.intentCells.length + 1).fill("0x"),
+  });
+
+  await tx.completeInputsByCapacity(signer);
+  await tx.completeFeeBy(signer, 1000);
+  return tx;
+}
+
+/**
+ * @notice Builds a REVOKE_DELEGATION transaction.
+ * @dev Consumes delegation cell and unlocks its occupied capacity back to delegator lock.
+ */
 export async function buildRevokeDelegationTx(
   signer: any,
   input: { delegationCell: any }
@@ -567,6 +829,9 @@ export async function buildRevokeDelegationTx(
   return tx;
 }
 
+/**
+ * @notice Signs and sends a transaction using compatible signer interfaces.
+ */
 export async function signAndSendTx(signer: any, tx: any): Promise<string> {
   if (typeof signer?.sendTransaction === "function") {
     return signer.sendTransaction(tx);
@@ -576,6 +841,9 @@ export async function signAndSendTx(signer: any, tx: any): Promise<string> {
   return signer.client.sendTransaction(tx);
 }
 
+/**
+ * @notice Validates user input for CREATE_POLL prior to transaction build.
+ */
 export function validateCreatePollInput(input: {
   question: string;
   options: string[];

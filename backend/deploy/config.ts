@@ -33,3 +33,67 @@ export const MIN_CONFIRMATIONS = 3;
 export const PREVIOUS_CONTRACT_TX_HASH = process.env.PREVIOUS_CONTRACT_TX_HASH;
 export const PREVIOUS_CONTRACT_INDEX = Number(process.env.PREVIOUS_CONTRACT_INDEX ?? "0");
 export const PREVIOUS_CONTRACT_OUTPOINTS = process.env.PREVIOUS_CONTRACT_OUTPOINTS;
+
+function readFirstEnv(keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = process.env[key]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+export function assertHex32(
+  value: string,
+  label: string,
+  options: { allowZero?: boolean } = {}
+): string {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    throw new Error(`${label} must be a 32-byte hex string (0x + 64 hex chars).`);
+  }
+  if (!options.allowZero && value.toLowerCase() === `0x${"00".repeat(32)}`) {
+    throw new Error(`${label} cannot be the zero hash.`);
+  }
+  return value;
+}
+
+export function assertRpcUrl(value: string, label = "RPC URL"): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid URL.`);
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error(`${label} must use http or https.`);
+  }
+  return value;
+}
+
+export function requirePrivateKey(): string {
+  const privateKey = readFirstEnv(["CKB_PRIVATE_KEY"]);
+  if (!privateKey) {
+    throw new Error("Set CKB_PRIVATE_KEY before running this script.");
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
+    throw new Error("CKB_PRIVATE_KEY must be a 32-byte hex string.");
+  }
+  return privateKey;
+}
+
+export function requireGovernanceHashes(): {
+  codeHash: string;
+  scriptTxHash: string;
+} {
+  const codeHash = readFirstEnv(["GOVERNANCE_CODE_HASH", "VITE_GOVERNANCE_CODE_HASH"]);
+  const scriptTxHash = readFirstEnv(["GOVERNANCE_SCRIPT_TX_HASH", "VITE_GOVERNANCE_SCRIPT_TX_HASH"]);
+  if (!codeHash) {
+    throw new Error("Set GOVERNANCE_CODE_HASH or VITE_GOVERNANCE_CODE_HASH.");
+  }
+  if (!scriptTxHash) {
+    throw new Error("Set GOVERNANCE_SCRIPT_TX_HASH or VITE_GOVERNANCE_SCRIPT_TX_HASH.");
+  }
+  return {
+    codeHash: assertHex32(codeHash, "Governance code hash", { allowZero: false }),
+    scriptTxHash: assertHex32(scriptTxHash, "Governance script tx hash", { allowZero: false }),
+  };
+}

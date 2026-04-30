@@ -11,6 +11,7 @@ import { ccc } from "@ckb-ccc/core";
 import {
   buildAggregateVotesTx,
   buildClosePollTx,
+  buildForceCloseTx,
   buildCreatePollTx,
   buildCreateVoteIntentTx,
   buildDelegateTx,
@@ -42,12 +43,14 @@ export interface CreatePollParams {
   question: string;
   options: string[];
   durationEpochs: number;
+  tokenWeighted?: boolean;
 }
 
 export interface CastVoteParams {
   poll: Poll;
   optionIndex: number;
   authorityId?: string;
+  weightUnits?: number;
 }
 
 function deriveWinnerIndex(voteCounts: bigint[]): number | null {
@@ -69,6 +72,45 @@ function deriveWinnerIndex(voteCounts: bigint[]): number | null {
 
   if (maxVotes === 0n || isTie) return null;
   return maxIndex;
+}
+
+async function resolveCellCreatedEpoch(
+  client: any,
+  txHash: string,
+  headerEpochCache: Map<string, bigint | null>
+): Promise<bigint | null> {
+  try {
+    const txView = await client.getTransaction(txHash);
+    const blockHash =
+      txView?.txStatus?.blockHash ??
+      txView?.tx_status?.block_hash ??
+      txView?.txStatus?.block_hash ??
+      txView?.tx_status?.blockHash ??
+      null;
+
+    if (!blockHash) return null;
+    if (headerEpochCache.has(blockHash)) {
+      return headerEpochCache.get(blockHash) ?? null;
+    }
+
+    const header = await client.getHeader(blockHash);
+    const rawEpoch =
+      header?.epoch ??
+      header?.header?.epoch ??
+      header?.inner?.epoch ??
+      null;
+
+    if (rawEpoch === null || rawEpoch === undefined) {
+      headerEpochCache.set(blockHash, null);
+      return null;
+    }
+
+    const parsed = BigInt(String(rawEpoch).split(",")[0]);
+    headerEpochCache.set(blockHash, parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 async function waitForTx(client: any, txHash: string): Promise<void> {
@@ -106,6 +148,7 @@ export function usePolls(signer: any | null) {
       const nextIntents: Record<string, VoteIntent[]> = {};
       const nextIntentCells: Record<string, any[]> = {};
       const nextPollCells: Record<string, any> = {};
+      const headerEpochCache = new Map<string, bigint | null>();
       const currentLockHashHex = await getSignerLockHashHex(signer);
       const tipEpoch = await getTipEpoch(client);
 
@@ -120,6 +163,11 @@ export function usePolls(signer: any | null) {
           const pollId = hashScript(cell.cellOutput?.type ?? cell.output?.type);
           const voteCounts = pollData.vote_counts;
           const totalVotes = voteCounts.reduce((sum, count) => sum + count, 0n);
+          const createdEpoch = await resolveCellCreatedEpoch(
+            client,
+            cell.outPoint.txHash,
+            headerEpochCache
+          );
           nextPollCells[pollId] = cell;
 
           nextPolls.push({
@@ -131,6 +179,7 @@ export function usePolls(signer: any | null) {
             question: pollData.question,
             options: pollData.options,
             voteCounts,
+            createdEpoch,
             deadline: pollData.deadline,
             creator: bytesToHex(pollData.creator),
             isClosed: pollData.is_closed,
@@ -234,6 +283,7 @@ export function usePolls(signer: any | null) {
 
       for (const poll of nextPolls) {
         const pollIntents = nextIntents[poll.id] ?? [];
+        const pendingPollIntents = pollIntents.filter((intent) => !intent.aggregated);
         const authorityOptions: VoteAuthorityOption[] = [];
 
         const directIntents = pollIntents.filter(
@@ -274,7 +324,10 @@ export function usePolls(signer: any | null) {
         }
 
         poll.authorityOptions = authorityOptions;
-        poll.outstandingIntentCount = pollIntents.length;
+        // UI action gates should follow indexer-observed pending intents until
+        // poll.pending_intent_count is promoted to strict on-chain accounting.
+        poll.pendingIntentCount = BigInt(pendingPollIntents.length);
+        poll.outstandingIntentCount = pendingPollIntents.length;
       }
 
       setPolls(nextPolls);
@@ -319,7 +372,7 @@ export function usePolls(signer: any | null) {
   );
 
   const castVote = useCallback(
-    async ({ poll, optionIndex, authorityId }: CastVoteParams) => {
+    async ({ poll, optionIndex, authorityId, weightUnits }: CastVoteParams) => {
       if (!signer) throw new Error("Wallet not connected");
 
       const selectedAuthority =
@@ -327,6 +380,9 @@ export function usePolls(signer: any | null) {
         poll.authorityOptions[0];
 
       if (!selectedAuthority) throw new Error("No voting authority is available for this poll");
+      if (selectedAuthority.hasAggregatedIntent) {
+        throw new Error("This voting authority already has an aggregated vote intent for the poll");
+      }
       if (selectedAuthority.hasIntent) {
         throw new Error("This voting authority already has an indexed intent for the poll");
       }
@@ -335,13 +391,17 @@ export function usePolls(signer: any | null) {
         selectedAuthority.delegationId !== null
           ? delegationCells[selectedAuthority.delegationId]
           : undefined;
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
 
       setTxState({ status: "building", txHash: null, error: null });
       try {
         const tx = await buildCreateVoteIntentTx(signer, {
           pollTypeHash: poll.id,
           optionIndex,
+          pollCell,
           delegationCell,
+          weightUnits,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
@@ -358,7 +418,7 @@ export function usePolls(signer: any | null) {
         throw error;
       }
     },
-    [delegationCells, fetchPolls, signer]
+    [delegationCells, fetchPolls, pollCells, signer]
   );
 
   const closePoll = useCallback(
@@ -373,6 +433,39 @@ export function usePolls(signer: any | null) {
       setTxState({ status: "building", txHash: null, error: null });
       try {
         const tx = await buildClosePollTx(signer, {
+          pollCell,
+          intentCells: outstandingIntentCells,
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [fetchPolls, intentCells, pollCells, signer]
+  );
+
+  const forceClose = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+
+      const outstandingIntentCells = intentCells[poll.id] ?? [];
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildForceCloseTx(signer, {
           pollCell,
           intentCells: outstandingIntentCells,
         });
@@ -513,6 +606,7 @@ export function usePolls(signer: any | null) {
     closePoll,
     createDelegation,
     revokeDelegation,
+    forceClose,
     currentEpoch,
   };
 }

@@ -7,12 +7,16 @@
 
 import { ccc } from "@ckb-ccc/core";
 import { randomBytes } from "crypto";
-import { decodePollData, encodePollData } from "../contract/src/molecule";
-import { RPC_URL } from "./config";
+import { decodePollData, encodePollData } from "../../frontend/src/lib/molecule";
+import {
+  RPC_URL,
+  assertRpcUrl,
+  requireGovernanceHashes,
+  requirePrivateKey,
+} from "./config";
 
-const PRIVATE_KEY = process.env.CKB_PRIVATE_KEY;
-const GOVERNANCE_CODE_HASH = process.env.GOVERNANCE_CODE_HASH ?? process.env.VITE_GOVERNANCE_CODE_HASH;
-const GOVERNANCE_SCRIPT_TX_HASH = process.env.GOVERNANCE_SCRIPT_TX_HASH ?? process.env.VITE_GOVERNANCE_SCRIPT_TX_HASH;
+const PRIVATE_KEY = requirePrivateKey();
+const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
 const CREATOR_DEPOSIT_SHANNONS = 500n * 100_000_000n;
 const SHANNONS_PER_CKB = 100_000_000n;
 const SCRIPT_HASH_TYPE = "data1";
@@ -30,25 +34,14 @@ const DEMO_POLLS = [
   },
 ];
 
-if (!PRIVATE_KEY) {
-  console.error("Set CKB_PRIVATE_KEY before running the seed script.");
-  process.exit(1);
-}
+assertRpcUrl(RPC_URL, "CKB RPC URL");
 
-if (!GOVERNANCE_CODE_HASH || !/^0x[0-9a-fA-F]{64}$/.test(GOVERNANCE_CODE_HASH)) {
-  console.error("Set GOVERNANCE_CODE_HASH or VITE_GOVERNANCE_CODE_HASH to the deployed governance code hash.");
-  process.exit(1);
-}
-
-if (!GOVERNANCE_SCRIPT_TX_HASH || !/^0x[0-9a-fA-F]{64}$/.test(GOVERNANCE_SCRIPT_TX_HASH)) {
-  console.error("Set GOVERNANCE_SCRIPT_TX_HASH or VITE_GOVERNANCE_SCRIPT_TX_HASH to the deployment transaction hash.");
-  process.exit(1);
-}
-
+/** @notice Estimates minimum occupied capacity from data size. */
 function estimateCellCapacity(dataBytes: number, extraScriptBytes = 61): bigint {
   return BigInt(dataBytes + extraScriptBytes) * SHANNONS_PER_CKB;
 }
 
+/** @notice Resolves chain tip epoch in bigint format across client variants. */
 async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
     const rawEpoch = await client.getTipEpoch();
@@ -61,6 +54,7 @@ async function getTipEpoch(client: any): Promise<bigint> {
   return BigInt(String(tipHeader.epoch).split(",")[0]);
 }
 
+/** @notice Seeds demo polls for hosted frontend smoke and UX validation. */
 async function main(): Promise<void> {
   console.log("=== CKB Governance Seeder ===");
   console.log(`RPC: ${RPC_URL}`);

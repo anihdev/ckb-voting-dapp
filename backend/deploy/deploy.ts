@@ -24,16 +24,19 @@ import {
   PREVIOUS_CONTRACT_TX_HASH,
   PREVIOUS_CONTRACT_INDEX,
   PREVIOUS_CONTRACT_OUTPOINTS,
+  assertRpcUrl,
+  requirePrivateKey,
 } from "./config";
 
 // ─── Read private key from environment ───────────────────────────────────────
-const PRIVATE_KEY = process.env.CKB_PRIVATE_KEY;
-if (!PRIVATE_KEY) {
-  console.error("Set CKB_PRIVATE_KEY env var before running deploy");
-  process.exit(1);
-}
+const PRIVATE_KEY = requirePrivateKey();
+assertRpcUrl(RPC_URL, "CKB RPC URL");
 
 // ─── Main deploy function ─────────────────────────────────────────────────────
+/**
+ * @notice Deploys the governance ELF as a code cell and prints resulting hashes.
+ * @dev Supports optional recycling of previous code-cell outpoints to save capacity.
+ */
 async function deploy(): Promise<void> {
   console.log("=== CKB Voting Contract Deployer ===");
   console.log(`RPC: ${RPC_URL}`);
@@ -147,6 +150,10 @@ async function waitForConfirmation(
   }
 }
 
+/**
+ * @notice Computes the deployed code hash from output data.
+ * @dev Mirrors the hash used when constructing governance type scripts.
+ */
 async function computeDataHash(
   client: ccc.Client,
   txHash: string,
@@ -160,10 +167,12 @@ async function computeDataHash(
   return ccc.hexFrom(hash);
 }
 
+/** @notice Promise-based delay helper for polling loops. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** @notice Parses optional previous code-cell outpoints for deployment recycling. */
 function parseRecycledOutPoints(): Array<{ previousOutput: { txHash: string; index: number } }> {
   if (PREVIOUS_CONTRACT_OUTPOINTS) {
     return PREVIOUS_CONTRACT_OUTPOINTS.split(",")

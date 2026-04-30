@@ -10,7 +10,7 @@
     "skipLibCheck": true
   },
   "include": [
-    "backend/contract/src/**/*.ts",
+    "frontend/src/lib/molecule.ts",
     "tests/**/*.ts",
     "tests/**/*.d.ts"
   ],

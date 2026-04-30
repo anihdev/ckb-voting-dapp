@@ -1,0 +1,17 @@
+# Keep Vercel upload context minimal for faster and more reliable deploys.
+.git
+.git/**
+node_modules
+node_modules/**
+.pnpm-store
+.pnpm-store/**
+
+# Rust contract build artifacts (not needed for frontend deploy).
+backend/contracts-rust/target
+backend/contracts-rust/target/**
+
+# Local caches and editor/runtime artifacts.
+.vite
+.vite/**
+.DS_Store
+*.log

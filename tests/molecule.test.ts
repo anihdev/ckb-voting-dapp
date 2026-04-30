@@ -1,19 +1,10 @@
 /**
  * Molecule Codec Tests
  * ====================
- * Verifies that backend and frontend serialize the same bytes for poll,
- * vote intent, and delegation cells.
+ * Validates the shared frontend codec layout used by deploy tooling and UI.
  */
 
 import { describe, expect, test } from "vitest";
-import {
-  decodeDelegationData as decodeBackendDelegationData,
-  decodePollData as decodeBackendPollData,
-  decodeVoteIntentData as decodeBackendVoteIntentData,
-  encodeDelegationData as encodeBackendDelegationData,
-  encodePollData as encodeBackendPollData,
-  encodeVoteIntentData as encodeBackendVoteIntentData,
-} from "../backend/contract/src/molecule";
 import {
   bytesToHex,
   decodeDelegationData,
@@ -80,15 +71,12 @@ function makeDelegation(overrides: Partial<DelegationData> = {}): DelegationData
   };
 }
 
-describe("poll codec parity", () => {
-  test("frontend and backend encode the same poll bytes", () => {
+describe("poll codec", () => {
+  test("round-trips poll bytes", () => {
     const poll = makePoll();
-    const frontend = encodePollData(poll);
-    const backend = encodeBackendPollData(poll as any);
+    const encoded = encodePollData(poll);
 
-    expect(bytesToHex(frontend)).toBe(bytesToHex(backend));
-    expect(decodePollData(frontend)).toEqual(poll);
-    expect(decodeBackendPollData(backend)).toEqual(poll);
+    expect(decodePollData(encoded)).toEqual(poll);
   });
 
   test("question length is still written as little-endian uint32", () => {
@@ -97,16 +85,13 @@ describe("poll codec parity", () => {
   });
 });
 
-describe("vote intent codec parity", () => {
-  test("frontend and backend encode the same intent bytes", () => {
+describe("vote intent codec", () => {
+  test("round-trips intent bytes", () => {
     const intent = makeIntent();
-    const frontend = encodeVoteIntentData(intent);
-    const backend = encodeBackendVoteIntentData(intent as any);
+    const encoded = encodeVoteIntentData(intent);
 
-    expect(frontend.length).toBeGreaterThan(74);
-    expect(bytesToHex(frontend)).toBe(bytesToHex(backend));
-    expect(decodeVoteIntentData(frontend)).toEqual(intent);
-    expect(decodeBackendVoteIntentData(backend)).toEqual(intent);
+    expect(encoded.length).toBeGreaterThan(74);
+    expect(decodeVoteIntentData(encoded)).toEqual(intent);
   });
 
   test("aggregated flag flips the final byte only", () => {
@@ -119,16 +104,13 @@ describe("vote intent codec parity", () => {
   });
 });
 
-describe("delegation codec parity", () => {
-  test("frontend and backend encode the same delegation bytes", () => {
+describe("delegation codec", () => {
+  test("round-trips delegation bytes", () => {
     const delegation = makeDelegation();
-    const frontend = encodeDelegationData(delegation);
-    const backend = encodeBackendDelegationData(delegation as any);
+    const encoded = encodeDelegationData(delegation);
 
-    expect(frontend.length).toBe(104);
-    expect(bytesToHex(frontend)).toBe(bytesToHex(backend));
-    expect(decodeDelegationData(frontend)).toEqual(delegation);
-    expect(decodeBackendDelegationData(backend)).toEqual(delegation);
+    expect(encoded.length).toBe(104);
+    expect(decodeDelegationData(encoded)).toEqual(delegation);
   });
 });
 

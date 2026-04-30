@@ -16,33 +16,23 @@ import {
   encodeDelegationData,
   encodePollData,
   encodeVoteIntentData,
-} from "../contract/src/molecule";
-import { RPC_URL } from "./config";
+} from "../../frontend/src/lib/molecule";
+import {
+  RPC_URL,
+  assertRpcUrl,
+  requireGovernanceHashes,
+  requirePrivateKey,
+} from "./config";
 
-const PRIVATE_KEY = process.env.CKB_PRIVATE_KEY;
-const GOVERNANCE_CODE_HASH = process.env.GOVERNANCE_CODE_HASH ?? process.env.VITE_GOVERNANCE_CODE_HASH;
-const GOVERNANCE_SCRIPT_TX_HASH = process.env.GOVERNANCE_SCRIPT_TX_HASH ?? process.env.VITE_GOVERNANCE_SCRIPT_TX_HASH;
+const PRIVATE_KEY = requirePrivateKey();
+const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
 const SCRIPT_HASH_TYPE = "data1";
 const CREATOR_DEPOSIT_SHANNONS = 500n * 100_000_000n;
 const VOTER_DEPOSIT_SHANNONS = 61n * 100_000_000n;
 const DELEGATION_MIN_SHANNONS = 61n * 100_000_000n;
 const SHANNONS_PER_CKB = 100_000_000n;
 const AGGREGATE_FEE_RESERVE_SHANNONS = 1_000_000n;
-
-if (!PRIVATE_KEY) {
-  console.error("Set CKB_PRIVATE_KEY before running the smoke script.");
-  process.exit(1);
-}
-
-if (!GOVERNANCE_CODE_HASH || !/^0x[0-9a-fA-F]{64}$/.test(GOVERNANCE_CODE_HASH)) {
-  console.error("Set GOVERNANCE_CODE_HASH or VITE_GOVERNANCE_CODE_HASH before running the smoke script.");
-  process.exit(1);
-}
-
-if (!GOVERNANCE_SCRIPT_TX_HASH || !/^0x[0-9a-fA-F]{64}$/.test(GOVERNANCE_SCRIPT_TX_HASH)) {
-  console.error("Set GOVERNANCE_SCRIPT_TX_HASH or VITE_GOVERNANCE_SCRIPT_TX_HASH before running the smoke script.");
-  process.exit(1);
-}
+assertRpcUrl(RPC_URL, "CKB RPC URL");
 
 type CellRef = {
   outPoint: { txHash: string; index: number };
@@ -50,18 +40,22 @@ type CellRef = {
   outputData: string;
 };
 
+/** @notice Computes the script hash used for poll id and type binding checks. */
 function scriptHash(script: any): string {
   return ccc.hexFrom((ccc as any).hashCkb((ccc as any).Script.from(script).toBytes()));
 }
 
+/** @notice Computes lock hash bytes for signer and ownership assertions. */
 function lockHashBytes(script: any): Uint8Array {
   return (ccc as any).bytesFrom((ccc as any).hashCkb(script.toBytes()));
 }
 
+/** @notice Encodes operation args as `<op-byte><scope-bytes>`. */
 function encodeOpArgs(op: number, scopeHex = "0x"): string {
   return `0x${op.toString(16).padStart(2, "0")}${scopeHex.replace(/^0x/, "")}`;
 }
 
+/** @notice Builds governance type scripts for lifecycle smoke transactions. */
 function governanceTypeScript(op: number, scopeHex = "0x"): any {
   return (ccc as any).Script.from({
     codeHash: GOVERNANCE_CODE_HASH,
@@ -70,6 +64,7 @@ function governanceTypeScript(op: number, scopeHex = "0x"): any {
   });
 }
 
+/** @notice Builds governance code cell dep. */
 function governanceCellDep() {
   return {
     outPoint: {
@@ -80,6 +75,7 @@ function governanceCellDep() {
   };
 }
 
+/** @notice Estimates output capacity from serialized script and data size. */
 function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
   const lockBytes = (ccc as any).Script.from(lockScript).toBytes().length;
   const typeBytes = typeScript ? (ccc as any).Script.from(typeScript).toBytes().length : 0;
@@ -87,6 +83,7 @@ function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, da
   return BigInt(occupiedBytes) * SHANNONS_PER_CKB;
 }
 
+/** @notice Resolves chain tip epoch in bigint format across client variants. */
 async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
     const rawEpoch = await client.getTipEpoch();
@@ -99,6 +96,7 @@ async function getTipEpoch(client: any): Promise<bigint> {
   return BigInt(String(tipHeader.epoch).split(",")[0]);
 }
 
+/** @notice Polls RPC until a transaction is indexed or times out. */
 async function waitForTx(client: any, txHash: string): Promise<void> {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -109,6 +107,7 @@ async function waitForTx(client: any, txHash: string): Promise<void> {
   throw new Error(`Timed out waiting for ${txHash}`);
 }
 
+/** @notice Finds a signer-owned auth cell suitable for fee/change handling. */
 async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = []): Promise<any> {
   const signerAddress = await signer.getAddressObjSecp256k1();
   let fallbackCell: any | null = null;
@@ -138,6 +137,7 @@ async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = [])
   throw new Error("No signer auth cell available");
 }
 
+/** @notice Normalizes script field casing into molecule encoded-script shape. */
 function normalizeScript(script: any): EncodedScript {
   return {
     code_hash: script.code_hash ?? script.codeHash,
@@ -146,6 +146,10 @@ function normalizeScript(script: any): EncodedScript {
   };
 }
 
+/**
+ * @notice Runs a full governance lifecycle smoke flow on testnet.
+ * @dev Covers create poll, create intent, pending replacement, aggregate, close, delegate, and revoke.
+ */
 async function main(): Promise<void> {
   console.log("=== Governance Smoke Test ===");
   console.log(`RPC: ${RPC_URL}`);
@@ -279,14 +283,85 @@ async function main(): Promise<void> {
     outputData: ccc.hexFrom(intentBytes),
   };
 
+  // Replace the pending intent before aggregation to exercise direct-voter override.
+  const replacementAuthCell = await findSignerAuthCell(signer, [
+    `${pollCell.outPoint.txHash}:${pollCell.outPoint.index}`,
+    `${intentCell.outPoint.txHash}:${intentCell.outPoint.index}`,
+  ]);
+  const replacementAuthCapacity = BigInt((replacementAuthCell.cellOutput ?? replacementAuthCell.output).capacity);
+  const replacementFeeReserve = 1_000_000n;
+  const replacementChangeCapacity = replacementAuthCapacity - replacementFeeReserve;
+  if (replacementChangeCapacity <= 0n) {
+    throw new Error("Replacement auth cell does not have enough capacity for change");
+  }
+  const replacedIntentData: VoteIntentData = {
+    ...intentData,
+    option_index: 1,
+    voted_at_epoch: currentEpoch + 1n,
+    aggregated: false,
+  };
+  const replacedIntentBytes = encodeVoteIntentData(replacedIntentData);
+
+  const replaceIntentTx = ccc.Transaction.from({
+    cellDeps: [
+      governanceCellDep(),
+      {
+        outPoint: pollCell.outPoint,
+        depType: "code",
+      },
+    ],
+    headerDeps: [tipHeader.hash],
+    inputs: [
+      { previousOutput: intentCell.outPoint },
+      {
+        previousOutput: {
+          txHash: replacementAuthCell.outPoint.txHash,
+          index: Number(replacementAuthCell.outPoint.index),
+        },
+      },
+    ],
+    outputs: [
+      {
+        lock: signerAddress.script,
+        type: intentType,
+        capacity: intentCell.cellOutput.capacity,
+      },
+      {
+        lock: signerAddress.script,
+        capacity: replacementChangeCapacity,
+      },
+    ],
+    outputsData: [ccc.hexFrom(replacedIntentBytes), "0x"],
+    witnesses: [
+      (ccc as any).WitnessArgs.from({
+        inputType: new Uint8Array([1]),
+      }).toBytes(),
+      "0x",
+    ],
+  });
+  await signer.signTransaction(replaceIntentTx);
+  const replaceIntentHash = await client.sendTransaction(replaceIntentTx);
+  await waitForTx(client, replaceIntentHash);
+  console.log(`CREATE_VOTE_INTENT (override): ${replaceIntentHash}`);
+
+  const replacedIntentCell: CellRef = {
+    outPoint: { txHash: replaceIntentHash, index: 0 },
+    cellOutput: {
+      lock: signerAddress.script,
+      type: intentType,
+      capacity: intentCell.cellOutput.capacity,
+    },
+    outputData: ccc.hexFrom(replacedIntentBytes),
+  };
+
   const aggregatedPollData: PollData = {
     ...pollData,
-    vote_counts: [1n, 0n],
+    vote_counts: [0n, 1n],
     total_voters: 1n,
     counted_voter_lock_hashes: [signerLockHash],
   };
   const aggregatedPollBytes = encodePollData(aggregatedPollData);
-  const aggregatedIntentBytes = encodeVoteIntentData({ ...intentData, aggregated: true });
+  const aggregatedIntentBytes = encodeVoteIntentData({ ...replacedIntentData, aggregated: true });
   const aggregatedPollMinCapacity = estimateOutputCapacity(
     signerAddress.script,
     pollType,
@@ -302,7 +377,7 @@ async function main(): Promise<void> {
     headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: pollCell.outPoint },
-      { previousOutput: intentCell.outPoint },
+      { previousOutput: replacedIntentCell.outPoint },
     ],
     outputs: [
       {
@@ -338,7 +413,7 @@ async function main(): Promise<void> {
     cellOutput: {
       lock: signerAddress.script,
       type: intentType,
-      capacity: intentCapacity > VOTER_DEPOSIT_SHANNONS ? intentCapacity : VOTER_DEPOSIT_SHANNONS,
+      capacity: replacedIntentCell.cellOutput.capacity,
     },
     outputData: ccc.hexFrom(aggregatedIntentBytes),
   };
@@ -380,7 +455,7 @@ async function main(): Promise<void> {
       },
       {
         lock: signerAddress.script,
-        capacity: intentCapacity > VOTER_DEPOSIT_SHANNONS ? intentCapacity : VOTER_DEPOSIT_SHANNONS,
+        capacity: aggregatedIntentCell.cellOutput.capacity,
       },
     ],
     outputsData: [ccc.hexFrom(closedPollBytes), "0x", "0x"],
@@ -440,6 +515,73 @@ async function main(): Promise<void> {
   const revokeHash = await client.sendTransaction(revokeTx);
   await waitForTx(client, revokeHash);
   console.log(`REVOKE_DELEGATION: ${revokeHash}`);
+
+  // --- Permissionless close example (not executed by default) ---
+  // The Rust contract now treats force-close as a strict CLOSE_POLL mode:
+  // any caller can close after `deadline + FORCE_CLOSE_GRACE_EPOCHS` as long
+  // as all pending intent refunds are included. The tx below demonstrates that
+  // recovery flow and is not sent by default. To send it from this script, set
+  // `FORCE_CLOSE_NOW=1` (not recommended on public testnet unless you
+  // understand the epoch timing and refund requirements).
+  async function buildForceCloseTxExample() {
+    const closedPollBytes = encodePollData({
+      ...aggregatedPollData,
+      is_closed: true,
+      pending_intent_count: 0n,
+    });
+
+    const closedPollMinCapacity = estimateOutputCapacity(
+      signerAddress.script,
+      pollType,
+      closedPollBytes.length
+    );
+    const closedPollCandidateCapacity = aggregatedPollCell.cellOutput.capacity - CREATOR_DEPOSIT_SHANNONS;
+    const closedPollCapacity = closedPollCandidateCapacity > closedPollMinCapacity
+      ? closedPollCandidateCapacity
+      : closedPollMinCapacity;
+
+    const forceCloseTx = ccc.Transaction.from({
+      cellDeps: [governanceCellDep()],
+      headerDeps: [tipHeader.hash],
+      inputs: [
+        { previousOutput: aggregatedPollCell.outPoint },
+        { previousOutput: aggregatedIntentCell.outPoint },
+      ],
+      outputs: [
+        {
+          lock: pollCell.cellOutput.lock, // return closed poll to the original creator lock
+          type: pollType,
+          capacity: closedPollCapacity,
+        },
+        {
+          lock: pollCell.cellOutput.lock, // creator deposit return goes to the creator lock
+          capacity: CREATOR_DEPOSIT_SHANNONS,
+        },
+        {
+          lock: signerAddress.script, // placeholder for voter deposit return(s)
+          capacity: aggregatedIntentCell.cellOutput.capacity,
+        },
+      ],
+      outputsData: [ccc.hexFrom(closedPollBytes), "0x", "0x"],
+      witnesses: ["0x", "0x", "0x"],
+    });
+
+    await forceCloseTx.completeInputsByCapacity(signer);
+    await forceCloseTx.completeFeeBy(signer, 1000);
+    return forceCloseTx;
+  }
+
+  if (process.env.FORCE_CLOSE_NOW === "1") {
+    console.log("Building and sending force-close transaction (FORCE_CLOSE_NOW=1)...");
+    buildForceCloseTxExample().then(async (tx) => {
+      await signer.signTransaction(tx);
+      const hash = await client.sendTransaction(tx);
+      await waitForTx(client, hash);
+      console.log(`FORCE_CLOSE: ${hash}`);
+    }).catch((err) => {
+      console.error("Force-close failed:", err);
+    });
+  }
 
   const decodedAggregatedIntent = decodeVoteIntentData(aggregatedIntentBytes);
   if (!decodedAggregatedIntent.aggregated) {

@@ -47,6 +47,7 @@ pub struct DelegationData {
     pub expires_epoch: u64,
 }
 
+/// @notice Reads a little-endian u32 and advances the cursor.
 fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, Error> {
     if data.len() < *offset + 4 {
         return Err(Error::Encoding);
@@ -56,6 +57,7 @@ fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, Error> {
     Ok(value)
 }
 
+/// @notice Reads a little-endian u64 and advances the cursor.
 fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, Error> {
     if data.len() < *offset + 8 {
         return Err(Error::Encoding);
@@ -65,6 +67,7 @@ fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, Error> {
     Ok(value)
 }
 
+/// @notice Reads a fixed-length byte array and advances the cursor.
 fn read_bytes<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N], Error> {
     if data.len() < *offset + N {
         return Err(Error::Encoding);
@@ -74,6 +77,7 @@ fn read_bytes<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N]
     Ok(value)
 }
 
+/// @notice Reads a length-prefixed byte vector and advances the cursor.
 fn read_vec(data: &[u8], offset: &mut usize) -> Result<Vec<u8>, Error> {
     let len = read_u32_le(data, offset)? as usize;
     if data.len() < *offset + len {
@@ -84,6 +88,7 @@ fn read_vec(data: &[u8], offset: &mut usize) -> Result<Vec<u8>, Error> {
     Ok(value)
 }
 
+/// @notice Decodes an encoded script from the current cursor.
 pub fn decode_script(data: &[u8], offset: &mut usize) -> Result<EncodedScript, Error> {
     let code_hash = read_bytes::<32>(data, offset)?;
     if data.len() <= *offset {
@@ -99,6 +104,7 @@ pub fn decode_script(data: &[u8], offset: &mut usize) -> Result<EncodedScript, E
     })
 }
 
+/// @notice Decodes VoteIntentData from molecule-compatible bytes.
 pub fn decode_vote_intent(data: &[u8]) -> Result<VoteIntentData, Error> {
     let mut offset = 0;
     let poll_type_hash = read_bytes::<32>(data, &mut offset)?;
@@ -125,6 +131,7 @@ pub fn decode_vote_intent(data: &[u8]) -> Result<VoteIntentData, Error> {
     })
 }
 
+/// @notice Decodes DelegationData from molecule-compatible bytes.
 pub fn decode_delegation(data: &[u8]) -> Result<DelegationData, Error> {
     let mut offset = 0;
     Ok(DelegationData {
@@ -135,6 +142,7 @@ pub fn decode_delegation(data: &[u8]) -> Result<DelegationData, Error> {
     })
 }
 
+/// @notice Decodes PollData from molecule-compatible bytes.
 pub fn decode_poll(data: &[u8]) -> Result<PollData, Error> {
     let mut offset = 0;
     let question = read_vec(data, &mut offset)?;
