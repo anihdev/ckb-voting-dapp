@@ -26,7 +26,8 @@ export function WalletConnect() {
 
   if (isLoading) {
     return (
-      <div className="wallet-address-pill">
+      <div className="wallet-shell wallet-shell-loading">
+        <div className="wallet-address-pill">
         <span
           style={{
             width: 6,
@@ -38,13 +39,14 @@ export function WalletConnect() {
           }}
         />
         <span style={{ fontSize: 12, color: "var(--ink-2)" }}>Connecting...</span>
+        </div>
       </div>
     );
   }
 
   if (!isConnected || !address) {
     return (
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+      <div className="wallet-shell wallet-shell-disconnected">
         <button
           onClick={connect}
           className="btn-primary"
@@ -58,7 +60,7 @@ export function WalletConnect() {
   }
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+    <div className="wallet-shell wallet-shell-connected">
       <div className="wallet-address-pill">
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", lineHeight: 1.3 }}>
           <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>

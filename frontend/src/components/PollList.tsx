@@ -24,6 +24,7 @@ interface Props {
   onForceClose: (poll: Poll) => Promise<string>;
   onRefresh: () => void;
   onConnectWallet: () => void;
+  onDelegateForPoll: (pollId: string) => void;
 }
 
 export function PollList({
@@ -40,10 +41,38 @@ export function PollList({
   onForceClose,
   onRefresh,
   onConnectWallet,
+  onDelegateForPoll,
 }: Props) {
   const [filter, setFilter] = useState<Filter>("all");
+  const [copiedPollId, setCopiedPollId] = useState<string | null>(null);
   const isInitialLoading = loading && polls.length === 0;
   const hasNoPolls = polls.length === 0;
+
+  const copyPollId = async (pollId: string) => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(pollId);
+      } else if (typeof document !== "undefined") {
+        const tempInput = document.createElement("textarea");
+        tempInput.value = pollId;
+        tempInput.style.position = "fixed";
+        tempInput.style.opacity = "0";
+        document.body.appendChild(tempInput);
+        tempInput.focus();
+        tempInput.select();
+        document.execCommand("copy");
+        document.body.removeChild(tempInput);
+      } else {
+        throw new Error("Clipboard not available");
+      }
+      setCopiedPollId(pollId);
+      setTimeout(() => {
+        setCopiedPollId((active) => (active === pollId ? null : active));
+      }, 1800);
+    } catch {
+      setCopiedPollId(null);
+    }
+  };
 
   const filteredPolls = polls.filter((poll) => {
     if (filter === "active") return !poll.isClosed && currentEpoch <= poll.deadline;
@@ -195,6 +224,7 @@ export function PollList({
             Aggregation processes pending vote intents and updates poll tally state on-chain.
           </div>
           <div className="table-shell">
+            <div className="table-mobile-hint">Swipe horizontally to copy Poll ID.</div>
             <table className="table-grid">
               <thead>
                 <tr>
@@ -235,14 +265,32 @@ export function PollList({
                         {poll.tokenWeighted ? "Capped weighted" : "1p1v"}
                       </td>
                       <td>
-                        <button
-                          onClick={() =>
-                            document.getElementById(anchorId)?.scrollIntoView({ behavior: "smooth", block: "start" })
-                          }
-                          className="btn-quiet px-3 py-1.5 text-xs"
-                        >
-                          Inspect
-                        </button>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() =>
+                              document.getElementById(anchorId)?.scrollIntoView({ behavior: "smooth", block: "start" })
+                            }
+                            className="btn-quiet px-3 py-1.5 text-xs"
+                          >
+                            Inspect
+                          </button>
+                          <button
+                            onClick={() => {
+                              void copyPollId(poll.id);
+                            }}
+                            className="btn-quiet px-3 py-1.5 text-xs"
+                          >
+                            {copiedPollId === poll.id ? "Copied" : "Copy Poll ID"}
+                          </button>
+                          {isConnected && (
+                            <button
+                              onClick={() => onDelegateForPoll(poll.id)}
+                              className="btn-quiet px-3 py-1.5 text-xs"
+                            >
+                              Delegate for this poll
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );

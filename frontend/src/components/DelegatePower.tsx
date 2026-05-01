@@ -4,7 +4,7 @@
  * Creates and revokes delegation cells for the connected wallet.
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { DelegateParams, DelegationRecord, TxState } from "../lib/types";
 import { TxStatus } from "./TxStatus";
 
@@ -13,13 +13,20 @@ interface Props {
   txState: TxState;
   onDelegate: (params: DelegateParams) => Promise<string>;
   onRevoke: (delegationId: string) => Promise<string>;
+  prefillPollScope?: { pollId: string; requestId: number } | null;
 }
 
-export function DelegatePower({ delegations, txState, onDelegate, onRevoke }: Props) {
+export function DelegatePower({ delegations, txState, onDelegate, onRevoke, prefillPollScope = null }: Props) {
   const [delegateLockHash, setDelegateLockHash] = useState("");
   const [pollId, setPollId] = useState("");
   const [expiresEpoch, setExpiresEpoch] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!prefillPollScope?.pollId) return;
+    setPollId(prefillPollScope.pollId);
+    setError(null);
+  }, [prefillPollScope?.pollId, prefillPollScope?.requestId]);
 
   const submitDelegation = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -48,6 +55,9 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke }: Pr
         </p>
         <p className="subtle mt-2 text-sm">
           Delegation cells lock at least 61 CKB and may require more occupied capacity depending on script size.
+        </p>
+        <p className="subtle mt-2 text-sm">
+          Tip: use <strong>Copy Poll ID</strong> or <strong>Delegate for this poll</strong> from Poll Registry to prefill poll scope quickly.
         </p>
       </div>
 

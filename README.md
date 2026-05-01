@@ -1,11 +1,12 @@
 # CKB Governance Protocol
 
-Deposit-backed, UTXO-native governance on Nervos CKB built around vote intent cells, aggregation, delegation, and close-time refunds.
+CKB Governance is a CKB-native voting protocol built around an intent-cell voting model. Instead of mutating a shared poll cell on each vote, participants create independent vote intent cells, and tally updates happen via explicit aggregation transactions. The protocol includes delegation cells, creator-close and permissionless force-close windows, and deposit-backed refund paths to ensure funds are returned under validated spend rules
 
-This repository is the protocol implementation, not a tutorial demo. The contract is the source of truth and the frontend mirrors that contract model.
+The repo intentionally evolves from a tutorial dApp toward a production-minded governance protocol implementation.
 
 ## Table of Contents
 
+- [About](#about)
 - [Why This Exists](#why-this-exists)
 - [Protocol Model](#protocol-model)
 - [Data Layout (Codec Truth)](#data-layout-codec-truth)
@@ -20,6 +21,27 @@ This repository is the protocol implementation, not a tutorial demo. The contrac
 - [Testing Scope](#testing-scope)
 - [Known Tradeoffs and Limitations](#known-tradeoffs-and-limitations)
 - [Roadmap](#roadmap)
+
+## About
+
+CKB Governance Protocol is a cell-native governance system designed for Nervos CKB's UTXO model.
+
+Instead of relying on shared mutable state for every vote, it separates governance into explicit on-chain artifacts:
+
+- poll cells define proposal state and lifecycle windows
+- vote intent cells record participant choices with refundable deposits
+- delegation cells encode scoped authority between delegator and delegate
+
+This architecture keeps economic backing on-chain, reduces voter submission contention, and makes lifecycle transitions auditable through cell consumption rules.
+
+At a high level:
+
+- creators open polls by locking capacity
+- voters or delegates submit intent cells
+- aggregators batch intents into tally updates
+- close paths return deposits under validated spend conditions
+
+The result is a protocol that demonstrates why CKB's cell model is a better fit for governance flows than account-style voting patterns.
 
 ## Why This Exists
 
@@ -57,7 +79,7 @@ Primary lifecycle:
 - creator-authorized close after deadline
 - permissionless force-close after `deadline + FORCE_CLOSE_GRACE_EPOCHS`
 
-## Data Layout (Codec Truth)
+## Data Layout
 
 Authoritative files:
 
@@ -97,7 +119,7 @@ Authoritative files:
 
 ## Current Implementation Status
 
-Status reflects current repository behavior (April 2026 contract branch state):
+Status reflects current repository behavior:
 
 - Rust governance contract implements all six opcode validators.
 - Frontend transaction builders exist for all six operations.
@@ -194,7 +216,6 @@ From repo root:
 ```bash
 pnpm build                    # build rust contract + frontend
 pnpm build:contract:rust      # cargo build for governance contract
-pnpm check:contract:rust      # cargo check for governance contract
 pnpm build:frontend           # vite build
 pnpm dev:frontend             # local frontend dev server
 pnpm test                     # frontend workspace test command
@@ -260,6 +281,8 @@ UI states show:
 - indexed pending intents
 - authority options (self + delegated voter authorities)
 - close and force-close eligibility by epoch
+- poll registry quick actions: `Inspect`, `Copy Poll ID`, and `Delegate for this poll`
+- delegation form prefill flow for per-poll scope (click from poll registry to prefill `poll_id`)
 
 ## Testing Scope
 
@@ -267,8 +290,7 @@ Test files in `tests/` currently focus on:
 
 - codec round-trip invariants (`PollData`, `VoteIntentData`, `DelegationData`)
 - protocol model invariants for aggregation/close/delegation behaviors
-
-Current tests are not yet a full CKB-VM syscall harness for contract execution. They are useful for data/layout and model checks, but not sufficient alone for production-grade assurances.
+- end-to-end happy path flows for create, vote intent, aggregate, close, delegate, revoke is not yet exhaustively tested for every opcode failure path or edge case.
 
 ## Known Tradeoffs and Limitations
 
@@ -280,25 +302,23 @@ Current tests are not yet a full CKB-VM syscall harness for contract execution. 
 
 ## Roadmap
 
-### Phase 1: Repository honesty
-
-- keep docs synchronized with real implementation status
-- keep contract/frontend/test constants aligned
-
-### Phase 2: Protocol parity hardening
-
-- tighten pending intent accounting invariants
-- expand end-to-end tests across all six operations
-- keep frontend builders aligned with contract evolution
-
-### Phase 3: Production-grade polish
-
-- stronger indexing and UX state surfaces
-- improved deployment and observability workflows
-- clearer error reporting and transaction diagnostics
-
-### Phase 4: CKB-native extensions
+### Phase 1: CKB-native extensions
 
 - xUDT-weighted voting
 - abandoned poll recovery improvements
 - richer proposal metadata flows
+
+### Phase 2: Fiber-incentivized aggregation (optional)
+
+- add an optional Fiber fee path for aggregation services
+- allow voters to pay tiny off-chain aggregation fees to operator nodes
+- preserve full on-chain deposit refunds (no voter deposit haircut)
+- create an open aggregation market to improve tally freshness and reduce close-time backlog
+- keep a manual/no-Fiber path for wallets without Fiber support
+
+### Phase 3: ZK eligibility proofs (optional, later-stage)
+
+- evaluate a private-eligibility poll mode when governance controls real value
+- keep tallies and governance outcomes public while hiding voter-to-choice linkage
+- treat this as a mainnet-era extension, not a testnet requirement
+- only proceed once cryptographic assumptions, tooling, and audit scope are mature

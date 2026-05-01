@@ -1,6 +1,8 @@
-//! First Rust entry port for the governance script.
-//! This stage validates dispatch and decoding boundaries before porting the
-//! complete TypeScript validation logic operation by operation.
+//! Governance contract entry — validates and routes protocol operations.
+//!
+//! This file contains the top-level dispatch and the main validation
+//! routines used by each on-chain operation. Comments are written to be
+//! human-friendly and explain the purpose of checks and transitions.
 
 use alloc::vec::Vec;
 
@@ -23,16 +25,18 @@ use crate::{
     },
 };
 
-/// @notice Dispatches validation to the active governance operation.
-/// @dev The first byte of script args is treated as the operation code.
+/// Entry point for the contract. Reads the script arguments and dispatches
+/// to the validator that handles the selected operation.
+///
+/// The first byte of the script args is the operation code.
 pub fn main() -> Result<(), Error> {
-    // Full dispatch mode.
-    // All protocol operations now route through their Rust validation
-    // implementations instead of mixed stubs.
+    // Load the currently executing script and parse arguments.
+    // The operation code is the first byte of the args slice.
     let script = ckb_std::high_level::load_script()?;
     let args: Vec<u8> = script.args().raw_data().to_vec();
     let op = *args.first().ok_or(Error::UnknownOp)?;
 
+    // Dispatch to the correct validation routine based on op code.
     match op {
         OP_CREATE_POLL => validate_poll_lifecycle(),
         OP_CREATE_VOTE_INTENT => validate_intent_lifecycle(),
@@ -44,8 +48,10 @@ pub fn main() -> Result<(), Error> {
     }
 }
 
-/// @notice Loads the group cell data at index 0 when present.
-/// @dev Returns `Ok(None)` when the group source is empty.
+/// Try to load the cell data for group index 0.
+///
+/// Returns `Ok(None)` if the group is empty (IndexOutOfBound), otherwise
+/// returns the raw bytes of the group cell payload.
 fn maybe_group_cell_data(source: Source) -> Result<Option<Vec<u8>>, Error> {
     match load_cell_data(0, source) {
         Ok(data) => Ok(Some(data)),
@@ -54,43 +60,53 @@ fn maybe_group_cell_data(source: Source) -> Result<Option<Vec<u8>>, Error> {
     }
 }
 
-/// @notice Routes poll-group transitions to create, aggregate, or close handlers.
-/// @dev Polls use one type script family and infer transition mode from before/after cells.
+/// Decide whether the poll group operation is a creation, an aggregation,
+/// or a close, then call the matching validator.
+///
+/// Decision is based on whether the type-group has input and/or output cells.
 fn validate_poll_lifecycle() -> Result<(), Error> {
     let group_input = maybe_group_cell_data(Source::GroupInput)?;
     let group_output = maybe_group_cell_data(Source::GroupOutput)?;
 
     match (group_input, group_output) {
+        // No input poll but an output poll => new poll being created.
         (None, Some(output)) => {
-            decode_poll(&output)?;
+            decode_poll(&output)?; // validate encoding
             validate_create_poll()
         }
+        // Both input and output exist => either aggregate or close transition.
         (Some(input), Some(output)) => {
             let before = decode_poll(&input)?;
             let after = decode_poll(&output)?;
 
+            // If poll moved from open -> closed then it's a close, otherwise
+            // it's an aggregation update of vote counts.
             if !before.is_closed && after.is_closed {
                 validate_close_poll()
             } else {
                 validate_aggregate_votes()
             }
         }
+        // Any other pattern is invalid for poll transitions.
         _ => Err(Error::Validation),
     }
 }
 
-/// @notice Routes intent-group transitions to create, replace/aggregate, or consume handlers.
-/// @dev Input+output intent pairs are validated by `validate_intent_aggregation_transition`.
+/// Determine how intent (vote intent) group changed and validate the
+/// corresponding operation: creation, aggregation (replace), or consumption.
 fn validate_intent_lifecycle() -> Result<(), Error> {
     let group_input = maybe_group_cell_data(Source::GroupInput)?;
     let group_output = maybe_group_cell_data(Source::GroupOutput)?;
 
     match (group_input, group_output) {
+        // New intent created (no input, output present)
         (None, Some(output)) => {
             decode_vote_intent(&output)?;
             validate_create_vote_intent()
         }
+        // Intent replaced/aggregated: both input+output present
         (Some(input), Some(output)) => validate_intent_aggregation_transition(&input, &output),
+        // Intent consumed without output (simple consumption)
         (Some(input), None) => {
             decode_vote_intent(&input)?;
             Ok(())
@@ -99,8 +115,8 @@ fn validate_intent_lifecycle() -> Result<(), Error> {
     }
 }
 
-/// @notice Routes delegation-group transitions to delegate or revoke handlers.
-/// @dev Delegations are created as type cells and revoked by consuming the cell.
+/// Validate delegation creation or revocation by inspecting the group
+/// inputs/outputs. Creation = no input, output present. Revoke = input consumed.
 fn validate_delegation_lifecycle() -> Result<(), Error> {
     let group_input = maybe_group_cell_data(Source::GroupInput)?;
     let group_output = maybe_group_cell_data(Source::GroupOutput)?;
@@ -118,16 +134,23 @@ fn validate_delegation_lifecycle() -> Result<(), Error> {
     }
 }
 
-/// @notice Validates intent transitions inside the intent type group.
-/// @dev Only aggregate transitions (`pending -> aggregated`) are accepted.
+/// Validate a single intent aggregation transition (input -> output).
+///
+/// Typical aggregation replaces a pending intent with an aggregated marker
+/// while preserving the intent's binding to the voter, poll, refund-lock
+/// and chosen option. We check capacity, ownership and identity invariants.
 fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result<(), Error> {
     let before = decode_vote_intent(input)?;
     let after = decode_vote_intent(output)?;
+    // group deposit checks
     let input_capacity = load_cell_capacity(0, Source::GroupInput)?;
     let output_capacity = load_cell_capacity(0, Source::GroupOutput)?;
     let output_lock = load_output_script(0)?;
 
+    // Basic invariants: before must be pending, after must be marked aggregated.
     assert_condition(!before.aggregated, Error::Validation)?;
+
+    // Identity checks: voter and poll must match between before/after.
     assert_condition(
         compare_arrays(&after.voter_lock_hash, &before.voter_lock_hash),
         Error::Validation,
@@ -136,6 +159,8 @@ fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result
         compare_arrays(&after.poll_type_hash, &before.poll_type_hash),
         Error::Validation,
     )?;
+
+    // Refund-lock and output lock must match expected ownership.
     assert_condition(
         compare_scripts(&after.refund_lock, &before.refund_lock),
         Error::Validation,
@@ -144,8 +169,12 @@ fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result
         compare_scripts(&output_lock, &after.refund_lock),
         Error::Validation,
     )?;
+
+    // Capacity checks: outputs must preserve at least the voter deposit.
     assert_condition(output_capacity >= input_capacity, Error::Validation)?;
     assert_condition(output_capacity >= VOTER_DEPOSIT_SHANNONS, Error::Validation)?;
+
+    // Final consistency checks: aggregated flag, option and epoch unchanged.
     assert_condition(after.aggregated, Error::Validation)?;
     assert_condition(after.option_index == before.option_index, Error::Validation)?;
     assert_condition(
@@ -156,8 +185,11 @@ fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result
     Ok(())
 }
 
-/// @notice Ensures the referenced poll exists in cell deps and is still open.
-/// @dev Protects intent creation/replacement from forged or stale poll references.
+/// Look through `cell deps` for the poll type hash and ensure the poll is
+/// present and still open at `epoch`.
+///
+/// This protects intent creation against referencing a nonexistent or closed
+/// poll by enforcing the poll cell as a cell-dependency.
 fn ensure_poll_dep_open(poll_type_hash: &[u8; 32], epoch: u64) -> Result<PollData, Error> {
     let mut matched_poll: Option<PollData> = None;
     let mut dep_index = 0usize;
@@ -167,6 +199,7 @@ fn ensure_poll_dep_open(poll_type_hash: &[u8; 32], epoch: u64) -> Result<PollDat
                 if compare_arrays(&type_hash, poll_type_hash) {
                     let poll_bytes = load_cell_data(dep_index, Source::CellDep)?;
                     let poll = decode_poll(&poll_bytes)?;
+                    // Poll must still be open and not past its deadline.
                     assert_condition(!poll.is_closed, Error::Validation)?;
                     assert_condition(epoch <= poll.deadline, Error::Validation)?;
                     matched_poll = Some(poll);
@@ -182,13 +215,17 @@ fn ensure_poll_dep_open(poll_type_hash: &[u8; 32], epoch: u64) -> Result<PollDat
     matched_poll.ok_or(Error::Validation)
 }
 
-/// @notice Computes vote weight units from intent capacity.
-/// @dev For non-weighted polls this is always `1`; weighted polls are capped per intent.
+/// Convert an intent's locked capacity into vote weight units.
+///
+/// If the poll is not token-weighted this always returns `1`. For token-
+/// weighted polls the number of units is `capacity / VOTER_DEPOSIT_SHANNONS`
+/// capped by `MAX_WEIGHT_UNITS_PER_INTENT`.
 fn intent_vote_weight_units(intent_capacity: u64, token_weighted: bool) -> Result<u64, Error> {
     if !token_weighted {
         return Ok(1);
     }
 
+    // Compute raw units and enforce a minimum/upper-bound.
     let units = intent_capacity / VOTER_DEPOSIT_SHANNONS;
     assert_condition(units > 0, Error::Validation)?;
     Ok(core::cmp::min(units, MAX_WEIGHT_UNITS_PER_INTENT))

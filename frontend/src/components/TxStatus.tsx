@@ -146,7 +146,7 @@ export function TxStatus({ txState }: Props) {
 
       {status === "success" && (
         <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--teal)" }}>
-          ✓ Transaction confirmed on CKB.
+           Transaction confirmed on CKB.
         </div>
       )}
     </div>

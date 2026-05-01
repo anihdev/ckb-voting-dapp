@@ -65,6 +65,7 @@ function InnerApp() {
   const [currentEpoch, setCurrentEpoch] = useState<bigint>(0n);
   const [lastSyncedAt, setLastSyncedAt] = useState<number>(Date.now());
   const [secondsSinceSync, setSecondsSinceSync] = useState<number>(0);
+  const [delegationScopePrefill, setDelegationScopePrefill] = useState<{ pollId: string; requestId: number } | null>(null);
 
   const syncDashboard = useCallback(async () => {
     if (!signer) return;
@@ -151,11 +152,16 @@ function InnerApp() {
     </div>
   );
 
+  const handleDelegateForPoll = useCallback((pollId: string) => {
+    setDelegationScopePrefill({ pollId, requestId: Date.now() });
+    document.getElementById("creator-tools")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
   return (
     <div className="app-shell">
       <nav className="top-nav">
         <div className="nav-inner">
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div className="nav-brand" style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <div className="logo-mark">CG</div>
             <div>
               <div className="logo-name">CKB Governance</div>
@@ -308,6 +314,7 @@ function InnerApp() {
               void syncDashboard();
             }}
             onConnectWallet={connect}
+            onDelegateForPoll={handleDelegateForPoll}
           />
         </Suspense>
 
@@ -321,6 +328,7 @@ function InnerApp() {
                   txState={txState}
                   onDelegate={createDelegation}
                   onRevoke={revokeDelegation}
+                  prefillPollScope={delegationScopePrefill}
                 />
               </Suspense>
               <Suspense fallback={sectionFallback}>

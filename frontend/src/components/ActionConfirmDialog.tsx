@@ -4,7 +4,7 @@
  * Countdown confirmation modal for sensitive state-changing actions.
  */
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 interface Props {
   open: boolean;
@@ -28,15 +28,25 @@ export function ActionConfirmDialog({
   onCancel,
 }: Props) {
   const [remaining, setRemaining] = useState(countdownSeconds);
+  const cancelRef = useRef(onCancel);
 
   useEffect(() => {
-    if (!open) return;
+    cancelRef.current = onCancel;
+  }, [onCancel]);
+
+  useEffect(() => {
+    if (!open) {
+      setRemaining(countdownSeconds);
+      return;
+    }
+
+    setRemaining(countdownSeconds);
     const endAtMs = Date.now() + countdownSeconds * 1000;
     const updateRemaining = () => {
       const leftMs = endAtMs - Date.now();
       if (leftMs <= 0) {
         setRemaining(0);
-        onCancel();
+        cancelRef.current();
         return;
       }
       setRemaining(Math.ceil(leftMs / 1000));
@@ -46,7 +56,7 @@ export function ActionConfirmDialog({
     const timer = setInterval(updateRemaining, 200);
 
     return () => clearInterval(timer);
-  }, [countdownSeconds, onCancel, open]);
+  }, [countdownSeconds, open]);
 
   if (!open) return null;
 

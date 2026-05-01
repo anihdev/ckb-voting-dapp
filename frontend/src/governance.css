@@ -549,12 +549,26 @@
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
 }
 
 .governance-theme .table-grid {
   width: 100%;
+  min-width: 860px;
   border-collapse: collapse;
+}
+
+.governance-theme .table-mobile-hint {
+  display: none;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  background: var(--surface-2);
 }
 
 .governance-theme .table-grid th {
@@ -648,6 +662,27 @@
   gap: 8px;
   font-size: 12px;
   color: var(--ink-2);
+}
+
+.governance-theme .wallet-shell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.governance-theme .wallet-shell-loading {
+  justify-content: flex-end;
+}
+
+.governance-theme .wallet-shell-disconnected {
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.governance-theme .wallet-shell-connected {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .governance-theme .kicker {
@@ -885,6 +920,48 @@
 }
 
 @media (max-width: 640px) {
+  .governance-theme .nav-inner {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+    align-items: start;
+    height: auto;
+    min-height: 56px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .governance-theme .nav-brand {
+    width: 100%;
+  }
+
+  .governance-theme .wallet-shell,
+  .governance-theme .wallet-shell-loading,
+  .governance-theme .wallet-shell-connected,
+  .governance-theme .wallet-shell-disconnected {
+    width: 100%;
+    justify-content: flex-start;
+    align-items: stretch;
+  }
+
+  .governance-theme .wallet-shell-connected .wallet-address-pill,
+  .governance-theme .wallet-shell-loading .wallet-address-pill,
+  .governance-theme .wallet-shell-disconnected .btn-primary {
+    width: 100%;
+  }
+
+  .governance-theme .wallet-shell-connected .btn-danger {
+    width: 100%;
+  }
+
+  .governance-theme .wallet-shell-connected .wallet-address-pill {
+    border-radius: 12px;
+  }
+
+  .governance-theme .table-mobile-hint {
+    display: block;
+  }
+
   .governance-theme .hero-title {
     font-size: 30px;
   }

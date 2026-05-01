@@ -94,7 +94,7 @@ async function deploy(): Promise<void> {
 
   console.log("Sending transaction...");
   const txHash = await client.sendTransaction(tx);
-  console.log(`\n✅ Deploy TX sent: ${txHash}`);
+  console.log(`Deploy TX sent: ${txHash}`);
   console.log(`   View on explorer: https://pudge.explorer.nervos.org/transaction/${txHash}`);
 
   // 6. Wait for confirmation
