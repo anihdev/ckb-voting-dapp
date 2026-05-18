@@ -58,3 +58,4 @@ Thumbs.db
 *.md
 !README.md
 z_contracts/
+!ckb_weekly_update.md

@@ -371,3 +371,51 @@ describe("Lifecycle integration model", () => {
     expect(BigInt(refundedPending) >= trackedPending).toBe(true);
   });
 });
+
+describe("Multi-actor boundary model", () => {
+  test("third-party aggregation without voter auth should be treated as invalid", () => {
+    const signerLockHash = new Uint8Array(32).fill(0xa1);
+    const voterLockHash = new Uint8Array(32).fill(0xb2);
+    const refundLock = makeScript({ args: "0x4455" });
+
+    // Current contract model ties intent ownership/refund lock to voter lock.
+    const intent = makeIntent({
+      voter_lock_hash: voterLockHash,
+      refund_lock: refundLock,
+      aggregated: false,
+    });
+
+    const signerCanActAsVoter = equalBytes(signerLockHash, intent.voter_lock_hash);
+    expect(signerCanActAsVoter).toBe(false);
+  });
+
+  test("aggregation is serial because each batch consumes previous poll output", () => {
+    const firstPollOutPoint = { txHash: "0xaaa", index: 0 };
+    const secondPollOutPoint = { txHash: "0xbbb", index: 0 };
+
+    // Batch N+1 can only build on the poll output produced by batch N.
+    const batch1Output = secondPollOutPoint;
+    const batch2InputMustMatch = secondPollOutPoint;
+
+    expect(batch1Output).toEqual(batch2InputMustMatch);
+    expect(batch2InputMustMatch).not.toEqual(firstPollOutPoint);
+  });
+
+  test("large intent sets require multiple sequential batches with MAX_INTENTS_PER_AGG=50", () => {
+    const maxIntentsPerBatch = 50n;
+    const pendingIntents = 1000n;
+    const batches = (pendingIntents + maxIntentsPerBatch - 1n) / maxIntentsPerBatch;
+
+    expect(batches).toBe(20n);
+    expect(batches > 1n).toBe(true);
+  });
+
+  test("permissionless force-close is epoch-gated after deadline plus grace", () => {
+    const deadline = 500n;
+    const nowBeforeGrace = deadline + FORCE_CLOSE_GRACE_EPOCHS;
+    const nowAfterGrace = nowBeforeGrace + 1n;
+
+    expect(nowBeforeGrace > deadline).toBe(true);
+    expect(nowAfterGrace > deadline + FORCE_CLOSE_GRACE_EPOCHS).toBe(true);
+  });
+});

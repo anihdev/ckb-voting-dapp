@@ -31,6 +31,28 @@ import {
 // ─── Read private key from environment ───────────────────────────────────────
 const PRIVATE_KEY = requirePrivateKey();
 assertRpcUrl(RPC_URL, "CKB RPC URL");
+const RPC_RETRY_MAX = 5;
+
+async function withRpcRetry<T>(label: string, task: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= RPC_RETRY_MAX; attempt += 1) {
+    try {
+      return await task();
+    } catch (error) {
+      lastError = error;
+      const message = String((error as any)?.message ?? error).toLowerCase();
+      const retryable =
+        message.includes("fetch failed") ||
+        message.includes("etimedout") ||
+        message.includes("eai_again") ||
+        message.includes("connect timeout");
+      if (!retryable || attempt === RPC_RETRY_MAX) break;
+      console.log(`[rpc-retry] ${label} attempt ${attempt}/${RPC_RETRY_MAX} failed; retrying...`);
+      await sleep(1200 * attempt);
+    }
+  }
+  throw lastError;
+}
 
 // ─── Main deploy function ─────────────────────────────────────────────────────
 /**
@@ -42,11 +64,15 @@ async function deploy(): Promise<void> {
   console.log(`RPC: ${RPC_URL}`);
 
   // 1. Create CCC client
-  const client = new ccc.ClientPublicTestnet({ url: RPC_URL });
+  const client = new ccc.ClientPublicTestnet({
+    url: RPC_URL,
+    // Avoid flaky fallback DNS endpoint for deterministic deploy runs.
+    fallbacks: [RPC_URL] as any,
+  });
 
   // 2. Create signer from private key
   const signer = new ccc.SignerCkbPrivateKey(client, PRIVATE_KEY!);
-  const deployerAddress = await signer.getAddressObjSecp256k1();
+  const deployerAddress = await withRpcRetry("getAddress", () => signer.getAddressObjSecp256k1());
   console.log(`Deployer address: ${deployerAddress.toString()}`);
 
   // 3. Read the compiled RISC-V ELF artifact
@@ -86,14 +112,14 @@ async function deploy(): Promise<void> {
   });
 
   // 5. Complete any additional inputs needed after recycling.
-  await tx.completeInputsByCapacity(signer);
-  await tx.completeFeeBy(signer, 1000); // 1000 shannons/KB fee rate
+  await withRpcRetry("completeInputsByCapacity", () => tx.completeInputsByCapacity(signer));
+  await withRpcRetry("completeFeeBy", () => tx.completeFeeBy(signer, 1000)); // 1000 shannons/KB fee rate
 
   console.log("Signing transaction...");
-  await signer.signTransaction(tx);
+  await withRpcRetry("signTransaction", () => signer.signTransaction(tx));
 
   console.log("Sending transaction...");
-  const txHash = await client.sendTransaction(tx);
+  const txHash = await withRpcRetry("sendTransaction", () => client.sendTransaction(tx));
   console.log(`Deploy TX sent: ${txHash}`);
   console.log(`   View on explorer: https://pudge.explorer.nervos.org/transaction/${txHash}`);
 
@@ -136,7 +162,7 @@ async function waitForConfirmation(
     await sleep(POLL_INTERVAL);
     attempts++;
     try {
-      const tx = await client.getTransaction(txHash) as any;
+      const tx = await withRpcRetry("getTransaction.wait", () => client.getTransaction(txHash)) as any;
       if (tx && (tx.timeAddedToPool || tx.txStatus || tx.transaction)) {
         console.log(`  Confirmed after ~${attempts * 5}s`);
         return;
@@ -159,7 +185,7 @@ async function computeDataHash(
   txHash: string,
   outputIndex: number
 ): Promise<string> {
-  const tx = await client.getTransaction(txHash);
+  const tx = await withRpcRetry("getTransaction.hash", () => client.getTransaction(txHash));
   if (!tx) throw new Error("Transaction not found");
   const data = tx.transaction.outputsData[outputIndex];
   // CKB uses blake2b-256 with "ckb-default-hash" personalization

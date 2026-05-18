@@ -20,7 +20,7 @@ use crate::{
         assert_condition, compare_arrays, compare_scripts, compare_slice_items, compare_vec_bytes,
         count_unique_counted_voters, current_epoch, first_input_type_byte, load_input_capacity,
         load_input_lock_hash_bytes, load_input_script, load_input_type_hash_bytes,
-        load_output_capacity, load_output_lock_hash_bytes, load_output_script, min_poll_capacity,
+        load_output_capacity, load_output_lock_hash_bytes, load_group_output_script, load_output_script, min_poll_capacity,
         validate_duration,
     },
 };
@@ -145,7 +145,9 @@ fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result
     // group deposit checks
     let input_capacity = load_cell_capacity(0, Source::GroupInput)?;
     let output_capacity = load_cell_capacity(0, Source::GroupOutput)?;
-    let output_lock = load_output_script(0)?;
+    // Use group-output index for intent transitions; global output index 0 is
+    // often the poll cell during aggregate flows.
+    let output_lock = load_group_output_script(0)?;
 
     // Basic invariants: before must be pending, after must be marked aggregated.
     assert_condition(!before.aggregated, Error::Validation)?;
@@ -396,15 +398,47 @@ fn validate_aggregate_votes() -> Result<(), Error> {
     let mut deltas = alloc::vec![0u64; before.options.len()];
     let mut intent_count = 0usize;
 
-    for index in 1..=MAX_INTENTS_PER_AGG {
+    // Track how many intent rows we have paired so fee/change rows can be
+    // skipped without consuming the bounded intent budget.
+    let mut matched_intents = 0usize;
+    let mut index = 1usize;
+    loop {
+        if matched_intents >= MAX_INTENTS_PER_AGG {
+            break;
+        }
         let input = match load_cell_data(index, Source::Input) {
             Ok(data) => data,
             Err(SysError::IndexOutOfBound) => break,
             Err(err) => return Err(err.into()),
         };
-        let output = load_cell_data(index, Source::Output)?;
-        let before_intent = decode_vote_intent(&input)?;
-        let after_intent = decode_vote_intent(&output)?;
+
+        // Allow non-intent fee/change inputs in aggregate transactions.
+        // We only process rows where both input/output look like intent cells.
+        //
+        // This avoids forcing tx builders to use "exactly poll+intent inputs"
+        // and prevents accidental decode failures on plain CKB capacity cells.
+        let output = match load_cell_data(index, Source::Output) {
+            Ok(data) => data,
+            Err(SysError::IndexOutOfBound) => {
+                index += 1;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let before_intent = match decode_vote_intent(&input) {
+            Ok(intent) => intent,
+            Err(_) => {
+                index += 1;
+                continue;
+            }
+        };
+        let after_intent = match decode_vote_intent(&output) {
+            Ok(intent) => intent,
+            Err(_) => {
+                index += 1;
+                continue;
+            }
+        };
         let input_capacity = load_input_capacity(index)?;
         let output_capacity = load_output_capacity(index)?;
 
@@ -456,6 +490,8 @@ fn validate_aggregate_votes() -> Result<(), Error> {
         seen_voters.push(before_intent.voter_lock_hash);
         batch_voters.push(before_intent.voter_lock_hash);
         intent_count += 1;
+        matched_intents += 1;
+        index += 1;
     }
 
     assert_condition(intent_count > 0, Error::Validation)?;

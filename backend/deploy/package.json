@@ -5,6 +5,8 @@
     "deploy": "ts-node -P tsconfig.json deploy.ts",
     "seed": "ts-node -P tsconfig.json seed.ts",
     "smoke": "ts-node -P tsconfig.json smoke.ts",
+    "setup:multi": "ts-node -P tsconfig.json setup-multi-actors.ts",
+    "smoke:multi": "ts-node -P tsconfig.json smoke-multi.ts",
     "build-contract": "cd ../contracts-rust && cargo build --release -p governance-contract"
   },
   "dependencies": {

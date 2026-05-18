@@ -78,6 +78,11 @@ pub fn load_output_script(index: usize) -> Result<EncodedScript, Error> {
     decode_loaded_script(load_cell_lock(index, Source::Output)?)
 }
 
+/// @notice Decodes a group-output lock script into internal encoded representation.
+pub fn load_group_output_script(index: usize) -> Result<EncodedScript, Error> {
+    decode_loaded_script(load_cell_lock(index, Source::GroupOutput)?)
+}
+
 /// @notice Loads an output lock hash as a fixed 32-byte value.
 pub fn load_output_lock_hash_bytes(index: usize) -> Result<[u8; 32], Error> {
     let bytes = load_cell_lock_hash(index, Source::Output)?;
