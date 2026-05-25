@@ -20,7 +20,8 @@ use crate::{
         assert_condition, compare_arrays, compare_scripts, compare_slice_items, compare_vec_bytes,
         count_unique_counted_voters, current_epoch, first_input_type_byte, load_input_capacity,
         load_input_lock_hash_bytes, load_input_script, load_input_type_hash_bytes,
-        load_output_capacity, load_output_lock_hash_bytes, load_group_output_script, load_output_script, min_poll_capacity,
+        load_output_capacity, load_output_lock_hash_bytes, load_output_type_hash_bytes,
+        load_current_script, load_group_output_script, load_output_script, min_poll_capacity,
         validate_duration,
     },
 };
@@ -58,6 +59,72 @@ fn maybe_group_cell_data(source: Source) -> Result<Option<Vec<u8>>, Error> {
         Err(SysError::IndexOutOfBound) => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Phase B intent cells use the governance script itself as the lock path.
+///
+/// The lock mirrors the governance code hash/hash type and binds args to the
+/// `CREATE_VOTE_INTENT` op plus the poll type hash scope.
+fn expected_intent_lock_script(
+    poll_type_hash: &[u8; 32],
+) -> Result<crate::codec::EncodedScript, Error> {
+    let current_script = load_current_script()?;
+    let mut args = Vec::with_capacity(33);
+    args.push(OP_CREATE_VOTE_INTENT);
+    args.extend_from_slice(poll_type_hash);
+    Ok(crate::codec::EncodedScript {
+        code_hash: current_script.code_hash,
+        hash_type: current_script.hash_type,
+        args,
+    })
+}
+
+/// Validate that an intent output uses the governance-controlled Phase B lock.
+fn assert_intent_lock_matches_policy(
+    lock: &crate::codec::EncodedScript,
+    poll_type_hash: &[u8; 32],
+) -> Result<(), Error> {
+    let expected_lock = expected_intent_lock_script(poll_type_hash)?;
+    assert_condition(compare_scripts(lock, &expected_lock), Error::Validation)
+}
+
+/// Intent cells may only disappear without a replacement during a close path.
+///
+/// This prevents a future permissionless lock from turning `input present /
+/// output absent` into a free-spend path outside the refund-enforced close flow.
+fn validate_intent_consumption_without_output(input: &[u8]) -> Result<(), Error> {
+    let intent = decode_vote_intent(input)?;
+    let input_poll = load_cell_data(0, Source::Input)?;
+    let output_poll = load_cell_data(0, Source::Output)?;
+    let before_poll = decode_poll(&input_poll)?;
+    let after_poll = decode_poll(&output_poll)?;
+    let poll_type_hash = load_input_type_hash_bytes(0)?;
+    let output_poll_type_hash = load_output_type_hash_bytes(0)?;
+    let epoch = current_epoch()?;
+
+    assert_condition(compare_arrays(&intent.poll_type_hash, &poll_type_hash), Error::Validation)?;
+    assert_condition(compare_arrays(&output_poll_type_hash, &poll_type_hash), Error::Validation)?;
+    assert_condition(!before_poll.is_closed, Error::Validation)?;
+    if !after_poll.is_closed {
+        assert_condition(epoch <= before_poll.deadline, Error::Validation)?;
+        return Ok(());
+    }
+    assert_condition(epoch > before_poll.deadline, Error::Validation)?;
+
+    let creator_authorized = match load_input_lock_hash_bytes(1) {
+        Ok(lock_hash) => compare_arrays(&lock_hash, &before_poll.creator),
+        Err(Error::IndexOutOfBound) => false,
+        Err(err) => return Err(err),
+    };
+    if !creator_authorized {
+        let allow_epoch = before_poll
+            .deadline
+            .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
+            .ok_or(Error::Validation)?;
+        assert_condition(epoch > allow_epoch, Error::Validation)?;
+    }
+
+    Ok(())
 }
 
 /// Decide whether the poll group operation is a creation, an aggregation,
@@ -108,8 +175,7 @@ fn validate_intent_lifecycle() -> Result<(), Error> {
         (Some(input), Some(output)) => validate_intent_aggregation_transition(&input, &output),
         // Intent consumed without output (simple consumption)
         (Some(input), None) => {
-            decode_vote_intent(&input)?;
-            Ok(())
+            validate_intent_consumption_without_output(&input)
         }
         _ => Err(Error::Validation),
     }
@@ -167,10 +233,7 @@ fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result
         compare_scripts(&after.refund_lock, &before.refund_lock),
         Error::Validation,
     )?;
-    assert_condition(
-        compare_scripts(&output_lock, &after.refund_lock),
-        Error::Validation,
-    )?;
+    assert_intent_lock_matches_policy(&output_lock, &before.poll_type_hash)?;
 
     // Capacity checks: outputs must preserve at least the voter deposit.
     assert_condition(output_capacity >= input_capacity, Error::Validation)?;
@@ -285,10 +348,7 @@ fn validate_create_vote_intent() -> Result<(), Error> {
     assert_condition(!intent.aggregated, Error::Validation)?;
     assert_condition(intent.option_index == witness_option, Error::Validation)?;
     assert_condition(intent_capacity >= VOTER_DEPOSIT_SHANNONS, Error::Validation)?;
-    assert_condition(
-        compare_scripts(&output_lock, &intent.refund_lock),
-        Error::Validation,
-    )?;
+    assert_intent_lock_matches_policy(&output_lock, &intent.poll_type_hash)?;
 
     // The referenced poll must be provided as a cell dep and still be open at
     // the tip epoch, so stale/forged poll references cannot create intents.
@@ -420,6 +480,12 @@ fn validate_aggregate_votes() -> Result<(), Error> {
         let output = match load_cell_data(index, Source::Output) {
             Ok(data) => data,
             Err(SysError::IndexOutOfBound) => {
+                let maybe_input_intent = decode_vote_intent(&input).ok();
+                if let Some(intent) = maybe_input_intent {
+                    if compare_arrays(&intent.poll_type_hash, &poll_type_hash) {
+                        return Err(Error::Validation);
+                    }
+                }
                 index += 1;
                 continue;
             }
@@ -435,12 +501,16 @@ fn validate_aggregate_votes() -> Result<(), Error> {
         let after_intent = match decode_vote_intent(&output) {
             Ok(intent) => intent,
             Err(_) => {
+                if compare_arrays(&before_intent.poll_type_hash, &poll_type_hash) {
+                    return Err(Error::Validation);
+                }
                 index += 1;
                 continue;
             }
         };
         let input_capacity = load_input_capacity(index)?;
         let output_capacity = load_output_capacity(index)?;
+        let output_lock = load_output_script(index)?;
 
         assert_condition(!before_intent.aggregated, Error::Validation)?;
         assert_condition(after_intent.aggregated, Error::Validation)?;
@@ -471,6 +541,7 @@ fn validate_aggregate_votes() -> Result<(), Error> {
             compare_scripts(&after_intent.refund_lock, &before_intent.refund_lock),
             Error::Validation,
         )?;
+        assert_intent_lock_matches_policy(&output_lock, &before_intent.poll_type_hash)?;
         assert_condition(output_capacity >= input_capacity, Error::Validation)?;
         assert_condition(
             (before_intent.option_index as usize) < before.options.len(),
@@ -617,11 +688,11 @@ fn validate_close_poll() -> Result<(), Error> {
     let mut input_index = if creator_authorized { 2usize } else { 1usize };
     let mut refunded_pending_intents = 0u64;
     loop {
-        let input = match load_cell_data(input_index, Source::Input) {
-            Ok(data) => data,
-            Err(SysError::IndexOutOfBound) => break,
-            Err(err) => return Err(err.into()),
-        };
+            let input = match load_cell_data(input_index, Source::Input) {
+                Ok(data) => data,
+                Err(SysError::IndexOutOfBound) => break,
+                Err(err) => return Err(err.into()),
+            };
 
         if let Ok(intent) = decode_vote_intent(&input) {
             assert_condition(

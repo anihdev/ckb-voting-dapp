@@ -9,7 +9,7 @@ use ckb_std::{
     ckb_types::{bytes::Bytes, packed::Script, prelude::*},
     high_level::{
         load_cell_capacity, load_cell_lock, load_cell_lock_hash, load_cell_type_hash,
-        load_header_epoch_number, load_witness_args,
+        load_header_epoch_number, load_script, load_witness_args,
     },
 };
 
@@ -78,9 +78,22 @@ pub fn load_output_script(index: usize) -> Result<EncodedScript, Error> {
     decode_loaded_script(load_cell_lock(index, Source::Output)?)
 }
 
+/// @notice Loads an output type hash as a fixed 32-byte value.
+/// @dev Fails validation when the output has no type script.
+pub fn load_output_type_hash_bytes(index: usize) -> Result<[u8; 32], Error> {
+    load_cell_type_hash(index, Source::Output)?
+        .ok_or(Error::Validation)
+}
+
 /// @notice Decodes a group-output lock script into internal encoded representation.
 pub fn load_group_output_script(index: usize) -> Result<EncodedScript, Error> {
     decode_loaded_script(load_cell_lock(index, Source::GroupOutput)?)
+}
+
+/// @notice Decodes the currently executing script into the internal format.
+/// @dev Used to mirror governance lock/type scripts across lifecycle transitions.
+pub fn load_current_script() -> Result<EncodedScript, Error> {
+    decode_loaded_script(load_script()?)
 }
 
 /// @notice Loads an output lock hash as a fixed 32-byte value.

@@ -234,7 +234,6 @@ function parseRecycledOutPoints(): Array<{ previousOutput: { txHash: string; ind
   return [];
 }
 
-// ─── Run ──────────────────────────────────────────────────────────────────────
 deploy().catch((e) => {
   console.error("Deploy failed:", e);
   process.exit(1);

@@ -373,20 +373,30 @@ describe("Lifecycle integration model", () => {
 });
 
 describe("Multi-actor boundary model", () => {
-  test("third-party aggregation without voter auth should be treated as invalid", () => {
-    const signerLockHash = new Uint8Array(32).fill(0xa1);
+  test("third-party aggregation no longer depends on voter lock signatures", () => {
+    const aggregatorLockHash = new Uint8Array(32).fill(0xa1);
     const voterLockHash = new Uint8Array(32).fill(0xb2);
     const refundLock = makeScript({ args: "0x4455" });
+    const intentLock = makeScript({
+      code_hash: `0x${"77".repeat(32)}`,
+      hash_type: "data1",
+      args: `0x02${"11".repeat(32)}`,
+    });
 
-    // Current contract model ties intent ownership/refund lock to voter lock.
     const intent = makeIntent({
       voter_lock_hash: voterLockHash,
       refund_lock: refundLock,
       aggregated: false,
     });
+    const aggregatedIntent = {
+      ...intent,
+      aggregated: true,
+    };
 
-    const signerCanActAsVoter = equalBytes(signerLockHash, intent.voter_lock_hash);
-    expect(signerCanActAsVoter).toBe(false);
+    expect(equalBytes(aggregatorLockHash, intent.voter_lock_hash)).toBe(false);
+    expect(aggregatedIntent.refund_lock).toEqual(intent.refund_lock);
+    expect(aggregatedIntent.aggregated).toBe(true);
+    expect(intentLock.args.startsWith("0x02")).toBe(true);
   });
 
   test("aggregation is serial because each batch consumes previous poll output", () => {

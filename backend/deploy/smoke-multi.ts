@@ -1,11 +1,12 @@
 /**
  * Multi-Actor Governance Smoke Script
  * ===================================
- * Proves realistic actor boundaries for the current contract model:
+ * Proves realistic actor boundaries for the Phase B contract model:
  * creator, voters, aggregator, and force-closer are separate signers.
  *
  * This script intentionally includes pass and expected-fail scenarios to
- * document where voter-owned locks still block third-party execution.
+ * show that third-party aggregation no longer needs voter signatures while
+ * close and force-close rules remain epoch-gated.
  */
 
 import { randomBytes } from "crypto";
@@ -319,6 +320,10 @@ function governanceTypeScript(op: number, scopeHex = "0x"): any {
   });
 }
 
+function intentLockScript(pollTypeHash: string): any {
+  return governanceTypeScript(0x02, pollTypeHash);
+}
+
 function governanceCellDep() {
   return {
     outPoint: {
@@ -515,6 +520,14 @@ function normalizeScript(script: any): EncodedScript {
   };
 }
 
+function denormalizeScript(script: EncodedScript): any {
+  return {
+    codeHash: script.code_hash,
+    hashType: script.hash_type,
+    args: script.args,
+  };
+}
+
 function canonicalScriptKey(script: any): string {
   const normalized = normalizeScript(script);
   return `${normalized.code_hash}:${normalized.hash_type}:${normalized.args}`;
@@ -585,7 +598,7 @@ function preflightIntentGroupTransition(
     ["option_index unchanged", before.option_index === after.option_index],
     ["voted_at_epoch unchanged", before.voted_at_epoch === after.voted_at_epoch],
     ["refund_lock unchanged", scriptMatches(before.refund_lock, after.refund_lock)],
-    ["output lock == refund_lock", scriptMatches(outputLock, after.refund_lock)],
+    ["output lock == intent lock policy", canonicalScriptKey(outputLock) === intentTypeKey],
     ["output capacity >= input capacity", outCap >= inCap],
     ["output capacity >= voter deposit", outCap >= VOTER_DEPOSIT_SHANNONS],
   ];
@@ -765,6 +778,7 @@ async function main(): Promise<void> {
   const pollCell = await loadCommittedCellRef(client, createPollHash, 0);
 
   const intentType = governanceTypeScript(0x02, pollTypeHash);
+  const intentLock = intentLockScript(pollTypeHash);
   const voterIntentCells: CellRef[] = [];
   for (let index = 0; index < voterSigners.length; index += 1) {
     const voterSigner = voterSigners[index];
@@ -781,7 +795,7 @@ async function main(): Promise<void> {
       refund_lock: normalizeScript(voterAddress.script),
     };
     const intentBytes = encodeVoteIntentData(intentData);
-    const intentCapacity = estimateOutputCapacity(voterAddress.script, intentType, intentBytes.length);
+    const intentCapacity = estimateOutputCapacity(intentLock, intentType, intentBytes.length);
     const outputIntentCapacity = intentCapacity > VOTER_DEPOSIT_SHANNONS ? intentCapacity : VOTER_DEPOSIT_SHANNONS;
 
     const intentAuthCell = await findSignerAuthCell(voterSigner);
@@ -799,7 +813,7 @@ async function main(): Promise<void> {
         },
       }],
       outputs: [
-        { lock: voterAddress.script, type: intentType, capacity: outputIntentCapacity },
+        { lock: intentLock, type: intentType, capacity: outputIntentCapacity },
       ],
       outputsData: [bytesToHex(intentBytes)],
       witnesses: [
@@ -836,14 +850,15 @@ async function main(): Promise<void> {
     expectedVoteCounts[decoded.option_index] += 1n;
   }
 
-  results.push(await runScenario(
+    results.push(await runScenario(
     "third_party_aggregate_without_voter_auth",
-    "fail",
+    "pass",
     async () => {
       const aggregateAttemptPollData: PollData = {
         ...pollData,
         vote_counts: expectedVoteCounts,
         total_voters: BigInt(voterIntentCells.length),
+        pending_intent_count: 0n,
         counted_voter_lock_hashes: voterIntentCells.map((cell) =>
           decodeVoteIntentData(hexToBytes(cell.outputData)).voter_lock_hash
         ),
@@ -875,7 +890,7 @@ async function main(): Promise<void> {
         outputs: [
           { lock: creatorAddress.script, type: pollType, capacity: aggregatePollCapacity },
           ...voterIntentCells.map((intentCell) => ({
-            lock: intentCell.cellOutput.lock,
+            lock: intentLock,
             type: intentType,
             capacity: intentCell.cellOutput.capacity,
           })),
@@ -884,11 +899,33 @@ async function main(): Promise<void> {
         witnesses: Array.from({ length: voterIntentCells.length + 1 }).map(() => "0x"),
       });
 
-      await aggregateAttemptTx.completeInputsByCapacity(aggregatorSigner);
-      await aggregateAttemptTx.completeFeeBy(aggregatorSigner, TX_FEE_SHANNONS);
+      const aggregateInputCapacity =
+        pollCell.cellOutput.capacity +
+        voterIntentCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
+      const aggregateOutputCapacity =
+        aggregatePollCapacity +
+        voterIntentCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
+      const aggregateFee = aggregateInputCapacity - aggregateOutputCapacity;
+      if (aggregateFee < BigInt(TX_FEE_SHANNONS)) {
+        throw new Error(
+          `aggregate fee too low: ${aggregateFee} shannons (min ${TX_FEE_SHANNONS})`
+        );
+      }
+      if (aggregateFee > 2_000_000n) {
+        throw new Error(
+          `aggregate fee unexpectedly high: ${aggregateFee} shannons`
+        );
+      }
+      preflightIntentGroupTransition(
+        aggregateAttemptTx,
+        new Map(voterIntentCells.map((cell) => [`${cell.outPoint.txHash}:${cell.outPoint.index}`, cell])),
+        intentType
+      );
+      await creatorSigner.signTransaction(aggregateAttemptTx);
       await aggregatorSigner.signTransaction(aggregateAttemptTx);
       const hash = await client.sendTransaction(aggregateAttemptTx);
       await waitForTx(client, hash);
+      console.log(`AGGREGATE_VOTES (aggregator-only intent auth): ${hash}`);
     }
   ));
 
@@ -934,7 +971,7 @@ async function main(): Promise<void> {
         outputs: [
           { lock: creatorAddress.script, type: pollType, capacity: aggregatePollCapacity },
           ...voterIntentCells.map((intentCell) => ({
-            lock: intentCell.cellOutput.lock,
+            lock: intentLock,
             type: intentType,
             capacity: intentCell.cellOutput.capacity,
           })),
@@ -991,7 +1028,7 @@ async function main(): Promise<void> {
       aggregatedIntentCells = voterIntentCells.map((intentCell, index) => ({
         outPoint: { txHash: aggregateHash, index: index + 1 },
         cellOutput: {
-          lock: intentCell.cellOutput.lock,
+          lock: intentLock,
           type: intentType,
           capacity: intentCell.cellOutput.capacity,
         },
@@ -1038,7 +1075,7 @@ async function main(): Promise<void> {
             { lock: creatorAddress.script, type: pollType, capacity: closedPollCapacity },
             { lock: creatorAddress.script, capacity: CREATOR_DEPOSIT_SHANNONS },
             ...aggregatedIntentCells.map((intentCell) => ({
-              lock: intentCell.cellOutput.lock,
+              lock: denormalizeScript(decodeVoteIntentData(hexToBytes(intentCell.outputData)).refund_lock),
               capacity: intentCell.cellOutput.capacity,
             })),
           ],
@@ -1103,7 +1140,7 @@ async function main(): Promise<void> {
             { lock: creatorAddress.script, type: pollType, capacity: closedPollCapacity },
             { lock: creatorAddress.script, capacity: CREATOR_DEPOSIT_SHANNONS },
             ...aggregatedIntentCells.map((intentCell) => ({
-              lock: intentCell.cellOutput.lock,
+              lock: denormalizeScript(decodeVoteIntentData(hexToBytes(intentCell.outputData)).refund_lock),
               capacity: intentCell.cellOutput.capacity,
             })),
           ],

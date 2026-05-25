@@ -171,6 +171,14 @@ export function buildGovernanceTypeScript(op: number, scopeHex = "0x"): any {
 }
 
 /**
+ * @notice Builds the Phase B governance lock used by vote intent cells.
+ * @dev Lock args mirror the contract policy: CREATE_VOTE_INTENT op + poll type hash.
+ */
+export function buildIntentLockScript(pollTypeHash: string): any {
+  return buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, pollTypeHash);
+}
+
+/**
  * @notice Builds the governance code cell dep used by all governance transactions.
  */
 export function buildGovernanceCellDep(): any {
@@ -354,7 +362,7 @@ export async function buildCreateVoteIntentTx(
     input.delegationCell?.output?.lock ??
     signerAddress.script
   );
-  const intentLock = denormalizeScript(refundLock);
+  const intentLock = buildIntentLockScript(input.pollTypeHash);
 
   const intentData = encodeVoteIntentData({
     poll_type_hash: (ccc as any).bytesFrom(input.pollTypeHash),
@@ -566,7 +574,7 @@ export async function buildAggregateVotesTx(
     return {
       decoded,
       output: {
-        lock: getCellLock(cell),
+        lock: buildIntentLockScript(pollTypeHash),
         type: getCellType(cell),
         capacity: getCellCapacity(cell),
       },
