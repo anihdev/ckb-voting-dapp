@@ -5,8 +5,11 @@
  * creator, voters, aggregator, and force-closer are separate signers.
  *
  * This script intentionally includes pass and expected-fail scenarios to
- * show that third-party aggregation no longer needs voter signatures while
- * close and force-close rules remain epoch-gated.
+ * show that third-party shard aggregation no longer needs voter signatures.
+ * Sharded close requires post-deadline shard finalization, so this immediate
+ * smoke run labels close scenarios as skipped rather than using legacy
+ * poll-cell aggregation. Large-poll MERGE_TALLY_SHARDS close coverage is
+ * documented here but should run in a controlled local epoch smoke harness.
  */
 
 import { randomBytes } from "crypto";
@@ -23,10 +26,11 @@ const SCRIPT_HASH_TYPE = "data1";
 const CREATOR_DEPOSIT_SHANNONS = 500n * 100_000_000n;
 const VOTER_DEPOSIT_SHANNONS = 61n * 100_000_000n;
 const SHANNONS_PER_CKB = 100_000_000n;
-const AGGREGATE_FEE_RESERVE_SHANNONS = 1_000_000n;
+const TALLY_SHARD_MIN_SHANNONS = 61n * SHANNONS_PER_CKB;
 const FORCE_CLOSE_GRACE_EPOCHS = 10n;
 const TX_FEE_SHANNONS = 5_000;
 const POLL_CAPACITY_HEADROOM_SHANNONS = 2n * SHANNONS_PER_CKB;
+const DEFAULT_SHARD_COUNT = 1;
 const RPC_CALL_RETRY_COUNT = 5;
 const RPC_CALL_RETRY_DELAY_MS = 1500;
 const EPOCH_BLOCKS_FALLBACK = 180n;
@@ -39,6 +43,7 @@ type PollData = {
   vote_counts: bigint[];
   deadline: bigint;
   creator: Uint8Array;
+  creator_lock: EncodedScript;
   is_closed: boolean;
   total_voters: bigint;
   creator_deposit: bigint;
@@ -46,6 +51,17 @@ type PollData = {
   counted_voter_lock_hashes: Uint8Array[];
   token_weighted: boolean;
   udt_type_hash: Uint8Array;
+  shard_count: number;
+};
+
+type TallyShardData = {
+  poll_type_hash: Uint8Array;
+  shard_id: number;
+  shard_count: number;
+  vote_counts: bigint[];
+  total_voters: bigint;
+  counted_voter_lock_hashes: Uint8Array[];
+  finalized: boolean;
 };
 
 type EncodedScript = {
@@ -212,12 +228,14 @@ function decodeScript(bytes: Uint8Array, offset: number): [EncodedScript, number
 function encodePollData(poll: PollData): Uint8Array {
   assertCodec(poll.creator.length === 32, "creator must be 32 bytes");
   assertCodec(poll.udt_type_hash.length === 32, "udt_type_hash must be 32 bytes");
+  assertCodec(poll.shard_count > 0, "shard_count must be positive");
   return concat([
     encodeString(poll.question),
     encodeStringVec(poll.options),
     encodeUint64Vec(poll.vote_counts),
     encodeUint64(poll.deadline),
     poll.creator,
+    encodeScript(poll.creator_lock),
     new Uint8Array([poll.is_closed ? 1 : 0]),
     encodeUint64(poll.total_voters),
     encodeUint64(poll.creator_deposit),
@@ -225,6 +243,22 @@ function encodePollData(poll: PollData): Uint8Array {
     encodeBytes32Vec(poll.counted_voter_lock_hashes),
     new Uint8Array([poll.token_weighted ? 1 : 0]),
     poll.udt_type_hash,
+    encodeUint32(poll.shard_count),
+  ]);
+}
+
+function encodeTallyShardData(shard: TallyShardData): Uint8Array {
+  assertCodec(shard.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+  assertCodec(shard.shard_count > 0 && shard.shard_count <= 256, "shard_count out of range");
+  assertCodec(shard.shard_id >= 0 && shard.shard_id < shard.shard_count, "shard_id out of range");
+  return concat([
+    shard.poll_type_hash,
+    encodeUint32(shard.shard_id),
+    encodeUint32(shard.shard_count),
+    encodeUint64Vec(shard.vote_counts),
+    encodeUint64(shard.total_voters),
+    encodeBytes32Vec(shard.counted_voter_lock_hashes),
+    new Uint8Array([shard.finalized ? 1 : 0]),
   ]);
 }
 
@@ -324,6 +358,19 @@ function intentLockScript(pollTypeHash: string): any {
   return governanceTypeScript(0x02, pollTypeHash);
 }
 
+function pollLockScript(pollTypeHash: string): any {
+  return governanceTypeScript(0x04, pollTypeHash);
+}
+
+function tallyShardScript(pollTypeHash: string, shardId: number): any {
+  const shardIdBytes = new Uint8Array(4);
+  shardIdBytes[0] = shardId & 0xff;
+  shardIdBytes[1] = (shardId >> 8) & 0xff;
+  shardIdBytes[2] = (shardId >> 16) & 0xff;
+  shardIdBytes[3] = (shardId >> 24) & 0xff;
+  return governanceTypeScript(0x07, `${pollTypeHash}${bytesToHex(shardIdBytes).slice(2)}`);
+}
+
 function governanceCellDep() {
   return {
     outPoint: {
@@ -332,6 +379,32 @@ function governanceCellDep() {
     },
     depType: "code",
   };
+}
+
+function getOutPoint(cell: any): any {
+  return {
+    txHash: cell.outPoint.txHash,
+    index: Number(cell.outPoint.index),
+  };
+}
+
+function outPointKeyFromOutPoint(outPoint: any): string {
+  return `${outPoint.txHash}:${Number(outPoint.index)}`;
+}
+
+function derivePollTypeIdFromSeedInput(seedCell: any, outputIndex = 0): string {
+  return (ccc as any).hashTypeId(
+    { previousOutput: getOutPoint(seedCell), since: 0 },
+    outputIndex
+  );
+}
+
+function assertPinnedInput0(tx: any, expectedOutPointKey: string): void {
+  const firstInput = tx.inputs?.[0];
+  const previousOutput = firstInput?.previousOutput ?? firstInput?.previous_output;
+  if (!previousOutput || outPointKeyFromOutPoint(previousOutput) !== expectedOutPointKey) {
+    throw new Error("CREATE_POLL Type ID seed input was reordered or replaced");
+  }
 }
 
 function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, dataBytes: number): bigint {
@@ -470,8 +543,6 @@ async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = [])
   const signerAddress = await signer.getAddressObjSecp256k1();
   let bestPlainCell: any | null = null;
   let bestPlainCapacity = 0n;
-  let fallbackCell: any | null = null;
-  let fallbackCapacity = 0n;
   for await (const cell of signer.client.findCells({
     script: signerAddress.script,
     scriptType: "lock",
@@ -492,20 +563,14 @@ async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = [])
       }
       continue;
     }
-
-    if (capacity > fallbackCapacity) {
-      fallbackCell = cell;
-      fallbackCapacity = capacity;
-    }
   }
 
   if (bestPlainCell) return bestPlainCell;
-  if (fallbackCell) return fallbackCell;
-  throw new Error("No signer auth cell available");
+  throw new Error("No plain CKB cell is available for signer auth. Fund this wallet with a plain CKB cell and retry.");
 }
 
 function outPointKey(cell: any): string {
-  return `${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`;
+  return outPointKeyFromOutPoint(cell.outPoint ?? cell.previousOutput);
 }
 
 function normalizeScript(script: any): EncodedScript {
@@ -599,7 +664,7 @@ function preflightIntentGroupTransition(
     ["voted_at_epoch unchanged", before.voted_at_epoch === after.voted_at_epoch],
     ["refund_lock unchanged", scriptMatches(before.refund_lock, after.refund_lock)],
     ["output lock == intent lock policy", canonicalScriptKey(outputLock) === intentTypeKey],
-    ["output capacity >= input capacity", outCap >= inCap],
+    ["output capacity == input capacity", outCap === inCap],
     ["output capacity >= voter deposit", outCap >= VOTER_DEPOSIT_SHANNONS],
   ];
 
@@ -653,6 +718,8 @@ function decodePollData(bytes: Uint8Array): PollData {
   }
   const deadline = readU64();
   const creator = readBytes32();
+  const [creator_lock, nextCreatorLockOffset] = decodeScript(bytes, offset);
+  offset = nextCreatorLockOffset;
   const is_closed = readBool();
   const total_voters = readU64();
   const creator_deposit = readU64();
@@ -664,12 +731,15 @@ function decodePollData(bytes: Uint8Array): PollData {
   }
   const token_weighted = readBool();
   const udt_type_hash = readBytes32();
+  const shard_count = readU32();
+  assertCodec(offset === bytes.length, "PollData has trailing bytes");
   return {
     question,
     options,
     vote_counts,
     deadline,
     creator,
+    creator_lock,
     is_closed,
     total_voters,
     creator_deposit,
@@ -677,6 +747,7 @@ function decodePollData(bytes: Uint8Array): PollData {
     counted_voter_lock_hashes,
     token_weighted,
     udt_type_hash,
+    shard_count,
   };
 }
 
@@ -718,9 +789,13 @@ async function main(): Promise<void> {
   const currentEpoch = await withRpcRetry("getTipEpoch", () => getTipEpoch(client));
   const creatorLockHash = lockHashBytes(creatorAddress.script);
   const smokeLabel = randomBytes(4).toString("hex");
-  const pollScopeHex = `0x${randomBytes(32).toString("hex")}`;
-  const pollType = governanceTypeScript(0x01, pollScopeHex);
+  const typeIdSeedCell = await findSignerAuthCell(creatorSigner);
+  const typeIdSeedKey = outPointKey(typeIdSeedCell);
+  const pollTypeId = derivePollTypeIdFromSeedInput(typeIdSeedCell, 0);
+  const pollType = governanceTypeScript(0x01, pollTypeId);
   const pollTypeHash = scriptHash(pollType);
+  const pollLock = pollLockScript(pollTypeHash);
+  const shardCount = DEFAULT_SHARD_COUNT;
   const results: ScenarioResult[] = [];
 
   console.log(`Creator: ${creatorAddress.toString()}`);
@@ -735,6 +810,7 @@ async function main(): Promise<void> {
     vote_counts: [0n, 0n],
     deadline: currentEpoch + FORCE_CLOSE_GRACE_EPOCHS + 8n,
     creator: creatorLockHash,
+    creator_lock: normalizeScript(creatorAddress.script),
     is_closed: false,
     total_voters: 0n,
     creator_deposit: CREATOR_DEPOSIT_SHANNONS,
@@ -742,14 +818,40 @@ async function main(): Promise<void> {
     counted_voter_lock_hashes: [],
     token_weighted: false,
     udt_type_hash: new Uint8Array(32),
+    shard_count: shardCount,
   };
   const pollBytes = encodePollData(pollData);
   const pollCapacity =
     CREATOR_DEPOSIT_SHANNONS +
-    estimateOutputCapacity(creatorAddress.script, pollType, pollBytes.length) +
+    estimateOutputCapacity(pollLock, pollType, pollBytes.length) +
     POLL_CAPACITY_HEADROOM_SHANNONS;
+  const shardOutputs = Array.from({ length: shardCount }, (_, shardId) => {
+    const shardScript = tallyShardScript(pollTypeHash, shardId);
+    const shardData = encodeTallyShardData({
+      poll_type_hash: hexToBytes(pollTypeHash),
+      shard_id: shardId,
+      shard_count: shardCount,
+      vote_counts: pollData.options.map(() => 0n),
+      total_voters: 0n,
+      counted_voter_lock_hashes: [],
+      finalized: false,
+    });
+    const capacity = [
+      TALLY_SHARD_MIN_SHANNONS,
+      estimateOutputCapacity(shardScript, shardScript, shardData.length),
+    ].reduce((max, current) => (current > max ? current : max), 0n);
+    return {
+      output: {
+        lock: shardScript,
+        type: shardScript,
+        capacity,
+      },
+      data: bytesToHex(shardData),
+    };
+  });
   const creatorBalance = BigInt(await withRpcRetry("creator.getBalance", () => creatorSigner.getBalance()));
-  const minCreatorNeeded = pollCapacity + BigInt(TX_FEE_SHANNONS);
+  const shardCapacityTotal = shardOutputs.reduce((sum, item) => sum + item.output.capacity, 0n);
+  const minCreatorNeeded = pollCapacity + shardCapacityTotal + BigInt(TX_FEE_SHANNONS);
   console.log(`Creator available balance: ${creatorBalance} shannons`);
   console.log(`Create-poll minimum needed: ${minCreatorNeeded} shannons`);
   if (creatorBalance < minCreatorNeeded) {
@@ -761,15 +863,21 @@ async function main(): Promise<void> {
   const createPollTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
     headerDeps: [tipHeader.hash],
-    outputs: [{
-      lock: creatorAddress.script,
-      type: pollType,
-      capacity: pollCapacity,
-    }],
-    outputsData: [bytesToHex(pollBytes)],
+    inputs: [{ previousOutput: getOutPoint(typeIdSeedCell), since: 0 }],
+    outputs: [
+      {
+        lock: pollLock,
+        type: pollType,
+        capacity: pollCapacity,
+      },
+      ...shardOutputs.map((item) => item.output),
+    ],
+    outputsData: [bytesToHex(pollBytes), ...shardOutputs.map((item) => item.data)],
   });
   await createPollTx.completeInputsByCapacity(creatorSigner);
+  assertPinnedInput0(createPollTx, typeIdSeedKey);
   await createPollTx.completeFeeBy(creatorSigner, TX_FEE_SHANNONS);
+  assertPinnedInput0(createPollTx, typeIdSeedKey);
   await creatorSigner.signTransaction(createPollTx);
   const createPollHash = await client.sendTransaction(createPollTx);
   await waitForTx(client, createPollHash);
@@ -850,180 +958,87 @@ async function main(): Promise<void> {
     expectedVoteCounts[decoded.option_index] += 1n;
   }
 
-    results.push(await runScenario(
-    "third_party_aggregate_without_voter_auth",
-    "pass",
-    async () => {
-      const aggregateAttemptPollData: PollData = {
-        ...pollData,
-        vote_counts: expectedVoteCounts,
-        total_voters: BigInt(voterIntentCells.length),
-        pending_intent_count: 0n,
-        counted_voter_lock_hashes: voterIntentCells.map((cell) =>
-          decodeVoteIntentData(hexToBytes(cell.outputData)).voter_lock_hash
-        ),
-      };
-      const aggregatePollBytes = encodePollData(aggregateAttemptPollData);
-      const aggregatePollMinCapacity = estimateOutputCapacity(
-        creatorAddress.script,
-        pollType,
-        aggregatePollBytes.length
-      );
-      const aggregatePollCandidateCapacity = pollCell.cellOutput.capacity - BigInt(TX_FEE_SHANNONS);
-      const aggregatePollCapacity =
-        aggregatePollCandidateCapacity > aggregatePollMinCapacity
-          ? aggregatePollCandidateCapacity
-          : aggregatePollMinCapacity;
-
-      const aggregateOutputsData = voterIntentCells.map((intentCell) => {
-        const decoded = decodeVoteIntentData(hexToBytes(intentCell.outputData));
-        return bytesToHex(encodeVoteIntentData({ ...decoded, aggregated: true }));
-      });
-
-      const aggregateAttemptTx = ccc.Transaction.from({
-        cellDeps: [governanceCellDep()],
-        headerDeps: [tipHeader.hash],
-        inputs: [
-          { previousOutput: pollCell.outPoint },
-          ...voterIntentCells.map((intentCell) => ({ previousOutput: intentCell.outPoint })),
-        ],
-        outputs: [
-          { lock: creatorAddress.script, type: pollType, capacity: aggregatePollCapacity },
-          ...voterIntentCells.map((intentCell) => ({
-            lock: intentLock,
-            type: intentType,
-            capacity: intentCell.cellOutput.capacity,
-          })),
-        ],
-        outputsData: [bytesToHex(aggregatePollBytes), ...aggregateOutputsData],
-        witnesses: Array.from({ length: voterIntentCells.length + 1 }).map(() => "0x"),
-      });
-
-      const aggregateInputCapacity =
-        pollCell.cellOutput.capacity +
-        voterIntentCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
-      const aggregateOutputCapacity =
-        aggregatePollCapacity +
-        voterIntentCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
-      const aggregateFee = aggregateInputCapacity - aggregateOutputCapacity;
-      if (aggregateFee < BigInt(TX_FEE_SHANNONS)) {
-        throw new Error(
-          `aggregate fee too low: ${aggregateFee} shannons (min ${TX_FEE_SHANNONS})`
-        );
-      }
-      if (aggregateFee > 2_000_000n) {
-        throw new Error(
-          `aggregate fee unexpectedly high: ${aggregateFee} shannons`
-        );
-      }
-      preflightIntentGroupTransition(
-        aggregateAttemptTx,
-        new Map(voterIntentCells.map((cell) => [`${cell.outPoint.txHash}:${cell.outPoint.index}`, cell])),
-        intentType
-      );
-      await creatorSigner.signTransaction(aggregateAttemptTx);
-      await aggregatorSigner.signTransaction(aggregateAttemptTx);
-      const hash = await client.sendTransaction(aggregateAttemptTx);
-      await waitForTx(client, hash);
-      console.log(`AGGREGATE_VOTES (aggregator-only intent auth): ${hash}`);
-    }
-  ));
-
-  let aggregatedPollCell: CellRef | null = null;
+  let aggregatedShardCell: CellRef | null = null;
   let aggregatedIntentCells: CellRef[] = [];
   results.push(await runScenario(
-    "aggregate_with_all_voter_auth",
+    "third_party_create_tally_shard_aggregate_without_voter_auth",
     "pass",
     async () => {
-      const aggregatePollData: PollData = {
-        ...pollData,
+      const shardCell = await loadCommittedCellRef(client, createPollHash, 1);
+      const countedVoters = voterIntentCells.map((cell) =>
+        decodeVoteIntentData(hexToBytes(cell.outputData)).voter_lock_hash
+      );
+      const updatedShardBytes = encodeTallyShardData({
+        poll_type_hash: hexToBytes(pollTypeHash),
+        shard_id: 0,
+        shard_count: shardCount,
         vote_counts: expectedVoteCounts,
         total_voters: BigInt(voterIntentCells.length),
-        pending_intent_count: 0n,
-        counted_voter_lock_hashes: voterIntentCells.map((cell) =>
-          decodeVoteIntentData(hexToBytes(cell.outputData)).voter_lock_hash
-        ),
-      };
-      const aggregatePollBytes = encodePollData(aggregatePollData);
-      const aggregatePollMinCapacity = estimateOutputCapacity(
-        creatorAddress.script,
-        pollType,
-        aggregatePollBytes.length
-      );
-      const aggregatePollCandidateCapacity = pollCell.cellOutput.capacity - AGGREGATE_FEE_RESERVE_SHANNONS;
-      const aggregatePollCapacity =
-        aggregatePollCandidateCapacity > aggregatePollMinCapacity
-          ? aggregatePollCandidateCapacity
-          : aggregatePollMinCapacity;
-
+        counted_voter_lock_hashes: countedVoters,
+        finalized: false,
+      });
       const aggregateOutputsData = voterIntentCells.map((intentCell) => {
         const decoded = decodeVoteIntentData(hexToBytes(intentCell.outputData));
         return bytesToHex(encodeVoteIntentData({ ...decoded, aggregated: true }));
       });
+      const aggregateFeeCell = await findSignerAuthCell(aggregatorSigner, [
+        outPointKey(pollCell),
+        outPointKey(shardCell),
+        ...voterIntentCells.map(outPointKey),
+      ]);
 
       const aggregateTx = ccc.Transaction.from({
-        cellDeps: [governanceCellDep()],
+        cellDeps: [
+          governanceCellDep(),
+          { outPoint: pollCell.outPoint, depType: "code" },
+        ],
         headerDeps: [tipHeader.hash],
         inputs: [
-          { previousOutput: pollCell.outPoint },
+          { previousOutput: shardCell.outPoint },
           ...voterIntentCells.map((intentCell) => ({ previousOutput: intentCell.outPoint })),
+          {
+            previousOutput: {
+              txHash: aggregateFeeCell.outPoint.txHash,
+              index: Number(aggregateFeeCell.outPoint.index),
+            },
+          },
         ],
         outputs: [
-          { lock: creatorAddress.script, type: pollType, capacity: aggregatePollCapacity },
+          {
+            lock: shardCell.cellOutput.lock,
+            type: shardCell.cellOutput.type,
+            capacity: shardCell.cellOutput.capacity,
+          },
           ...voterIntentCells.map((intentCell) => ({
             lock: intentLock,
             type: intentType,
             capacity: intentCell.cellOutput.capacity,
           })),
         ],
-        outputsData: [bytesToHex(aggregatePollBytes), ...aggregateOutputsData],
-        witnesses: Array.from({ length: voterIntentCells.length + 1 }).map(() => "0x"),
+        outputsData: [bytesToHex(updatedShardBytes), ...aggregateOutputsData],
+        witnesses: Array.from({ length: voterIntentCells.length + 2 }).map(() => "0x"),
       });
 
-      // Keep aggregate tx deterministic: no extra fee/change cells.
-      // Fee is paid by reducing poll output capacity in-place.
-      const aggregateInputCapacity =
-        pollCell.cellOutput.capacity +
-        voterIntentCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
-      const aggregateOutputCapacity =
-        aggregatePollCapacity +
-        voterIntentCells.reduce((sum, cell) => sum + cell.cellOutput.capacity, 0n);
-      const aggregateFee = aggregateInputCapacity - aggregateOutputCapacity;
-      if (aggregateFee < BigInt(TX_FEE_SHANNONS)) {
-        throw new Error(
-          `aggregate fee too low: ${aggregateFee} shannons (min ${TX_FEE_SHANNONS})`
-        );
-      }
-      if (aggregateFee > 2_000_000n) {
-        throw new Error(
-          `aggregate fee unexpectedly high: ${aggregateFee} shannons`
-        );
-      }
-      // Align with single-actor smoke behavior: let the fee payer complete the
-      // transaction skeleton before lock-group signing by all required parties.
-      await aggregateTx.completeInputsByCapacity(aggregatorSigner);
       await aggregateTx.completeFeeBy(aggregatorSigner, TX_FEE_SHANNONS);
       preflightIntentGroupTransition(
         aggregateTx,
         new Map(voterIntentCells.map((cell) => [`${cell.outPoint.txHash}:${cell.outPoint.index}`, cell])),
         intentType
       );
-      // Sign lock scripts in actual input order so secp signatures map to the
-      // correct witness groups when multiple parties share a transaction.
-      await creatorSigner.signTransaction(aggregateTx);
-      for (const voterSigner of voterSigners) {
-        await voterSigner.signTransaction(aggregateTx);
-      }
       await aggregatorSigner.signTransaction(aggregateTx);
 
       const aggregateHash = await client.sendTransaction(aggregateTx);
       await waitForTx(client, aggregateHash);
-      console.log(`AGGREGATE_VOTES (multi-auth): ${aggregateHash}`);
+      console.log(`CREATE_TALLY_SHARD aggregate: ${aggregateHash}`);
 
-      aggregatedPollCell = {
+      aggregatedShardCell = {
         outPoint: { txHash: aggregateHash, index: 0 },
-        cellOutput: { lock: creatorAddress.script, type: pollType, capacity: aggregatePollCapacity },
-        outputData: bytesToHex(aggregatePollBytes),
+        cellOutput: {
+          lock: shardCell.cellOutput.lock,
+          type: shardCell.cellOutput.type,
+          capacity: shardCell.cellOutput.capacity,
+        },
+        outputData: bytesToHex(updatedShardBytes),
       };
       aggregatedIntentCells = voterIntentCells.map((intentCell, index) => ({
         outPoint: { txHash: aggregateHash, index: index + 1 },
@@ -1037,127 +1052,18 @@ async function main(): Promise<void> {
     }
   ));
 
-  if (!aggregatedPollCell) {
-    console.log("Aggregation pass scenario failed; skipping close scenarios.");
-  } else {
-    results.push(await runScenario(
-      "force_close_before_grace_by_non_creator",
-      "fail",
-      async () => {
-        const closedPollBytes = encodePollData({
-          ...pollData,
-          vote_counts: expectedVoteCounts,
-          total_voters: BigInt(voterIntentCells.length),
-          counted_voter_lock_hashes: aggregatedIntentCells.map((intentCell) =>
-            decodeVoteIntentData(hexToBytes(intentCell.outputData)).voter_lock_hash
-          ),
-          is_closed: true,
-          pending_intent_count: 0n,
-        });
-        const closedPollMinCapacity = estimateOutputCapacity(
-          creatorAddress.script,
-          pollType,
-          closedPollBytes.length
-        );
-        const closedPollCandidateCapacity = aggregatedPollCell.cellOutput.capacity - CREATOR_DEPOSIT_SHANNONS;
-        const closedPollCapacity = closedPollCandidateCapacity > closedPollMinCapacity
-          ? closedPollCandidateCapacity
-          : closedPollMinCapacity;
-
-        const forceCloseAttemptTx = ccc.Transaction.from({
-          cellDeps: [governanceCellDep()],
-          headerDeps: [tipHeader.hash],
-          inputs: [
-            { previousOutput: aggregatedPollCell.outPoint },
-            ...aggregatedIntentCells.map((intentCell) => ({ previousOutput: intentCell.outPoint })),
-          ],
-          outputs: [
-            { lock: creatorAddress.script, type: pollType, capacity: closedPollCapacity },
-            { lock: creatorAddress.script, capacity: CREATOR_DEPOSIT_SHANNONS },
-            ...aggregatedIntentCells.map((intentCell) => ({
-              lock: denormalizeScript(decodeVoteIntentData(hexToBytes(intentCell.outputData)).refund_lock),
-              capacity: intentCell.cellOutput.capacity,
-            })),
-          ],
-          outputsData: [bytesToHex(closedPollBytes), "0x", ...aggregatedIntentCells.map(() => "0x")],
-          witnesses: Array.from({ length: aggregatedIntentCells.length + 1 }).map(() => "0x"),
-        });
-        await forceCloseAttemptTx.completeInputsByCapacity(forceCloserSigner);
-        await forceCloseAttemptTx.completeFeeBy(forceCloserSigner, TX_FEE_SHANNONS);
-        await forceCloserSigner.signTransaction(forceCloseAttemptTx);
-        const hash = await client.sendTransaction(forceCloseAttemptTx);
-        await waitForTx(client, hash);
+  results.push(await runScenario(
+    "sharded_close_requires_finalized_shards",
+    "pass_or_skip",
+    async () => {
+      if (!aggregatedShardCell || aggregatedIntentCells.length !== voterIntentCells.length) {
+        throw new ScenarioSkip("skipped: shard aggregation did not produce committed marker cells");
       }
-    ));
-
-    results.push(await runScenario(
-      "force_close_after_grace_by_non_creator",
-      "pass_or_skip",
-      async () => {
-        const closedPollBytes = encodePollData({
-          ...pollData,
-          vote_counts: expectedVoteCounts,
-          total_voters: BigInt(voterIntentCells.length),
-          counted_voter_lock_hashes: aggregatedIntentCells.map((intentCell) =>
-            decodeVoteIntentData(hexToBytes(intentCell.outputData)).voter_lock_hash
-          ),
-          is_closed: true,
-          pending_intent_count: 0n,
-        });
-        const closedPollMinCapacity = estimateOutputCapacity(
-          creatorAddress.script,
-          pollType,
-          closedPollBytes.length
-        );
-        const closedPollCandidateCapacity = aggregatedPollCell.cellOutput.capacity - CREATOR_DEPOSIT_SHANNONS;
-        const closedPollCapacity = closedPollCandidateCapacity > closedPollMinCapacity
-          ? closedPollCandidateCapacity
-          : closedPollMinCapacity;
-
-        const afterGraceEpoch = pollData.deadline + FORCE_CLOSE_GRACE_EPOCHS + 1n;
-        let afterGraceHeader: any;
-        try {
-          afterGraceHeader = await findHeaderAfterEpoch(client, tipHeader, afterGraceEpoch);
-        } catch (error) {
-          const reason = summarizeError(error);
-          if (reason.includes("tip height too low for after-grace scenario")) {
-            throw new ScenarioSkip(
-              `skipped: chain not yet at after-grace epoch (${afterGraceEpoch.toString()})`
-            );
-          }
-          throw error;
-        }
-        const afterGraceEpochNo = BigInt(Array.isArray(afterGraceHeader.epoch) ? afterGraceHeader.epoch[0] : 0);
-
-        const forceCloseAfterGraceTx = ccc.Transaction.from({
-          cellDeps: [governanceCellDep()],
-          headerDeps: [afterGraceHeader.hash],
-          inputs: [
-            { previousOutput: aggregatedPollCell.outPoint },
-            ...aggregatedIntentCells.map((intentCell) => ({ previousOutput: intentCell.outPoint })),
-          ],
-          outputs: [
-            { lock: creatorAddress.script, type: pollType, capacity: closedPollCapacity },
-            { lock: creatorAddress.script, capacity: CREATOR_DEPOSIT_SHANNONS },
-            ...aggregatedIntentCells.map((intentCell) => ({
-              lock: denormalizeScript(decodeVoteIntentData(hexToBytes(intentCell.outputData)).refund_lock),
-              capacity: intentCell.cellOutput.capacity,
-            })),
-          ],
-          outputsData: [bytesToHex(closedPollBytes), "0x", ...aggregatedIntentCells.map(() => "0x")],
-          witnesses: Array.from({ length: aggregatedIntentCells.length + 1 }).map(() => "0x"),
-        });
-        await forceCloseAfterGraceTx.completeInputsByCapacity(forceCloserSigner);
-        await forceCloseAfterGraceTx.completeFeeBy(forceCloserSigner, TX_FEE_SHANNONS);
-        await forceCloserSigner.signTransaction(forceCloseAfterGraceTx);
-        const hash = await client.sendTransaction(forceCloseAfterGraceTx);
-        await waitForTx(client, hash);
-        console.log(
-          `FORCE_CLOSE after grace (epoch=${afterGraceEpochNo.toString()} target=${afterGraceEpoch.toString()}): ${hash}`
-        );
-      }
-    ));
-  }
+      throw new ScenarioSkip(
+        "skipped: immediate smoke stops before post-deadline CREATE_TALLY_SHARD finalization, MERGE_TALLY_SHARDS for large polls, and CLOSE_POLL"
+      );
+    }
+  ));
 
   console.log("\n=== Scenario Results ===");
   for (const result of results) {

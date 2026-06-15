@@ -1,5 +1,5 @@
 [workspace]
-members = ["contracts/governance"]
+members = ["contracts/governance", "integration-tests"]
 resolver = "2"
 
 [workspace.package]
@@ -8,7 +8,8 @@ license = "MIT"
 authors = ["anihdev"]
 
 [workspace.dependencies]
-ckb-std = { version = "0.16.4", default-features = false, features = ["allocator", "calc-hash", "ckb-types", "dummy-atomic", "libc"] }
+ckb-std = { version = "0.16.4", default-features = false, features = ["allocator", "calc-hash", "ckb-types", "dummy-atomic", "libc", "type-id"] }
+ckb-hash = { version = "0.119.0", default-features = false, features = ["ckb-contract"] }
 
 [profile.release]
 panic = "abort"

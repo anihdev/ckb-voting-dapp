@@ -10,6 +10,7 @@ import { ccc } from "@ckb-ccc/core";
 import { useCKB } from "./hooks/useCKB";
 import { usePolls } from "./hooks/usePolls";
 import { CKB_RPC_URL, getTipEpoch, shannonsToCkb, validateRuntimeConfig } from "./lib/ckb";
+import { buildProtocolTimeline, getPollFilterCounts } from "./lib/protocolUi";
 import { WalletConnect } from "./components/WalletConnect";
 
 const CreatePoll = lazy(() => import("./components/CreatePoll").then((module) => ({ default: module.CreatePoll })));
@@ -56,8 +57,11 @@ function InnerApp() {
     createPoll,
     castVote,
     aggregatePoll,
+    finalizeShards,
+    mergeShards,
     closePoll,
     forceClose,
+    refundClosedIntent,
     createDelegation,
     revokeDelegation,
   } = usePolls(signer);
@@ -95,54 +99,12 @@ function InnerApp() {
   }, [lastSyncedAt]);
 
   const protocolTimeline = useMemo(() => {
-    type State = "completed" | "live" | "pending";
-
-    const hasPolls = polls.length > 0;
-    const hasIntent = polls.some((poll) => poll.totalVoters > 0n || poll.pendingIntentCount > 0n);
-    const hasAggregated = polls.some((poll) => poll.totalVotes > 0n);
-    const hasExpiredOpen = polls.some((poll) => !poll.isClosed && currentEpoch > poll.deadline);
-    const hasClosed = polls.some((poll) => poll.isClosed);
-    const hasDelegation = delegations.length > 0;
-
-    return [
-      {
-        op: "CREATE_POLL",
-        label: "Create poll cell",
-        detail: "Lock creator deposit and initialize governance state.",
-        state: hasPolls ? ("completed" as State) : ("live" as State),
-      },
-      {
-        op: "CREATE_VOTE_INTENT",
-        label: "Record vote intent",
-        detail: "Store independent voter intent cells.",
-        state: hasIntent ? ("completed" as State) : hasPolls ? ("live" as State) : ("pending" as State),
-      },
-      {
-        op: "AGGREGATE_VOTES",
-        label: "Aggregate intents",
-        detail: "Batch-consume pending intents and update tally.",
-        state: hasAggregated ? ("completed" as State) : hasIntent ? ("live" as State) : ("pending" as State),
-      },
-      {
-        op: "CLOSE_POLL",
-        label: "Close or recover",
-        detail: "Creator closes after deadline, then force-close after grace.",
-        state: hasClosed ? ("completed" as State) : hasExpiredOpen ? ("live" as State) : ("pending" as State),
-      },
-      {
-        op: "DELEGATE",
-        label: "Delegate authority",
-        detail: "Issue delegation cells globally or per poll.",
-        state: hasDelegation ? ("completed" as State) : hasPolls ? ("live" as State) : ("pending" as State),
-      },
-      {
-        op: "REVOKE_DELEGATION",
-        label: "Revoke delegation",
-        detail: "Consume delegation cell to revoke authority.",
-        state: hasDelegation ? ("live" as State) : ("pending" as State),
-      },
-    ] as const;
+    return buildProtocolTimeline(polls, delegations, currentEpoch);
   }, [currentEpoch, delegations, polls]);
+  const pollFilterCounts = useMemo(
+    () => getPollFilterCounts(polls, currentEpoch),
+    [currentEpoch, polls]
+  );
 
   const sectionFallback = (
     <div className="card-shell" style={{ padding: 24 }}>
@@ -201,7 +163,7 @@ function InnerApp() {
           <div className="hero-chips">
             <span className="chip">Testnet</span>
             <span className="chip">6 operations</span>
-            <span className="chip">Intent aggregation</span>
+            <span className="chip">Shard aggregation</span>
             <span className="chip">Delegation cells</span>
             <span className="chip">Permissionless force-close</span>
           </div>
@@ -223,6 +185,9 @@ function InnerApp() {
           <div className="status-metric">
             <div className="metric-label">Indexed Polls</div>
             <div className="metric-value">{polls.length}</div>
+            <div className="hint" style={{ marginTop: 6 }}>
+              Open {pollFilterCounts.open} | Needs close {pollFilterCounts.needsClose} | Archived {pollFilterCounts.archived}
+            </div>
             <span className="status-pill status-pill-ok" style={{ marginTop: 8 }}>On-chain</span>
           </div>
           <div className="status-metric">
@@ -308,8 +273,11 @@ function InnerApp() {
               castVote({ poll, optionIndex, authorityId, weightUnits })
             }
             onAggregate={aggregatePoll}
+            onFinalizeShards={finalizeShards}
+            onMergeShards={mergeShards}
             onClose={closePoll}
             onForceClose={forceClose}
+            onRefundClosedIntent={refundClosedIntent}
             onRefresh={() => {
               void syncDashboard();
             }}

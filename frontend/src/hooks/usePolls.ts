@@ -9,17 +9,23 @@
 import { useCallback, useState } from "react";
 import { ccc } from "@ckb-ccc/core";
 import {
-  buildAggregateVotesTx,
+  buildAggregateTallyShardTx,
   buildClosePollTx,
   buildForceCloseTx,
+  buildFinalizeTallyShardTx,
+  buildMergeTallyShardsTx,
   buildCreatePollTx,
   buildCreateVoteIntentTx,
   buildDelegateTx,
   buildGovernanceTypeScript,
+  buildRefundClosedIntentTx,
   buildRevokeDelegationTx,
+  deriveTallyShardId,
   getTipEpoch,
   getSignerLockHashHex,
   hashScript,
+  MAX_DIRECT_CLOSE_SHARDS,
+  MAX_SHARDS_PER_MERGE,
   OP,
   signAndSendTx,
   validateCreatePollInput,
@@ -28,16 +34,25 @@ import {
   bytesToHex,
   decodeDelegationData,
   decodePollData,
+  decodeTallyMergeResultData,
+  decodeTallyShardData,
   decodeVoteIntentData,
 } from "../lib/molecule";
 import {
   DelegateParams,
   DelegationRecord,
   Poll,
+  TallyMergeResult,
+  TallyShard,
   TxState,
   VoteAuthorityOption,
   VoteIntent,
 } from "../lib/types";
+import {
+  computeCanonicalTallyFrontier,
+  selectCloseTimeIntentRefunds,
+  tallyMergeCoverageComplete,
+} from "../lib/protocolUi";
 
 export interface CreatePollParams {
   question: string;
@@ -125,6 +140,53 @@ async function waitForTx(client: any, txHash: string): Promise<void> {
   }
 }
 
+function coverageDisjoint(a: Uint8Array, b: Uint8Array): boolean {
+  for (let index = 0; index < a.length; index += 1) {
+    if ((a[index] & b[index]) !== 0) return false;
+  }
+  return true;
+}
+
+function coverageSetShard(coverage: Uint8Array, shardId: number): void {
+  coverage[Math.floor(shardId / 8)] |= 1 << (shardId % 8);
+}
+
+function coverageCount(coverage: Uint8Array): number {
+  return coverage.reduce((sum, byte) => sum + byte.toString(2).replace(/0/g, "").length, 0);
+}
+
+function coverageAddsMissing(selected: Uint8Array, candidate: Uint8Array, shardCount: number): boolean {
+  for (let shardId = 0; shardId < shardCount; shardId += 1) {
+    const mask = 1 << (shardId % 8);
+    const byteIndex = Math.floor(shardId / 8);
+    if ((selected[byteIndex] & mask) === 0 && (candidate[byteIndex] & mask) !== 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildCloseIntentRefundSelection(input: {
+  cells: any[];
+  pollId: string;
+  trackedPendingLowerBound: bigint;
+}) {
+  const candidates = input.cells.map((cell) => {
+    const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+    return {
+      cell,
+      pollTypeHash: bytesToHex(decoded.poll_type_hash),
+      aggregated: decoded.aggregated,
+      sortKey: `${cell.outPoint.txHash}:${Number(cell.outPoint.index)}`,
+    };
+  });
+
+  return selectCloseTimeIntentRefunds(candidates, {
+    pollTypeHash: input.pollId,
+    trackedPendingLowerBound: input.trackedPendingLowerBound,
+  });
+}
+
 export function usePolls(signer: any | null) {
   const [polls, setPolls] = useState<Poll[]>([]);
   const [intents, setIntents] = useState<Record<string, VoteIntent[]>>({});
@@ -134,6 +196,8 @@ export function usePolls(signer: any | null) {
   const [txState, setTxState] = useState<TxState>({ status: "idle", txHash: null, error: null });
   const [pollCells, setPollCells] = useState<Record<string, any>>({});
   const [intentCells, setIntentCells] = useState<Record<string, any[]>>({});
+  const [tallyShardCells, setTallyShardCells] = useState<Record<string, any[]>>({});
+  const [tallyMergeResultCells, setTallyMergeResultCells] = useState<Record<string, any[]>>({});
   const [delegationCells, setDelegationCells] = useState<Record<string, any>>({});
 
   const fetchPolls = useCallback(async () => {
@@ -148,6 +212,10 @@ export function usePolls(signer: any | null) {
       const nextIntents: Record<string, VoteIntent[]> = {};
       const nextIntentCells: Record<string, any[]> = {};
       const nextPollCells: Record<string, any> = {};
+      const nextTallyShardCells: Record<string, any[]> = {};
+      const nextTallyShards: Record<string, TallyShard[]> = {};
+      const nextTallyMergeResultCells: Record<string, any[]> = {};
+      const nextTallyMergeResults: Record<string, TallyMergeResult[]> = {};
       const headerEpochCache = new Map<string, bigint | null>();
       const currentLockHashHex = await getSignerLockHashHex(signer);
       const tipEpoch = await getTipEpoch(client);
@@ -186,21 +254,133 @@ export function usePolls(signer: any | null) {
             totalVoters: pollData.total_voters,
             creatorDeposit: pollData.creator_deposit,
             pendingIntentCount: pollData.pending_intent_count,
+            protocolPendingIntentCount: pollData.pending_intent_count,
             tokenWeighted: pollData.token_weighted,
             udtTypeHash: bytesToHex(pollData.udt_type_hash),
+            shardCount: pollData.shard_count,
+            tallyShards: [],
+            tallyMergeResults: [],
+            tallyFrontier: {
+              source: pollData.shard_count > 0 && pollData.is_closed ? "closed-poll" : "poll-cell",
+              coveredShardCount: 0,
+              shardCount: pollData.shard_count,
+              coverageComplete: pollData.shard_count === 0,
+              selectedMergeResultIds: [],
+              selectedShardIds: [],
+              uncoveredShardIds: pollData.shard_count > 0
+                ? Array.from({ length: pollData.shard_count }, (_, shardId) => shardId)
+                : [],
+            },
             totalVotes,
             winnerIndex: deriveWinnerIndex(voteCounts),
             authorityOptions: [],
             outstandingIntentCount: 0,
+            refundableIntentCount: 0,
           });
 
           nextIntents[pollId] = [];
+          nextTallyShardCells[pollId] = [];
+          nextTallyShards[pollId] = [];
+          nextTallyMergeResultCells[pollId] = [];
+          nextTallyMergeResults[pollId] = [];
         } catch (error) {
           console.warn("Failed to decode poll cell", error);
         }
       }
 
       for (const poll of nextPolls) {
+        const tallyShardScript = buildGovernanceTypeScript(OP.CREATE_TALLY_SHARD, poll.id);
+        for await (const cell of client.findCells({
+          script: tallyShardScript,
+          scriptType: "type",
+          scriptSearchMode: "prefix",
+        })) {
+          try {
+            const shardBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
+            const shardData = decodeTallyShardData(shardBytes);
+            if (bytesToHex(shardData.poll_type_hash).toLowerCase() !== poll.id.toLowerCase()) {
+              continue;
+            }
+
+            nextTallyShardCells[poll.id].push(cell);
+            nextTallyShards[poll.id].push({
+              id: `${cell.outPoint.txHash}:${cell.outPoint.index}`,
+              pollId: poll.id,
+              outPoint: {
+                txHash: cell.outPoint.txHash,
+                index: Number(cell.outPoint.index),
+              },
+              shardId: shardData.shard_id,
+              shardCount: shardData.shard_count,
+              voteCounts: shardData.vote_counts,
+              totalVoters: shardData.total_voters,
+              finalized: shardData.finalized,
+              capacity: BigInt(cell.cellOutput?.capacity ?? cell.output?.capacity ?? 0),
+            });
+          } catch (error) {
+            console.warn("Failed to decode tally shard cell", error);
+          }
+        }
+
+        const pollShards = nextTallyShards[poll.id] ?? [];
+        poll.tallyShards = pollShards;
+
+        const mergeScript = buildGovernanceTypeScript(OP.MERGE_TALLY_SHARDS, poll.id);
+        for await (const cell of client.findCells({
+          script: mergeScript,
+          scriptType: "type",
+          scriptSearchMode: "exact",
+        })) {
+          try {
+            const resultBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
+            const resultData = decodeTallyMergeResultData(resultBytes);
+            if (bytesToHex(resultData.poll_type_hash).toLowerCase() !== poll.id.toLowerCase()) {
+              continue;
+            }
+            nextTallyMergeResultCells[poll.id].push(cell);
+            nextTallyMergeResults[poll.id].push({
+              id: `${cell.outPoint.txHash}:${cell.outPoint.index}`,
+              pollId: poll.id,
+              outPoint: {
+                txHash: cell.outPoint.txHash,
+                index: Number(cell.outPoint.index),
+              },
+              coverage: bytesToHex(resultData.coverage),
+              voteCounts: resultData.vote_counts,
+              totalVoters: resultData.total_voters,
+              mergeLevel: resultData.merge_level,
+              version: resultData.version,
+              capacity: BigInt(cell.cellOutput?.capacity ?? cell.output?.capacity ?? 0),
+            });
+          } catch (error) {
+            console.warn("Failed to decode tally merge result cell", error);
+          }
+        }
+        poll.tallyMergeResults = nextTallyMergeResults[poll.id] ?? [];
+
+        const tallyFrontier = computeCanonicalTallyFrontier({
+          optionCount: poll.options.length,
+          shardCount: poll.shardCount,
+          pollVoteCounts: poll.voteCounts,
+          pollTotalVoters: poll.totalVoters,
+          pollIsClosed: poll.isClosed,
+          shards: poll.tallyShards,
+          mergeResults: poll.tallyMergeResults,
+        });
+        poll.voteCounts = tallyFrontier.voteCounts;
+        poll.totalVoters = tallyFrontier.totalVoters;
+        poll.totalVotes = tallyFrontier.totalVotes;
+        poll.winnerIndex = deriveWinnerIndex(tallyFrontier.voteCounts);
+        poll.tallyFrontier = {
+          source: tallyFrontier.source,
+          coveredShardCount: tallyFrontier.coveredShardCount,
+          shardCount: tallyFrontier.shardCount,
+          coverageComplete: tallyFrontier.coverageComplete,
+          selectedMergeResultIds: tallyFrontier.selectedMergeResultIds,
+          selectedShardIds: tallyFrontier.selectedShardIds,
+          uncoveredShardIds: tallyFrontier.uncoveredShardIds,
+        };
+
         const intentScript = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, poll.id);
         const nextIntentCellsForPoll: any[] = [];
         for await (const cell of client.findCells({
@@ -275,6 +455,7 @@ export function usePolls(signer: any | null) {
                 : bytesToHex(delegation.poll_type_hash),
             expiresEpoch: delegation.expires_epoch,
             capacity: BigInt((cell.cellOutput ?? cell.output).capacity),
+            isDelegator: delegatorLockHash === currentLockHashHex,
           });
         } catch (error) {
           console.warn("Failed to decode delegation cell", error);
@@ -328,12 +509,15 @@ export function usePolls(signer: any | null) {
         // poll.pending_intent_count is promoted to strict on-chain accounting.
         poll.pendingIntentCount = BigInt(pendingPollIntents.length);
         poll.outstandingIntentCount = pendingPollIntents.length;
+        poll.refundableIntentCount = pollIntents.length;
       }
 
       setPolls(nextPolls);
       setIntents(nextIntents);
       setPollCells(nextPollCells);
       setIntentCells(nextIntentCells);
+      setTallyShardCells(nextTallyShardCells);
+      setTallyMergeResultCells(nextTallyMergeResultCells);
       setDelegations(nextDelegations);
       setDelegationCells(nextDelegationCells);
     } catch (error: any) {
@@ -428,13 +612,24 @@ export function usePolls(signer: any | null) {
       const pollCell = pollCells[poll.id];
       if (!pollCell) throw new Error("Poll cell is not currently indexed");
 
-      const outstandingIntentCells = intentCells[poll.id] ?? [];
+      const indexedShardCells = tallyShardCells[poll.id] ?? [];
+      const finalMergeResultCell = (tallyMergeResultCells[poll.id] ?? []).find((cell) => {
+        const result = decodeTallyMergeResultData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
+      });
 
       setTxState({ status: "building", txHash: null, error: null });
       try {
+        const closeIntentSelection = buildCloseIntentRefundSelection({
+          cells: intentCells[poll.id] ?? [],
+          pollId: poll.id,
+          trackedPendingLowerBound: poll.protocolPendingIntentCount,
+        });
         const tx = await buildClosePollTx(signer, {
           pollCell,
-          intentCells: outstandingIntentCells,
+          intentCells: closeIntentSelection.included.map((candidate) => candidate.cell),
+          shardCells: indexedShardCells,
+          mergeResultCell: finalMergeResultCell,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
@@ -451,7 +646,7 @@ export function usePolls(signer: any | null) {
         throw error;
       }
     },
-    [fetchPolls, intentCells, pollCells, signer]
+    [fetchPolls, intentCells, pollCells, signer, tallyMergeResultCells, tallyShardCells]
   );
 
   const forceClose = useCallback(
@@ -461,13 +656,80 @@ export function usePolls(signer: any | null) {
       const pollCell = pollCells[poll.id];
       if (!pollCell) throw new Error("Poll cell is not currently indexed");
 
-      const outstandingIntentCells = intentCells[poll.id] ?? [];
+      const indexedShardCells = tallyShardCells[poll.id] ?? [];
+      const finalMergeResultCell = (tallyMergeResultCells[poll.id] ?? []).find((cell) => {
+        const result = decodeTallyMergeResultData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
+      });
 
       setTxState({ status: "building", txHash: null, error: null });
       try {
+        const closeIntentSelection = buildCloseIntentRefundSelection({
+          cells: intentCells[poll.id] ?? [],
+          pollId: poll.id,
+          trackedPendingLowerBound: poll.protocolPendingIntentCount,
+        });
         const tx = await buildForceCloseTx(signer, {
           pollCell,
-          intentCells: outstandingIntentCells,
+          intentCells: closeIntentSelection.included.map((candidate) => candidate.cell),
+          shardCells: indexedShardCells,
+          mergeResultCell: finalMergeResultCell,
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [fetchPolls, intentCells, pollCells, signer, tallyMergeResultCells, tallyShardCells]
+  );
+
+  const refundClosedIntent = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
+      if (!poll.isClosed) throw new Error("Standalone intent refund requires a closed poll");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+
+      const refundableIntentCandidates = (intentCells[poll.id] ?? [])
+        .map((cell) => {
+          try {
+            const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+            return { cell, decoded };
+          } catch {
+            return null;
+          }
+        })
+        .filter((candidate): candidate is { cell: any; decoded: ReturnType<typeof decodeVoteIntentData> } => {
+          if (!candidate) return false;
+          return bytesToHex(candidate.decoded.poll_type_hash).toLowerCase() === poll.id.toLowerCase();
+        })
+        .sort((left, right) => {
+          const aggregateOrder = Number(left.decoded.aggregated) - Number(right.decoded.aggregated);
+          if (aggregateOrder !== 0) return aggregateOrder;
+          return `${left.cell.outPoint.txHash}:${Number(left.cell.outPoint.index)}`.localeCompare(
+            `${right.cell.outPoint.txHash}:${Number(right.cell.outPoint.index)}`
+          );
+        });
+
+      const intentCell = refundableIntentCandidates[0]?.cell;
+      if (!intentCell) throw new Error("No live omitted intent cell is indexed for refund");
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildRefundClosedIntentTx(signer, {
+          pollCell,
+          intentCell,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
@@ -503,12 +765,39 @@ export function usePolls(signer: any | null) {
 
       if (!pollCell) throw new Error("Poll cell is not currently indexed");
       if (pendingIntentCells.length === 0) throw new Error("No pending intent cells to aggregate");
+      const shardCells = tallyShardCells[poll.id] ?? [];
+      if (shardCells.length === 0) throw new Error("No tally shard cells are currently indexed for this poll");
+
+      const pendingByShard = new Map<number, any[]>();
+      for (const cell of pendingIntentCells) {
+        const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        const shardId = deriveTallyShardId(decoded.poll_type_hash, decoded.voter_lock_hash, poll.shardCount);
+        const group = pendingByShard.get(shardId) ?? [];
+        group.push(cell);
+        pendingByShard.set(shardId, group);
+      }
+
+      let selectedShardCell: any | null = null;
+      let selectedIntentCells: any[] = [];
+      for (const cell of shardCells) {
+        const shardData = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        const group = pendingByShard.get(shardData.shard_id) ?? [];
+        if (group.length > 0) {
+          selectedShardCell = cell;
+          selectedIntentCells = group.slice(0, 50);
+          break;
+        }
+      }
+      if (!selectedShardCell) {
+        throw new Error("No indexed tally shard matches the pending intent cells");
+      }
 
       setTxState({ status: "building", txHash: null, error: null });
       try {
-        const tx = await buildAggregateVotesTx(signer, {
+        const tx = await buildAggregateTallyShardTx(signer, {
           pollCell,
-          intentCells: pendingIntentCells.slice(0, 50),
+          shardCell: selectedShardCell,
+          intentCells: selectedIntentCells,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
@@ -525,7 +814,133 @@ export function usePolls(signer: any | null) {
         throw error;
       }
     },
-    [fetchPolls, intentCells, pollCells, signer]
+    [fetchPolls, intentCells, pollCells, signer, tallyShardCells]
+  );
+
+  const finalizeShards = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+
+      const shardCells = tallyShardCells[poll.id] ?? [];
+      if (poll.shardCount <= 0) throw new Error("Poll is not configured for tally shards");
+      if (shardCells.length !== poll.shardCount) {
+        throw new Error("Finalize requires the complete indexed shard set");
+      }
+
+      const nextShardCell = shardCells.find((cell) => {
+        const shardData = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        return !shardData.finalized;
+      });
+      if (!nextShardCell) throw new Error("All indexed shards are already finalized");
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildFinalizeTallyShardTx(signer, {
+          pollCell,
+          shardCell: nextShardCell,
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [fetchPolls, pollCells, signer, tallyShardCells]
+  );
+
+  const mergeShards = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+
+      const shardCells = (tallyShardCells[poll.id] ?? []).filter((cell) => {
+        const shard = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        return shard.finalized;
+      });
+      const resultCells = tallyMergeResultCells[poll.id] ?? [];
+      if (poll.shardCount <= MAX_DIRECT_CLOSE_SHARDS) throw new Error("Merge is only required for large shard-count polls");
+      if (shardCells.length === 0 && resultCells.length === 0) {
+        throw new Error("No finalized shard or merge result cells are indexed");
+      }
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const selectedShardCells: any[] = [];
+        const selectedResultCells: any[] = [];
+        const selectedCoverage = new Uint8Array(32);
+
+        const resultCandidates = resultCells
+          .map((cell) => ({
+            cell,
+            result: decodeTallyMergeResultData((ccc as any).bytesFrom(cell.outputData ?? "0x")),
+          }))
+          .sort((left, right) => coverageCount(right.result.coverage) - coverageCount(left.result.coverage));
+
+        for (const { cell, result } of resultCandidates) {
+          if (selectedShardCells.length + selectedResultCells.length >= MAX_SHARDS_PER_MERGE) break;
+          if (!coverageDisjoint(selectedCoverage, result.coverage)) continue;
+          if (!coverageAddsMissing(selectedCoverage, result.coverage, poll.shardCount)) continue;
+          selectedResultCells.push(cell);
+          for (let index = 0; index < selectedCoverage.length; index += 1) {
+            selectedCoverage[index] |= result.coverage[index];
+          }
+        }
+
+        const shardCandidates = shardCells
+          .map((cell) => ({
+            cell,
+            shard: decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x")),
+          }))
+          .sort((left, right) => left.shard.shard_id - right.shard.shard_id);
+
+        for (const { cell, shard } of shardCandidates) {
+          if (selectedShardCells.length + selectedResultCells.length >= MAX_SHARDS_PER_MERGE) break;
+          if (shard.shard_id >= poll.shardCount) continue;
+          if ((selectedCoverage[Math.floor(shard.shard_id / 8)] & (1 << (shard.shard_id % 8))) !== 0) {
+            continue;
+          }
+          selectedShardCells.push(cell);
+          coverageSetShard(selectedCoverage, shard.shard_id);
+        }
+        if (selectedShardCells.length + selectedResultCells.length === 0) {
+          throw new Error("No disjoint shard or merge result inputs are available");
+        }
+
+        const tx = await buildMergeTallyShardsTx(signer, {
+          pollCell,
+          shardCells: selectedShardCells,
+          mergeResultCells: selectedResultCells,
+        });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        setTxState({ status: "confirming", txHash, error: null });
+
+        waitForTx(signer.client, txHash).then(async () => {
+          setTxState({ status: "success", txHash, error: null });
+          await fetchPolls();
+        });
+
+        return txHash;
+      } catch (error: any) {
+        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        throw error;
+      }
+    },
+    [fetchPolls, pollCells, signer, tallyMergeResultCells, tallyShardCells]
   );
 
   const createDelegation = useCallback(
@@ -603,10 +1018,13 @@ export function usePolls(signer: any | null) {
     createPoll,
     castVote,
     aggregatePoll,
+    finalizeShards,
+    mergeShards,
     closePoll,
     createDelegation,
     revokeDelegation,
     forceClose,
+    refundClosedIntent,
     currentEpoch,
   };
 }

@@ -60,4 +60,10 @@ Thumbs.db
 z_contracts/
 !ckb_weekly_update.md
 !phase_b_weekly_update.md
+!phase_c_weekly_update.md
+!phase_d_contention_weekly_update.md
 !zk_plan.md
+#CONTENTION_FIRST_MVP_PLAN.md
+#ZK_COMPLETENESS_DESIGN.md
+#ZK_COMPLETENESS_AGENT.md
+#AGENTS.md

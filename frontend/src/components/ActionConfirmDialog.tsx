@@ -66,7 +66,7 @@ export function ActionConfirmDialog({
     <div className="confirm-overlay" role="dialog" aria-modal="true" aria-live="polite">
       <div className="confirm-modal">
         <div className="confirm-title">{title}</div>
-        <div className="confirm-body">{message}</div>
+        <div className="confirm-body whitespace-pre-line">{message}</div>
         <div className="confirm-countdown">Auto-cancel in {remaining}s</div>
         <div className="confirm-progress" aria-hidden="true">
           <div

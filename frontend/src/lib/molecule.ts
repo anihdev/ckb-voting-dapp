@@ -11,6 +11,7 @@ export interface PollData {
   vote_counts: bigint[];
   deadline: bigint;
   creator: Uint8Array;
+  creator_lock: EncodedScript;
   is_closed: boolean;
   total_voters: bigint;
   creator_deposit: bigint;
@@ -18,6 +19,7 @@ export interface PollData {
   counted_voter_lock_hashes: Uint8Array[];
   token_weighted: boolean;
   udt_type_hash: Uint8Array;
+  shard_count: number;
 }
 
 export interface VoteIntentData {
@@ -36,6 +38,25 @@ export interface DelegationData {
   expires_epoch: bigint;
 }
 
+export interface TallyShardData {
+  poll_type_hash: Uint8Array;
+  shard_id: number;
+  shard_count: number;
+  vote_counts: bigint[];
+  total_voters: bigint;
+  counted_voter_lock_hashes: Uint8Array[];
+  finalized: boolean;
+}
+
+export interface TallyMergeResultData {
+  poll_type_hash: Uint8Array;
+  coverage: Uint8Array;
+  vote_counts: bigint[];
+  total_voters: bigint;
+  merge_level: number;
+  version: number;
+}
+
 export interface EncodedScript {
   code_hash: string;
   hash_type: "type" | "data" | "data1" | "data2";
@@ -46,7 +67,14 @@ function assertCodec(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
 }
 
+function decodeBool(bytes: Uint8Array, offset: number, fieldName: string): boolean {
+  assertCodec(bytes.length > offset, `${fieldName} decode out of bounds`);
+  assertCodec(bytes[offset] === 0 || bytes[offset] === 1, `${fieldName} must be 0 or 1`);
+  return bytes[offset] === 1;
+}
+
 function encodeUint32(value: number): Uint8Array {
+  assertCodec(Number.isInteger(value) && value >= 0 && value <= 0xffffffff, "uint32 value out of range");
   const bytes = new Uint8Array(4);
   bytes[0] = value & 0xff;
   bytes[1] = (value >> 8) & 0xff;
@@ -56,7 +84,13 @@ function encodeUint32(value: number): Uint8Array {
 }
 
 function decodeUint32(bytes: Uint8Array, offset = 0): number {
-  return bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24);
+  assertCodec(bytes.length >= offset + 4, "uint32 decode out of bounds");
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24)
+  ) >>> 0;
 }
 
 function encodeUint64(value: bigint): Uint8Array {
@@ -70,6 +104,7 @@ function encodeUint64(value: bigint): Uint8Array {
 }
 
 function decodeUint64(bytes: Uint8Array, offset = 0): bigint {
+  assertCodec(bytes.length >= offset + 8, "uint64 decode out of bounds");
   let result = 0n;
   for (let index = 7; index >= 0; index -= 1) {
     result = (result << 8n) | BigInt(bytes[offset + index]);
@@ -87,6 +122,7 @@ function encodeString(value: string): Uint8Array {
 
 function decodeString(bytes: Uint8Array, offset: number): [string, number] {
   const length = decodeUint32(bytes, offset);
+  assertCodec(bytes.length >= offset + 4 + length, "string decode out of bounds");
   return [new TextDecoder().decode(bytes.slice(offset + 4, offset + 4 + length)), offset + 4 + length];
 }
 
@@ -139,6 +175,7 @@ function decodeBytes32Vec(bytes: Uint8Array, offset: number): [Uint8Array[], num
   const values: Uint8Array[] = [];
 
   for (let index = 0; index < count; index += 1) {
+    assertCodec(bytes.length >= currentOffset + 32, "bytes32 vec decode out of bounds");
     values.push(bytes.slice(currentOffset, currentOffset + 32));
     currentOffset += 32;
   }
@@ -165,6 +202,7 @@ function encodeBytes(bytes: Uint8Array): Uint8Array {
 
 function decodeBytes(bytes: Uint8Array, offset: number): [Uint8Array, number] {
   const length = decodeUint32(bytes, offset);
+  assertCodec(bytes.length >= offset + 4 + length, "bytes decode out of bounds");
   return [bytes.slice(offset + 4, offset + 4 + length), offset + 4 + length];
 }
 
@@ -199,7 +237,9 @@ function encodeScript(script: EncodedScript): Uint8Array {
 
 function decodeScript(bytes: Uint8Array, offset: number): [EncodedScript, number] {
   const code_hash = bytesToHex(bytes.slice(offset, offset + 32));
+  assertCodec(bytes.length >= offset + 32, "script code_hash decode out of bounds");
   offset += 32;
+  assertCodec(bytes.length > offset, "script hash_type decode out of bounds");
   const hash_type = byteToHashType(bytes[offset]);
   offset += 1;
   const [argsBytes, nextOffset] = decodeBytes(bytes, offset);
@@ -209,6 +249,8 @@ function decodeScript(bytes: Uint8Array, offset: number): [EncodedScript, number
 export function encodePollData(poll: PollData): Uint8Array {
   assertCodec(poll.creator.length === 32, "creator must be 32 bytes");
   assertCodec(poll.udt_type_hash.length === 32, "udt_type_hash must be 32 bytes");
+  assertCodec(poll.shard_count > 0, "poll.shard_count must be positive");
+  assertCodec(poll.shard_count <= 256, "poll.shard_count exceeds protocol maximum");
 
   return concat([
     encodeString(poll.question),
@@ -216,6 +258,7 @@ export function encodePollData(poll: PollData): Uint8Array {
     encodeUint64Vec(poll.vote_counts),
     encodeUint64(poll.deadline),
     poll.creator,
+    encodeScript(poll.creator_lock),
     new Uint8Array([poll.is_closed ? 1 : 0]),
     encodeUint64(poll.total_voters),
     encodeUint64(poll.creator_deposit),
@@ -223,6 +266,7 @@ export function encodePollData(poll: PollData): Uint8Array {
     encodeBytes32Vec(poll.counted_voter_lock_hashes),
     new Uint8Array([poll.token_weighted ? 1 : 0]),
     poll.udt_type_hash,
+    encodeUint32(poll.shard_count),
   ]);
 }
 
@@ -237,9 +281,12 @@ export function decodePollData(bytes: Uint8Array): PollData {
 
   const deadline = decodeUint64(bytes, offset);
   offset += 8;
+  assertCodec(bytes.length >= offset + 32, "creator decode out of bounds");
   const creator = bytes.slice(offset, offset + 32);
   offset += 32;
-  const is_closed = bytes[offset] === 1;
+  const [creator_lock, nextCreatorLockOffset] = decodeScript(bytes, offset);
+  offset = nextCreatorLockOffset;
+  const is_closed = decodeBool(bytes, offset, "is_closed");
   offset += 1;
   const total_voters = decodeUint64(bytes, offset);
   offset += 8;
@@ -249,9 +296,14 @@ export function decodePollData(bytes: Uint8Array): PollData {
   offset += 8;
   const [counted_voter_lock_hashes, nextRegistryOffset] = decodeBytes32Vec(bytes, offset);
   offset = nextRegistryOffset;
-  const token_weighted = bytes[offset] === 1;
+  const token_weighted = decodeBool(bytes, offset, "token_weighted");
   offset += 1;
+  assertCodec(bytes.length >= offset + 32, "udt_type_hash decode out of bounds");
   const udt_type_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const shard_count = decodeUint32(bytes, offset);
+  offset += 4;
+  assertCodec(offset === bytes.length, "PollData has trailing bytes");
 
   return {
     question,
@@ -259,6 +311,7 @@ export function decodePollData(bytes: Uint8Array): PollData {
     vote_counts,
     deadline,
     creator,
+    creator_lock,
     is_closed,
     total_voters,
     creator_deposit,
@@ -266,6 +319,7 @@ export function decodePollData(bytes: Uint8Array): PollData {
     counted_voter_lock_hashes,
     token_weighted,
     udt_type_hash,
+    shard_count,
   };
 }
 
@@ -295,9 +349,10 @@ export function decodeVoteIntentData(bytes: Uint8Array): VoteIntentData {
   offset += 1;
   const voted_at_epoch = decodeUint64(bytes, offset);
   offset += 8;
-  const aggregated = bytes[offset] === 1;
+  const aggregated = decodeBool(bytes, offset, "aggregated");
   offset += 1;
-  const [refund_lock] = decodeScript(bytes, offset);
+  const [refund_lock, nextOffset] = decodeScript(bytes, offset);
+  assertCodec(nextOffset === bytes.length, "VoteIntentData has trailing bytes");
 
   return { poll_type_hash, voter_lock_hash, option_index, voted_at_epoch, aggregated, refund_lock };
 }
@@ -326,8 +381,104 @@ export function decodeDelegationData(bytes: Uint8Array): DelegationData {
   const poll_type_hash = bytes.slice(offset, offset + 32);
   offset += 32;
   const expires_epoch = decodeUint64(bytes, offset);
+  offset += 8;
+  assertCodec(offset === bytes.length, "DelegationData has trailing bytes");
 
   return { delegator_lock_hash, delegate_lock_hash, poll_type_hash, expires_epoch };
+}
+
+export function encodeTallyShardData(shard: TallyShardData): Uint8Array {
+  assertCodec(shard.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+  assertCodec(shard.shard_count > 0, "shard_count must be positive");
+  assertCodec(shard.shard_count <= 256, "shard_count exceeds protocol maximum");
+  assertCodec(shard.shard_id >= 0 && shard.shard_id < shard.shard_count, "shard_id must be inside shard_count");
+
+  return concat([
+    shard.poll_type_hash,
+    encodeUint32(shard.shard_id),
+    encodeUint32(shard.shard_count),
+    encodeUint64Vec(shard.vote_counts),
+    encodeUint64(shard.total_voters),
+    encodeBytes32Vec(shard.counted_voter_lock_hashes),
+    new Uint8Array([shard.finalized ? 1 : 0]),
+  ]);
+}
+
+export function decodeTallyShardData(bytes: Uint8Array): TallyShardData {
+  assertCodec(bytes.length >= 53, `TallyShardData too short: ${bytes.length}`);
+
+  let offset = 0;
+  const poll_type_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const shard_id = decodeUint32(bytes, offset);
+  offset += 4;
+  const shard_count = decodeUint32(bytes, offset);
+  offset += 4;
+  const [vote_counts, nextCountsOffset] = decodeUint64Vec(bytes, offset);
+  offset = nextCountsOffset;
+  const total_voters = decodeUint64(bytes, offset);
+  offset += 8;
+  const [counted_voter_lock_hashes, nextRegistryOffset] = decodeBytes32Vec(bytes, offset);
+  offset = nextRegistryOffset;
+  assertCodec(bytes.length > offset, "finalized decode out of bounds");
+  const finalized = decodeBool(bytes, offset, "finalized");
+  offset += 1;
+  assertCodec(shard_count > 0, "shard_count must be positive");
+  assertCodec(shard_count <= 256, "shard_count exceeds protocol maximum");
+  assertCodec(shard_id < shard_count, "shard_id must be inside shard_count");
+  assertCodec(offset === bytes.length, "TallyShardData has trailing bytes");
+
+  return {
+    poll_type_hash,
+    shard_id,
+    shard_count,
+    vote_counts,
+    total_voters,
+    counted_voter_lock_hashes,
+    finalized,
+  };
+}
+
+export function encodeTallyMergeResultData(result: TallyMergeResultData): Uint8Array {
+  assertCodec(result.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+  assertCodec(result.coverage.length === 32, "coverage must be 32 bytes");
+
+  return concat([
+    result.poll_type_hash,
+    result.coverage,
+    encodeUint64Vec(result.vote_counts),
+    encodeUint64(result.total_voters),
+    encodeUint32(result.merge_level),
+    encodeUint32(result.version),
+  ]);
+}
+
+export function decodeTallyMergeResultData(bytes: Uint8Array): TallyMergeResultData {
+  assertCodec(bytes.length >= 80, `TallyMergeResultData too short: ${bytes.length}`);
+
+  let offset = 0;
+  const poll_type_hash = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const coverage = bytes.slice(offset, offset + 32);
+  offset += 32;
+  const [vote_counts, nextCountsOffset] = decodeUint64Vec(bytes, offset);
+  offset = nextCountsOffset;
+  const total_voters = decodeUint64(bytes, offset);
+  offset += 8;
+  const merge_level = decodeUint32(bytes, offset);
+  offset += 4;
+  const version = decodeUint32(bytes, offset);
+  offset += 4;
+  assertCodec(offset === bytes.length, "TallyMergeResultData has trailing bytes");
+
+  return {
+    poll_type_hash,
+    coverage,
+    vote_counts,
+    total_voters,
+    merge_level,
+    version,
+  };
 }
 
 export function hexToBytes(hex: string): Uint8Array {

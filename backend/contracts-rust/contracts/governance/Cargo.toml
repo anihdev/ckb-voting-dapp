@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ckb-hash = { workspace = true }
 ckb-std = { workspace = true }
 
 [features]

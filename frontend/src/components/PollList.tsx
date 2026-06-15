@@ -1,14 +1,18 @@
 /**
  * PollList Component
  * ==================
- * Lists polls and exposes simple active/closed filtering.
+ * Lists polls with lifecycle-aware filtering and archive access.
  */
 
 import React, { useState } from "react";
 import { Poll, TxState } from "../lib/types";
 import { VoteOnPoll } from "./VoteOnPoll";
-
-type Filter = "all" | "active" | "closed";
+import {
+  filterPollsByLifecycle,
+  getPollFilterCounts,
+  getPollLifecycleStatus,
+  PollLifecycleFilter,
+} from "../lib/protocolUi";
 
 interface Props {
   polls: Poll[];
@@ -20,8 +24,11 @@ interface Props {
   currentEpoch: bigint;
   onVote: (poll: Poll, optionIndex: number, authorityId?: string, weightUnits?: number) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
+  onFinalizeShards: (poll: Poll) => Promise<string>;
+  onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
+  onRefundClosedIntent: (poll: Poll) => Promise<string>;
   onRefresh: () => void;
   onConnectWallet: () => void;
   onDelegateForPoll: (pollId: string) => void;
@@ -37,13 +44,16 @@ export function PollList({
   currentEpoch,
   onVote,
   onAggregate,
+  onFinalizeShards,
+  onMergeShards,
   onClose,
   onForceClose,
+  onRefundClosedIntent,
   onRefresh,
   onConnectWallet,
   onDelegateForPoll,
 }: Props) {
-  const [filter, setFilter] = useState<Filter>("all");
+  const [filter, setFilter] = useState<PollLifecycleFilter>("open");
   const [copiedPollId, setCopiedPollId] = useState<string | null>(null);
   const isInitialLoading = loading && polls.length === 0;
   const hasNoPolls = polls.length === 0;
@@ -74,34 +84,31 @@ export function PollList({
     }
   };
 
-  const filteredPolls = polls.filter((poll) => {
-    if (filter === "active") return !poll.isClosed && currentEpoch <= poll.deadline;
-    if (filter === "closed") return poll.isClosed || currentEpoch > poll.deadline;
-    return true;
-  });
+  const filteredPolls = filterPollsByLifecycle(polls, filter, currentEpoch);
+  const filterCounts = getPollFilterCounts(polls, currentEpoch);
 
-  const pollStatus = (poll: Poll): "active" | "expired" | "closed" => {
-    if (poll.isClosed) return "closed";
-    if (currentEpoch > poll.deadline) return "expired";
-    return "active";
+  const pollStatus = (poll: Poll): "open" | "needsClose" | "archived" => {
+    return getPollLifecycleStatus(poll, currentEpoch);
   };
 
   const pollAnchorId = (poll: Poll) =>
     `poll-${poll.id.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24)}-${poll.outPoint.index}`;
 
-  const tabs: Array<{ key: Filter; label: string; count: number }> = [
-    { key: "all", label: "All", count: polls.length },
-    {
-      key: "active",
-      label: "Active",
-      count: polls.filter((poll) => !poll.isClosed && currentEpoch <= poll.deadline).length,
-    },
-    {
-      key: "closed",
-      label: "Closed",
-      count: polls.filter((poll) => poll.isClosed || currentEpoch > poll.deadline).length,
-    },
+  const tabs: Array<{ key: PollLifecycleFilter; label: string; count: number }> = [
+    { key: "open", label: "Open", count: filterCounts.open },
+    { key: "needsClose", label: "Needs Close", count: filterCounts.needsClose },
+    { key: "archived", label: "Archived", count: filterCounts.archived },
+    { key: "all", label: "All", count: filterCounts.all },
   ];
+
+  const emptyFilterMessage =
+    filter === "open"
+      ? "No open polls in the current registry view."
+      : filter === "needsClose"
+        ? "No expired polls currently need close or force-close."
+        : filter === "archived"
+          ? "No archived closed polls are indexed."
+          : "No polls in this filter.";
 
   return (
     <div>
@@ -215,13 +222,14 @@ export function PollList({
         </div>
       ) : !isInitialLoading && filteredPolls.length === 0 ? (
         <div className="card-shell py-14 text-center subtle">
-          <div className="font-medium" style={{ color: "var(--ink)" }}>No polls in this filter.</div>
-          <div className="mt-1 text-sm">Switch tabs to view active or closed proposals.</div>
+          <div className="font-medium" style={{ color: "var(--ink)" }}>{emptyFilterMessage}</div>
+          <div className="mt-1 text-sm">Archived and needs-close polls remain available from the lifecycle tabs.</div>
         </div>
       ) : !isInitialLoading ? (
         <div className="space-y-4">
           <div className="alert alert-info">
-            Aggregation processes pending vote intents and updates poll tally state on-chain.
+            Shard aggregation processes pending vote intents before the deadline and updates shard tally state on-chain.
+            Closed polls are archived by default but remain accessible from the Archived or All tabs.
           </div>
           <div className="table-shell">
             <div className="table-mobile-hint">Swipe horizontally to copy Poll ID.</div>
@@ -248,9 +256,9 @@ export function PollList({
                         <div className="mt-1 font-mono text-[10px] subtle">{poll.id.slice(0, 16)}...</div>
                       </td>
                       <td>
-                        {status === "closed" && <span className="status-pill status-closed">Closed</span>}
-                        {status === "expired" && <span className="status-pill status-expired">Expired</span>}
-                        {status === "active" && <span className="status-pill status-active">Active</span>}
+                        {status === "archived" && <span className="status-pill status-closed">Archived</span>}
+                        {status === "needsClose" && <span className="status-pill status-expired">Needs Close</span>}
+                        {status === "open" && <span className="status-pill status-active">Open</span>}
                       </td>
                       <td className="text-xs subtle">
                         <div>Now: {currentEpoch.toString()}</div>
@@ -309,8 +317,11 @@ export function PollList({
               txState={txState}
               onVote={onVote}
               onAggregate={onAggregate}
+              onFinalizeShards={onFinalizeShards}
+              onMergeShards={onMergeShards}
               onClose={onClose}
               onForceClose={onForceClose}
+              onRefundClosedIntent={onRefundClosedIntent}
               currentEpoch={currentEpoch}
             />
           ))}

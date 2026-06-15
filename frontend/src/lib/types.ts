@@ -10,6 +10,23 @@ export interface CellRef {
   index: number;
 }
 
+export type TallyFrontierSource =
+  | "poll-cell"
+  | "live-shards"
+  | "merge-frontier"
+  | "complete-merge"
+  | "closed-poll";
+
+export interface TallyFrontierMetadata {
+  source: TallyFrontierSource;
+  coveredShardCount: number;
+  shardCount: number;
+  coverageComplete: boolean;
+  selectedMergeResultIds: string[];
+  selectedShardIds: number[];
+  uncoveredShardIds: number[];
+}
+
 export interface Poll {
   id: string;
   outPoint: CellRef;
@@ -23,12 +40,18 @@ export interface Poll {
   totalVoters: bigint;
   creatorDeposit: bigint;
   pendingIntentCount: bigint;
+  protocolPendingIntentCount: bigint;
   tokenWeighted: boolean;
   udtTypeHash: string;
+  shardCount: number;
+  tallyShards: TallyShard[];
+  tallyMergeResults: TallyMergeResult[];
+  tallyFrontier: TallyFrontierMetadata;
   totalVotes: bigint;
   winnerIndex: number | null;
   authorityOptions: VoteAuthorityOption[];
   outstandingIntentCount: number;
+  refundableIntentCount: number;
 }
 
 export interface VoteIntent {
@@ -39,6 +62,30 @@ export interface VoteIntent {
   optionIndex: number;
   votedAtEpoch: bigint;
   aggregated: boolean;
+  capacity: bigint;
+}
+
+export interface TallyShard {
+  id: string;
+  pollId: string;
+  outPoint: CellRef;
+  shardId: number;
+  shardCount: number;
+  voteCounts: bigint[];
+  totalVoters: bigint;
+  finalized: boolean;
+  capacity: bigint;
+}
+
+export interface TallyMergeResult {
+  id: string;
+  pollId: string;
+  outPoint: CellRef;
+  coverage: string;
+  voteCounts: bigint[];
+  totalVoters: bigint;
+  mergeLevel: number;
+  version: number;
   capacity: bigint;
 }
 
@@ -61,6 +108,7 @@ export interface DelegationRecord {
   pollId: string | null;
   expiresEpoch: bigint;
   capacity: bigint;
+  isDelegator: boolean;
 }
 
 export interface DelegateParams {

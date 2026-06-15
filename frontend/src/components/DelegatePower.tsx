@@ -51,7 +51,7 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke, pref
       <div className="mb-4">
         <h2 className="section-title">Delegation</h2>
         <p className="subtle mt-1 text-sm">
-          Delegation authorizes another address to create intents for you (globally or per poll). It grants authority, not ownership, and can be revoked by consuming the delegation cell.
+          Delegation authorizes another address to create intents for you (globally or per poll). Delegated voting uses the live delegation cell as a read-only cell dep; only the delegator can revoke by consuming the delegation cell.
         </p>
         <p className="subtle mt-2 text-sm">
           Delegation cells lock at least 61 CKB and may require more occupied capacity depending on script size.
@@ -126,18 +126,24 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke, pref
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <div className="text-sm font-medium text-[var(--ink)]">
-                      Delegate: {delegation.delegateLockHash.slice(0, 14)}...
+                      {delegation.isDelegator
+                        ? `Delegate: ${delegation.delegateLockHash.slice(0, 14)}...`
+                        : `Delegator: ${delegation.delegatorLockHash.slice(0, 14)}...`}
                     </div>
                     <div className="mt-1 text-xs subtle">
                       Scope: {delegation.pollId ?? "Global"} | Expiry: {delegation.expiresEpoch.toString()}
                     </div>
                   </div>
-                  <button
-                    onClick={() => onRevoke(delegation.id)}
-                    className="btn-danger"
-                  >
-                    Revoke
-                  </button>
+                  {delegation.isDelegator ? (
+                    <button
+                      onClick={() => onRevoke(delegation.id)}
+                      className="btn-danger"
+                    >
+                      Revoke
+                    </button>
+                  ) : (
+                    <span className="status-pill status-active">Authority only</span>
+                  )}
                 </div>
               </div>
             ))}

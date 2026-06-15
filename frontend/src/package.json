@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
-    "test": "vitest run --root ../.. tests/contract.test.ts tests/molecule.test.ts"
+    "test": "vitest run --root ../.. tests/contract.test.ts tests/molecule.test.ts tests/zk-completeness.test.ts"
   },
   "dependencies": {
     "@ckb-ccc/connector-react": "^1.0.0",
