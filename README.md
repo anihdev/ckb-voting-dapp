@@ -383,8 +383,6 @@ CKB-VM/testtool coverage has started under `backend/contracts-rust/integration-t
 - `pending_intent_count` is not yet strict end-to-end accounting; close currently treats it as a lower-bound invariant. Current guarantee: deposits are recoverable through validated refund paths. Current limitation: tally completeness is coordinator/indexer-dependent until the protocol adds strict on-chain pending accounting, per-shard pending registries, a canonical intent commitment with a proof/indexer model, or later ZK-assisted completeness proofs.
 - Current ZK completeness research is tracked in `ZK_COMPLETENESS_DESIGN.md`; deterministic TypeScript model helpers now cover normalized intent records, live-intent normalization, per-shard/window commitment roots, commitment-set hashing, and public-input packing, but there is no Groth16 verifier integration or on-chain vote-completeness guarantee yet. The older `zk_plan.md` is retained only as historical context for pre-sharding aggregation work.
 - Token-weighted mode uses CKB-capacity weight units with a cap (`MAX_WEIGHT_UNITS_PER_INTENT`); xUDT-weighted voting is not implemented yet.
-- Indexing is direct RPC/indexer querying and does not yet include a dedicated aggregation coordinator or historical analytics service.
-- VM tests now cover the current non-ZK sharded lifecycle at the lock/type-script level, but they are still a focused harness rather than a full devnet deployment rehearsal. Frontend builder parity, indexer behavior under live RPC conditions, broad randomized/fuzz malformed-data coverage, and operational aggregation coordination still need more validation before production readiness claims.
 
 ## Roadmap
 
@@ -392,8 +390,6 @@ CKB-VM/testtool coverage has started under `backend/contracts-rust/integration-t
 
 - started: separate `backend/contracts-rust/integration-tests/` crate using `ckb-testtool = "1.1"` and the built `target/riscv64imac-unknown-none-elf/release/governance-contract` binary
 - covered in VM: Type ID-backed poll creation, vote intent creation, read-only delegation voting, revocation, shard aggregation, shard finalization, direct small-poll close, bounded merge results, large-poll merge-result close, post-close refunds, adversarial same-index lock/type bypass rejection, legacy non-sharded aggregation compatibility, and focused malformed-codec/capacity/authorization failures
-- remaining runtime work: controlled local devnet rehearsal, frontend transaction-builder parity against live RPC/indexer data, broader malformed-data/property coverage, and aggregation coordinator/indexer operational tests
-- do not claim production runtime confidence until VM coverage is paired with controlled local devnet or testnet rehearsal of the same lifecycle
 
 ### Phase 1: CKB-native extensions
 
