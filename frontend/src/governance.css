@@ -717,6 +717,19 @@
 
 .governance-theme .protocol-cell {
   padding: 14px 16px;
+  min-width: 0;
+}
+
+.governance-theme .protocol-op {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  line-height: 1.35;
+  margin-bottom: 3px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .governance-theme .protocol-cell:not(:last-child) {
@@ -982,6 +995,15 @@
 
   .governance-theme .protocol-strip {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .governance-theme .protocol-cell {
+    padding: 12px 10px;
+  }
+
+  .governance-theme .protocol-op {
+    font-size: 9px;
+    letter-spacing: 0.02em;
   }
 
 }

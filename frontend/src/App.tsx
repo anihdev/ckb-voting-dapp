@@ -328,15 +328,7 @@ function InnerApp() {
                 >
                   {step.state === "completed" ? "Done" : step.state === "live" ? "Live" : "Pending"}
                 </div>
-                <div
-                  style={{
-                    fontFamily: "var(--font-mono)",
-                    fontSize: 10,
-                    color: "var(--ink-3)",
-                    marginBottom: 3,
-                    letterSpacing: "0.06em",
-                  }}
-                >
+                <div className="protocol-op">
                   {step.op}
                 </div>
                 <div style={{ fontSize: 12, fontWeight: 500, color: step.state === "pending" ? "var(--ink-2)" : "var(--ink)" }}>
