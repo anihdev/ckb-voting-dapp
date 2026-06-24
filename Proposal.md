@@ -86,3 +86,11 @@ Reviewers should come away able to confirm that:
 ## Project Status
 
 This grant funds the next phase of an already-working protocol, not a project starting from zero. The poll lifecycle, vote intent cells, sharded aggregation, merge-close, delegation, permissionless maintenance, and deposit-safe refunds are implemented and covered by current test suites today. This phase adds the community/membership layer that turns the existing protocol into infrastructure other CKB applications can build on.
+
+
+
+do you think i can come up with something and participate in this hackathon? what do you suggest i should go in that can be sophisticated and meet the criterias given limited time, I'm leaning towards track 4, regardless of timeline too i need sophisteceted ideas 
+
+https://qwencloud-hackathon.devpost.com/rules
+
+https://qwencloud-hackathon.devpost.com/

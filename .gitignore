@@ -62,9 +62,11 @@ z_contracts/
 !phase_b_weekly_update.md
 !phase_c_weekly_update.md
 !phase_d_contention_weekly_update.md
+!phase_e_dao_builder_sdk_weekly_update.md
 !zk_plan.md
 !SHARDED_AGGREGATION_EXPLAINED.md
 !Proposal.md
+!Sdk_Proposal.md
 #CONTENTION_FIRST_MVP_PLAN.md
 #ZK_COMPLETENESS_DESIGN.md
 #ZK_COMPLETENESS_AGENT.md
