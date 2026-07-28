@@ -41,6 +41,11 @@ jobs:
           target: riscv64imac-unknown-none-elf
           components: rustfmt
 
+      - name: Install RISC-V C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-riscv64-unknown-elf
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

@@ -234,12 +234,16 @@ Prerequisites:
 - Node.js 20.19 or newer;
 - pnpm 10 or newer;
 - the repository Rust toolchain;
-- `riscv64imac-unknown-none-elf` Rust target.
+- `riscv64imac-unknown-none-elf` Rust target;
+- a RISC-V bare-metal C compiler providing `riscv64-unknown-elf-gcc`
+  (`gcc-riscv64-unknown-elf` on Ubuntu/Debian).
 
 ```bash
 corepack enable
 pnpm install
 rustup target add riscv64imac-unknown-none-elf
+sudo apt-get update
+sudo apt-get install --yes gcc-riscv64-unknown-elf
 ```
 
 Frontend environment:
