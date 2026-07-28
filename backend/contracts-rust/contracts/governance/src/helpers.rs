@@ -10,15 +10,24 @@ use ckb_std::{
     ckb_types::{bytes::Bytes, packed::Script, prelude::*},
     high_level::{
         load_cell_capacity, load_cell_lock, load_cell_lock_hash, load_cell_type,
-        load_cell_type_hash, load_header_epoch_number, load_script, load_witness_args,
+        load_cell_type_hash, load_header_epoch_number, load_input_since, load_script,
+        load_witness_args,
     },
 };
 
 use crate::{
     codec::{EncodedScript, PollData, TallyShardData},
-    constants::{MAX_DURATION_EPOCHS, MIN_DURATION_EPOCHS},
+    constants::MAX_DEADLINE_EPOCH,
     error::Error,
 };
+
+const SINCE_RELATIVE_FLAG: u64 = 1 << 63;
+const SINCE_METRIC_MASK: u64 = 0x6000_0000_0000_0000;
+const SINCE_EPOCH_METRIC: u64 = 0x2000_0000_0000_0000;
+const SINCE_RESERVED_FLAGS_MASK: u64 = 0x1f00_0000_0000_0000;
+const SINCE_VALUE_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+const EPOCH_NUMBER_MASK: u64 = (1u64 << 24) - 1;
+const EPOCH_INDEX_MASK: u64 = (1u64 << 16) - 1;
 
 /// @notice Converts boolean checks into contract validation results.
 /// @dev Keeps call sites compact while preserving explicit error mapping.
@@ -30,20 +39,47 @@ pub fn assert_condition(condition: bool, err: Error) -> Result<(), Error> {
     }
 }
 
-/// @notice Reads the current epoch number from header deps.
-/// @dev Header dep `0` is treated as the chain tip reference for governance timing.
-pub fn current_epoch() -> Result<u64, Error> {
-    // Match the TypeScript reference: read the latest epoch from header deps.
-    Ok(load_header_epoch_number(0, Source::HeaderDep)?)
+/// Validate that a poll deadline can be represented by the required
+/// strictly-after-deadline absolute epoch `since` lower bound.
+pub fn validate_deadline_epoch(deadline: u64) -> Result<(), Error> {
+    assert_condition(deadline <= MAX_DEADLINE_EPOCH, Error::Validation)
 }
 
-/// @notice Validates poll duration bounds against the current epoch.
-/// @dev Duration is `deadline - epoch` and must stay within configured min/max.
-pub fn validate_duration(deadline: u64, epoch: u64) -> Result<(), Error> {
-    assert_condition(deadline > epoch, Error::Validation)?;
-    let duration = deadline - epoch;
-    assert_condition(duration >= MIN_DURATION_EPOCHS, Error::Validation)?;
-    assert_condition(duration <= MAX_DURATION_EPOCHS, Error::Validation)
+/// Load the authenticated creation epoch of a transaction input.
+///
+/// `Source::Input` resolves the header linked to that input cell's creating
+/// transaction. The transaction must list that exact header in `header_deps`;
+/// unlike `Source::HeaderDep`, the caller cannot substitute another canonical
+/// header to change the returned epoch.
+pub fn load_input_creation_epoch(index: usize) -> Result<u64, Error> {
+    Ok(load_header_epoch_number(index, Source::Input)?)
+}
+
+/// Require the exact global input's `since` to be an absolute epoch lower
+/// bound strictly after `epoch`.
+///
+/// Consensus enforces the lower bound. The contract additionally parses the
+/// raw flags and epoch fraction so malformed, relative, or wrong-metric values
+/// cannot satisfy a lifecycle transition merely by being numerically large.
+pub fn require_input_since_strictly_after(index: usize, epoch: u64) -> Result<(), Error> {
+    let minimum_epoch = epoch.checked_add(1).ok_or(Error::Validation)?;
+    assert_condition(minimum_epoch <= EPOCH_NUMBER_MASK, Error::Validation)?;
+
+    let raw = load_input_since(index, Source::Input)?;
+    assert_condition(raw & SINCE_RELATIVE_FLAG == 0, Error::Validation)?;
+    assert_condition(
+        raw & SINCE_METRIC_MASK == SINCE_EPOCH_METRIC,
+        Error::Validation,
+    )?;
+    assert_condition(raw & SINCE_RESERVED_FLAGS_MASK == 0, Error::Validation)?;
+
+    let value = raw & SINCE_VALUE_MASK;
+    let epoch_number = value & EPOCH_NUMBER_MASK;
+    let epoch_index = (value >> 24) & EPOCH_INDEX_MASK;
+    let epoch_length = (value >> 40) & EPOCH_INDEX_MASK;
+    assert_condition(epoch_length > 0, Error::Validation)?;
+    assert_condition(epoch_index < epoch_length, Error::Validation)?;
+    assert_condition(epoch_number >= minimum_epoch, Error::Validation)
 }
 
 /// @notice Loads output capacity from a given output index.
@@ -111,6 +147,12 @@ pub fn load_group_input_script(index: usize) -> Result<EncodedScript, Error> {
 /// @notice Decodes a cell-dep lock script into the internal encoded representation.
 pub fn load_cell_dep_script(index: usize) -> Result<EncodedScript, Error> {
     decode_loaded_script(load_cell_lock(index, Source::CellDep)?)
+}
+
+/// @notice Loads a cell-dep lock hash as a fixed 32-byte value.
+pub fn load_cell_dep_lock_hash_bytes(index: usize) -> Result<[u8; 32], Error> {
+    let bytes = load_cell_lock_hash(index, Source::CellDep)?;
+    bytes.as_ref().try_into().map_err(|_| Error::Encoding)
 }
 
 /// @notice Decodes a cell-dep type script into the internal encoded representation.

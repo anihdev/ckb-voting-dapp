@@ -23,6 +23,7 @@ import {
   assertRpcUrl,
   requirePrivateKey,
 } from "./config";
+import { waitForCommittedTransaction } from "./tx-lifecycle";
 
 const SHANNONS_PER_CKB = 100_000_000n;
 const MIN_SECP_CELL_SHANNONS = 61n * SHANNONS_PER_CKB;
@@ -115,15 +116,6 @@ function ensureDistinctOrThrow(keys: string[]): void {
   }
 }
 
-async function waitForTx(client: any, txHash: string): Promise<void> {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const tx = await client.getTransaction(txHash);
-    if (tx) return;
-  }
-  throw new Error(`Timed out waiting for ${txHash}`);
-}
-
 function ckbToShannons(ckb: bigint): bigint {
   return ckb * SHANNONS_PER_CKB;
 }
@@ -167,8 +159,8 @@ async function ensureMinimumBalance(
   await tx.completeFeeBy(fundingSigner, 1000);
   await fundingSigner.signTransaction(tx);
   const txHash = await fundingSigner.client.sendTransaction(tx);
+  await waitForCommittedTransaction(fundingSigner.client, txHash);
   console.log(`${ROLE_LABEL} funded ${targetLabel}: +${transferCapacity} shannons (${txHash})`);
-  await waitForTx(fundingSigner.client, txHash);
 }
 
 async function main(): Promise<void> {
@@ -222,7 +214,7 @@ async function main(): Promise<void> {
   fs.writeFileSync(file, updatedEnv, "utf8");
   console.log(`${ROLE_LABEL} role keys written to ${file}${rotateKeys ? " (rotated)" : ""}`);
 
-  const client = new ccc.ClientPublicTestnet({ url: RPC_URL });
+  const client = new ccc.ClientPublicTestnet({ url: RPC_URL, fallbacks: [RPC_URL] as any });
   const creatorSigner = new ccc.SignerCkbPrivateKey(client, bundle.creator);
   const creatorBalance = BigInt(await creatorSigner.getBalance());
   const requiredForRoles =

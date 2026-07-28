@@ -1,9 +1,12 @@
+/// This script is used to top up the creator's account with CKB for testing purposes.
+
 import { ccc } from '@ckb-ccc/core';
 import { config as load } from 'dotenv';
 import * as path from 'path';
+import { waitForCommittedTransaction } from './tx-lifecycle';
 load({ path: path.resolve(__dirname, '../../.env') });
 
-const rpc = process.env.CKB_RPC_URL || process.env.VITE_CKB_RPC_URL || 'https://testnet.ckb.dev/rpc';
+const rpc = process.env.CKB_RPC_URL || process.env.VITE_CKB_RPC_URL || 'https://testnet.ckb.dev/';
 const client = new ccc.ClientPublicTestnet({ url: rpc, fallbacks: [rpc] as any });
 
 const creatorKey = (process.env.CREATOR_PRIVATE_KEY || '').trim();
@@ -12,15 +15,6 @@ if (!creatorKey || voterKeys.length < 2) throw new Error('Missing keys in .env')
 
 const from = new ccc.SignerCkbPrivateKey(client, voterKeys[1]);
 const to = new ccc.SignerCkbPrivateKey(client, creatorKey);
-
-async function waitForTx(txHash: string): Promise<void> {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const tx = await client.getTransaction(txHash);
-    if (tx) return;
-  }
-  throw new Error(`Timed out waiting for ${txHash}`);
-}
 
 async function withRpcRetry<T>(label: string, task: () => Promise<T>): Promise<T> {
   let lastError: unknown;
@@ -52,6 +46,6 @@ async function withRpcRetry<T>(label: string, task: () => Promise<T>): Promise<T
   const txHash = await withRpcRetry("sendTransaction", () => client.sendTransaction(tx));
   console.log(`TOPUP_TX=${txHash}`);
   console.log(`TOPUP_AMOUNT_SHANNONS=${amount}`);
-  await waitForTx(txHash);
+  await waitForCommittedTransaction(client, txHash);
   console.log(`TOPUP_CONFIRMED=${txHash}`);
 })();

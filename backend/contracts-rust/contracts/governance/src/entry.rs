@@ -22,13 +22,14 @@ use crate::{
     error::Error,
     helpers::{
         assert_condition, compare_arrays, compare_scripts, compare_slice_items, compare_vec_bytes,
-        count_unique_counted_voters, count_unique_shard_voters, current_epoch,
-        derive_tally_shard_id, first_input_type_byte, load_cell_dep_script,
+        count_unique_counted_voters, count_unique_shard_voters, derive_tally_shard_id,
+        first_input_type_byte, load_cell_dep_lock_hash_bytes, load_cell_dep_script,
         load_cell_dep_type_script, load_current_script, load_group_input_script,
-        load_group_output_script, load_input_capacity, load_input_lock_hash_bytes,
-        load_input_script, load_input_type_hash_bytes, load_input_type_script,
-        load_output_capacity, load_output_lock_hash_bytes, load_output_script,
-        load_output_type_hash_bytes, load_output_type_script, min_poll_capacity, validate_duration,
+        load_group_output_script, load_input_capacity, load_input_creation_epoch,
+        load_input_lock_hash_bytes, load_input_script, load_input_type_hash_bytes,
+        load_input_type_script, load_output_capacity, load_output_lock_hash_bytes,
+        load_output_script, load_output_type_hash_bytes, load_output_type_script,
+        min_poll_capacity, require_input_since_strictly_after, validate_deadline_epoch,
     },
 };
 
@@ -47,7 +48,7 @@ pub fn main() -> Result<(), Error> {
     match op {
         OP_CREATE_POLL => validate_poll_lifecycle(),
         OP_CREATE_VOTE_INTENT => validate_intent_lifecycle(),
-        OP_AGGREGATE_VOTES => validate_aggregate_votes(),
+        OP_RETIRED_AGGREGATE_VOTES => Err(Error::UnknownOp),
         OP_CLOSE_POLL => {
             if current_lock_can_defer_to_same_index_protocol_type_update()? {
                 Ok(())
@@ -56,7 +57,7 @@ pub fn main() -> Result<(), Error> {
             }
         }
         OP_DELEGATE => validate_delegation_lifecycle(),
-        OP_REVOKE_DELEGATION => validate_revoke_delegation(),
+        OP_RETIRED_REVOKE_DELEGATION => Err(Error::UnknownOp),
         OP_CREATE_TALLY_SHARD => validate_tally_shard_lifecycle(),
         OP_MERGE_TALLY_SHARDS => validate_tally_merge_lifecycle(),
         _ => Err(Error::UnknownOp),
@@ -73,6 +74,32 @@ fn maybe_group_cell_data(source: Source) -> Result<Option<Vec<u8>>, Error> {
         Err(SysError::IndexOutOfBound) => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+fn assert_single_group_cell(source: Source) -> Result<(), Error> {
+    match load_cell_data(1, source) {
+        Err(SysError::IndexOutOfBound) => Ok(()),
+        Ok(_) => Err(Error::Validation),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn group_cell_count(source: Source) -> Result<usize, Error> {
+    let mut count = 0usize;
+    loop {
+        match load_cell_data(count, source) {
+            Ok(_) => count = count.checked_add(1).ok_or(Error::Validation)?,
+            Err(SysError::IndexOutOfBound) => return Ok(count),
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn assert_equal_group_input_output_counts() -> Result<(), Error> {
+    assert_condition(
+        group_cell_count(Source::GroupInput)? == group_cell_count(Source::GroupOutput)?,
+        Error::Validation,
+    )
 }
 
 fn same_index_type_scripts(index: usize) -> Result<Option<(EncodedScript, EncodedScript)>, Error> {
@@ -394,22 +421,31 @@ fn assert_intent_transition_has_aggregation_anchor(
     )?;
     match anchor_type.args.first().copied() {
         Some(OP_CREATE_TALLY_SHARD) => assert_intent_transition_has_matching_shard(intent),
-        Some(OP_CREATE_POLL) => {
-            let poll = decode_poll(&load_cell_data(0, Source::Input)?)?;
-            let poll_type_hash = load_input_type_hash_bytes(0)?;
-            assert_condition(
-                compare_arrays(&poll_type_hash, &intent.poll_type_hash),
-                Error::Validation,
-            )?;
-            // Modern polls are sharded; legacy poll-cell aggregation is only
-            // left as a transitional path for non-sharded historical cells.
-            assert_condition(poll.shard_count == 0, Error::Validation)
-        }
         _ => Err(Error::Validation),
     }
 }
 
-/// Intent cells may only disappear without a corresponding output during a close path.
+fn poll_close_has_creator_authorization(poll: &PollData) -> Result<bool, Error> {
+    match load_input_lock_hash_bytes(1) {
+        Ok(lock_hash) => Ok(compare_arrays(&lock_hash, &poll.creator)),
+        Err(Error::IndexOutOfBound) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn require_poll_close_since(poll: &PollData, creator_authorized: bool) -> Result<(), Error> {
+    let threshold = if creator_authorized {
+        poll.deadline
+    } else {
+        poll.deadline
+            .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
+            .ok_or(Error::Validation)?
+    };
+    require_input_since_strictly_after(0, threshold)
+}
+
+/// Intent cells may only disappear without a corresponding output during a
+/// validated poll close, a post-close refund, or an immediate late refund.
 ///
 /// This prevents a future permissionless lock from turning `input present /
 /// output absent` into a free-spend path outside the refund-enforced close flow.
@@ -422,7 +458,6 @@ fn validate_intent_consumption_without_output(input: &[u8]) -> Result<(), Error>
             let after_poll = decode_poll(&output_poll)?;
             let poll_type_hash = load_input_type_hash_bytes(0)?;
             let output_poll_type_hash = load_output_type_hash_bytes(0)?;
-            let epoch = current_epoch()?;
 
             assert_condition(
                 compare_arrays(&intent.poll_type_hash, &poll_type_hash),
@@ -434,27 +469,38 @@ fn validate_intent_consumption_without_output(input: &[u8]) -> Result<(), Error>
             )?;
             assert_condition(!before_poll.is_closed, Error::Validation)?;
             assert_condition(after_poll.is_closed, Error::Validation)?;
-            assert_condition(epoch > before_poll.deadline, Error::Validation)?;
-
-            let creator_authorized = match load_input_lock_hash_bytes(1) {
-                Ok(lock_hash) => compare_arrays(&lock_hash, &before_poll.creator),
-                Err(Error::IndexOutOfBound) => false,
-                Err(err) => return Err(err),
-            };
-            if !creator_authorized {
-                let allow_epoch = before_poll
-                    .deadline
-                    .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
-                    .ok_or(Error::Validation)?;
-                assert_condition(epoch > allow_epoch, Error::Validation)?;
-            }
+            let creator_authorized = poll_close_has_creator_authorization(&before_poll)?;
+            require_poll_close_since(&before_poll, creator_authorized)?;
 
             return Ok(());
         }
     }
 
-    let poll = ensure_poll_dep_closed(&intent.poll_type_hash)?;
-    assert_condition(poll.is_closed, Error::Validation)?;
+    let poll = match ensure_poll_dep_closed(&intent.poll_type_hash) {
+        Ok(poll) => poll,
+        Err(Error::Validation) => ensure_poll_dep_unclosed(&intent.poll_type_hash)?,
+        Err(err) => return Err(err),
+    };
+
+    if !poll.is_closed {
+        // Immediate late-refund transactions pin the intent as global input 0.
+        // Source::Input then authenticates its creation block; HeaderDep(0)
+        // cannot be substituted to make a late intent look timely.
+        // Aggregated markers may themselves be created after the deadline even
+        // when their underlying intent was timely, so they remain locked until
+        // poll close and must never enter this pending-intent refund branch.
+        assert_condition(!intent.aggregated, Error::Validation)?;
+        let global_input = load_cell_data(0, Source::Input)?;
+        assert_condition(compare_vec_bytes(&global_input, input), Error::Validation)?;
+        let current_script = load_current_script()?;
+        let input_type = load_input_type_script(0)?;
+        assert_condition(
+            compare_scripts(&current_script, &input_type),
+            Error::Validation,
+        )?;
+        let creation_epoch = load_input_creation_epoch(0)?;
+        assert_condition(creation_epoch > poll.deadline, Error::Validation)?;
+    }
 
     let output_lock = load_output_script(0)?;
     let output_capacity = load_output_capacity(0)?;
@@ -511,7 +557,6 @@ fn ensure_delegation_dep_live(
     delegator_lock_hash: &[u8; 32],
     delegate_lock_hash: &[u8; 32],
     poll_type_hash: &[u8; 32],
-    epoch: u64,
 ) -> Result<EncodedScript, Error> {
     let mut dep_index = 0usize;
     loop {
@@ -522,8 +567,12 @@ fn ensure_delegation_dep_live(
                     let type_script = load_cell_dep_type_script(dep_index)?;
                     if compare_arrays(&delegation.delegator_lock_hash, delegator_lock_hash)
                         && compare_arrays(&delegation.delegate_lock_hash, delegate_lock_hash)
+                        && compare_arrays(
+                            &load_cell_dep_lock_hash_bytes(dep_index)?,
+                            &delegation.delegator_lock_hash,
+                        )
                         && delegation_scope_matches(&delegation, poll_type_hash)
-                        && (delegation.expires_epoch == 0 || epoch <= delegation.expires_epoch)
+                        && delegation.expires_epoch == 0
                         && script_is_governance_op(&type_script, OP_DELEGATE)?
                         && script_scope_matches(&type_script, &delegation.poll_type_hash)
                     {
@@ -540,8 +589,7 @@ fn ensure_delegation_dep_live(
     Err(Error::Validation)
 }
 
-/// Decide whether the poll group operation is a creation, an aggregation,
-/// or a close, then call the matching validator.
+/// Decide whether the poll group operation is a creation or close.
 ///
 /// Decision is based on whether the type-group has input and/or output cells.
 fn validate_poll_lifecycle() -> Result<(), Error> {
@@ -554,17 +602,25 @@ fn validate_poll_lifecycle() -> Result<(), Error> {
             decode_poll(&output)?; // validate encoding
             validate_create_poll()
         }
-        // Both input and output exist => either aggregate or close transition.
+        // New deployments only permit the poll's open -> closed transition.
         (Some(input), Some(output)) => {
+            check_type_id(1)?;
+            let current_script = load_current_script()?;
+            assert_condition(
+                compare_scripts(&load_input_type_script(0)?, &current_script),
+                Error::Validation,
+            )?;
+            assert_condition(
+                compare_scripts(&load_output_type_script(0)?, &current_script),
+                Error::Validation,
+            )?;
             let before = decode_poll(&input)?;
             let after = decode_poll(&output)?;
 
-            // If poll moved from open -> closed then it's a close, otherwise
-            // it's an aggregation update of vote counts.
             if !before.is_closed && after.is_closed {
                 validate_close_poll()
             } else {
-                validate_aggregate_votes()
+                Err(Error::Validation)
             }
         }
         // Any other pattern is invalid for poll transitions.
@@ -581,11 +637,15 @@ fn validate_intent_lifecycle() -> Result<(), Error> {
     match (group_input, group_output) {
         // New intent created (no input, output present)
         (None, Some(output)) => {
+            assert_single_group_cell(Source::GroupOutput)?;
             decode_vote_intent(&output)?;
             validate_create_vote_intent()
         }
         // Intent marked aggregated: both input+output present.
-        (Some(input), Some(output)) => validate_intent_aggregation_transition(&input, &output),
+        (Some(input), Some(output)) => {
+            assert_equal_group_input_output_counts()?;
+            validate_intent_aggregation_transition(&input, &output)
+        }
         // Intent consumed without output (simple consumption)
         (Some(input), None) => {
             if current_lock_can_defer_to_same_index_protocol_type_update()? {
@@ -597,20 +657,22 @@ fn validate_intent_lifecycle() -> Result<(), Error> {
     }
 }
 
-/// Validate delegation creation or revocation by inspecting the group
-/// inputs/outputs. Creation = no input, output present. Revoke = input consumed.
+/// Validate delegation creation or revocation under the OP_DELEGATE type
+/// family. Creation = no input, output present. Revoke = input consumed.
 fn validate_delegation_lifecycle() -> Result<(), Error> {
     let group_input = maybe_group_cell_data(Source::GroupInput)?;
     let group_output = maybe_group_cell_data(Source::GroupOutput)?;
 
     match (group_input, group_output) {
         (None, Some(output)) => {
+            assert_single_group_cell(Source::GroupOutput)?;
             decode_delegation(&output)?;
             validate_delegate()
         }
         (Some(input), None) => {
+            assert_single_group_cell(Source::GroupInput)?;
             decode_delegation(&input)?;
-            validate_revoke_delegation()
+            validate_delegation_revocation()
         }
         _ => Err(Error::Validation),
     }
@@ -730,7 +792,7 @@ fn validate_intent_aggregation_transition(input: &[u8], output: &[u8]) -> Result
 ///
 /// This protects intent creation against referencing a nonexistent or closed
 /// poll by enforcing the poll cell as a cell-dependency.
-fn ensure_poll_dep_open(poll_type_hash: &[u8; 32], epoch: u64) -> Result<PollData, Error> {
+fn ensure_poll_dep_open(poll_type_hash: &[u8; 32]) -> Result<PollData, Error> {
     let mut matched_poll: Option<PollData> = None;
     let mut dep_index = 0usize;
     loop {
@@ -739,9 +801,9 @@ fn ensure_poll_dep_open(poll_type_hash: &[u8; 32], epoch: u64) -> Result<PollDat
                 if compare_arrays(&type_hash, poll_type_hash) {
                     let poll_bytes = load_cell_data(dep_index, Source::CellDep)?;
                     let poll = decode_poll(&poll_bytes)?;
-                    // Poll must still be open and not past its deadline.
+                    // Intent creation can authenticate poll lifecycle state,
+                    // but not the output cell's eventual inclusion epoch.
                     assert_condition(!poll.is_closed, Error::Validation)?;
-                    assert_condition(epoch <= poll.deadline, Error::Validation)?;
                     matched_poll = Some(poll);
                     break;
                 }
@@ -778,10 +840,7 @@ fn ensure_poll_dep_unclosed(poll_type_hash: &[u8; 32]) -> Result<PollData, Error
     matched_poll.ok_or(Error::Validation)
 }
 
-fn ensure_created_output_poll_open(
-    poll_type_hash: &[u8; 32],
-    epoch: u64,
-) -> Result<PollData, Error> {
+fn ensure_created_output_poll_open(poll_type_hash: &[u8; 32]) -> Result<PollData, Error> {
     let output_poll_type_script = load_output_type_script(0)?;
     let current_script = load_current_script()?;
     assert_condition(
@@ -805,7 +864,6 @@ fn ensure_created_output_poll_open(
     let poll_bytes = load_cell_data(0, Source::Output)?;
     let poll = decode_poll(&poll_bytes)?;
     assert_condition(!poll.is_closed, Error::Validation)?;
-    assert_condition(epoch <= poll.deadline, Error::Validation)?;
     Ok(poll)
 }
 
@@ -826,22 +884,6 @@ fn assert_no_matching_poll_input(poll_type_hash: &[u8; 32]) -> Result<(), Error>
         index += 1;
     }
     Ok(())
-}
-
-/// Convert an intent's locked capacity into vote weight units.
-///
-/// If the poll is not token-weighted this always returns `1`. For token-
-/// weighted polls the number of units is `capacity / VOTER_DEPOSIT_SHANNONS`
-/// capped by `MAX_WEIGHT_UNITS_PER_INTENT`.
-fn intent_vote_weight_units(intent_capacity: u64, token_weighted: bool) -> Result<u64, Error> {
-    if !token_weighted {
-        return Ok(1);
-    }
-
-    // Compute raw units and enforce a minimum/upper-bound.
-    let units = intent_capacity / VOTER_DEPOSIT_SHANNONS;
-    assert_condition(units > 0, Error::Validation)?;
-    Ok(core::cmp::min(units, MAX_WEIGHT_UNITS_PER_INTENT))
 }
 
 fn assert_initial_tally_shard_data(
@@ -912,7 +954,6 @@ fn validate_create_poll() -> Result<(), Error> {
     let current_script = load_current_script()?;
     let creator_auth_lock_hash = load_input_lock_hash_bytes(0)?;
     let creator_auth_lock = load_input_script(0)?;
-    let epoch = current_epoch()?;
 
     assert_condition(
         compare_scripts(&output_type, &current_script),
@@ -938,6 +979,11 @@ fn validate_create_poll() -> Result<(), Error> {
     assert_condition(poll.shard_count > 0, Error::Validation)?;
     assert_condition(poll.shard_count <= MAX_TALLY_SHARDS, Error::Validation)?;
     assert_condition(!poll.is_closed, Error::Validation)?;
+    assert_condition(!poll.token_weighted, Error::Validation)?;
+    assert_condition(
+        compare_arrays(&poll.udt_type_hash, &[0u8; 32]),
+        Error::Validation,
+    )?;
     assert_condition(
         compare_arrays(&poll.creator, &creator_auth_lock_hash),
         Error::Validation,
@@ -954,7 +1000,10 @@ fn validate_create_poll() -> Result<(), Error> {
         Error::Validation,
     )?;
     assert_condition(count_unique_counted_voters(&poll), Error::Validation)?;
-    validate_duration(poll.deadline, epoch)?;
+    // The VM cannot authenticate the eventual inclusion epoch of this output.
+    // Builders enforce duration policy; the contract only requires a deadline
+    // that can later be enforced with an absolute epoch `since` value.
+    validate_deadline_epoch(poll.deadline)?;
 
     for option in &poll.options {
         assert_condition(!option.is_empty(), Error::Validation)?;
@@ -1001,7 +1050,6 @@ fn validate_create_tally_shard() -> Result<(), Error> {
     let current_script = load_current_script()?;
     let output_lock = load_group_output_script(0)?;
     let output_capacity = load_cell_capacity(0, Source::GroupOutput)?;
-    let epoch = current_epoch()?;
 
     assert_condition(current_script.args.len() == 37, Error::Validation)?;
     assert_condition(
@@ -1033,7 +1081,7 @@ fn validate_create_tally_shard() -> Result<(), Error> {
     )?;
 
     assert_no_matching_poll_input(&shard.poll_type_hash)?;
-    let poll = ensure_created_output_poll_open(&shard.poll_type_hash, epoch)?;
+    let poll = ensure_created_output_poll_open(&shard.poll_type_hash)?;
     assert_initial_tally_shard_data(&shard, &poll, &script_poll_type_hash, shard.shard_id)?;
 
     // One exact shard type script may appear in this type group. Duplicate
@@ -1133,8 +1181,7 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
     let before = decode_tally_shard(input)?;
     let after = decode_tally_shard(output)?;
     let (poll, _, _) = assert_tally_shard_group_update_policy(&before, &after)?;
-    let epoch = current_epoch()?;
-    assert_condition(epoch <= poll.deadline, Error::Validation)?;
+    assert_condition(!poll.token_weighted, Error::Validation)?;
     assert_condition(!before.finalized, Error::Validation)?;
     assert_condition(!after.finalized, Error::Validation)?;
 
@@ -1214,6 +1261,8 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
             (before_intent.option_index as usize) < poll.options.len(),
             Error::Validation,
         )?;
+        let creation_epoch = load_input_creation_epoch(global_index)?;
+        assert_condition(creation_epoch <= poll.deadline, Error::Validation)?;
 
         let derived_shard_id = derive_tally_shard_id(
             &before_intent.poll_type_hash,
@@ -1228,10 +1277,9 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
             Error::Validation,
         )?;
 
-        let weight = intent_vote_weight_units(input_intent_capacity, poll.token_weighted)?;
         let option_index = before_intent.option_index as usize;
         deltas[option_index] = deltas[option_index]
-            .checked_add(weight)
+            .checked_add(1)
             .ok_or(Error::Validation)?;
         seen_voters.push(before_intent.voter_lock_hash);
         batch_voters.push(before_intent.voter_lock_hash);
@@ -1282,12 +1330,11 @@ fn validate_finalize_tally_shard(
     after: &TallyShardData,
 ) -> Result<(), Error> {
     assert_tally_shard_group_update_policy(before, after)?;
-    let epoch = current_epoch()?;
     let poll = ensure_poll_dep_unclosed(&before.poll_type_hash)?;
 
     assert_condition(!before.finalized, Error::Validation)?;
     assert_condition(after.finalized, Error::Validation)?;
-    assert_condition(epoch > poll.deadline, Error::Validation)?;
+    require_input_since_strictly_after(0, poll.deadline)?;
     assert_condition(
         compare_slice_items(&after.vote_counts, &before.vote_counts),
         Error::Validation,
@@ -1863,7 +1910,6 @@ fn validate_create_vote_intent() -> Result<(), Error> {
     let output_lock = load_output_script(0)?;
     let output_type = load_output_type_script(0)?;
     let current_script = load_current_script()?;
-    let epoch = current_epoch()?;
 
     assert_condition(!intent.aggregated, Error::Validation)?;
     assert_condition(intent.option_index == witness_option, Error::Validation)?;
@@ -1886,28 +1932,27 @@ fn validate_create_vote_intent() -> Result<(), Error> {
     )?;
     assert_intent_lock_matches_policy(&output_lock, &intent.poll_type_hash)?;
 
-    // The referenced poll must be provided as a cell dep and still be open at
-    // the tip epoch, so stale/forged poll references cannot create intents.
-    let poll = ensure_poll_dep_open(&intent.poll_type_hash, epoch)?;
+    // The referenced poll must be provided as an open cell dep. An output's
+    // eventual inclusion epoch is unknowable here, so the authenticated cutoff
+    // is enforced when the intent input is aggregated or refunded.
+    let poll = ensure_poll_dep_open(&intent.poll_type_hash)?;
+    assert_condition(!poll.token_weighted, Error::Validation)?;
     assert_condition(
         (intent.option_index as usize) < poll.options.len(),
         Error::Validation,
     )?;
-    assert_condition(intent.voted_at_epoch == epoch, Error::Validation)?;
-    if poll.token_weighted {
-        let max_weighted_intent_capacity = VOTER_DEPOSIT_SHANNONS
-            .checked_mul(MAX_WEIGHT_UNITS_PER_INTENT)
-            .ok_or(Error::Validation)?;
-        // Strict cap mode: weighted intents above the cap are rejected so
-        // extra locked CKB cannot buy additional influence.
-        assert_condition(
-            intent_capacity <= max_weighted_intent_capacity,
-            Error::Validation,
-        )?;
-    }
-
     let signer_lock_hash = load_input_lock_hash_bytes(0)?;
     let signer_lock = load_input_script(0)?;
+    // The proposer is a neutral lifecycle authority in v1 and cannot submit
+    // either their own intent or an intent on another voter's behalf.
+    assert_condition(
+        !compare_arrays(&intent.voter_lock_hash, &poll.creator),
+        Error::Validation,
+    )?;
+    assert_condition(
+        !compare_arrays(&signer_lock_hash, &poll.creator),
+        Error::Validation,
+    )?;
     if compare_arrays(&intent.voter_lock_hash, &signer_lock_hash) {
         return assert_condition(
             compare_scripts(&intent.refund_lock, &signer_lock),
@@ -1919,215 +1964,9 @@ fn validate_create_vote_intent() -> Result<(), Error> {
         &intent.voter_lock_hash,
         &signer_lock_hash,
         &intent.poll_type_hash,
-        epoch,
     )?;
     assert_condition(
         compare_scripts(&intent.refund_lock, &delegation_refund_lock),
-        Error::Validation,
-    )
-}
-
-/// @notice Validates AGGREGATE_VOTES transition invariants.
-/// @dev Enforces poll immutables, intent-to-poll binding, unique voter counting, and weighted deltas.
-fn validate_aggregate_votes() -> Result<(), Error> {
-    let input_poll = load_cell_data(0, Source::Input)?;
-    let output_poll = load_cell_data(0, Source::Output)?;
-    let before = decode_poll(&input_poll)?;
-    let after = decode_poll(&output_poll)?;
-    let epoch = current_epoch()?;
-    let poll_type_hash = load_input_type_hash_bytes(0)?;
-
-    // Sharded polls use TallyShard cells as the active aggregation state.
-    // This legacy poll-cell path remains only for non-sharded historical cells.
-    assert_condition(before.shard_count == 0, Error::Validation)?;
-    assert_condition(!before.is_closed, Error::Validation)?;
-    assert_condition(epoch <= before.deadline, Error::Validation)?;
-    assert_condition(
-        compare_vec_bytes(&after.question, &before.question),
-        Error::Validation,
-    )?;
-    assert_condition(
-        compare_slice_items(&after.options, &before.options),
-        Error::Validation,
-    )?;
-    assert_condition(after.deadline == before.deadline, Error::Validation)?;
-    assert_condition(
-        compare_arrays(&after.creator, &before.creator),
-        Error::Validation,
-    )?;
-    assert_condition(
-        compare_scripts(&after.creator_lock, &before.creator_lock),
-        Error::Validation,
-    )?;
-    assert_condition(
-        after.creator_deposit == before.creator_deposit,
-        Error::Validation,
-    )?;
-    assert_condition(!after.is_closed, Error::Validation)?;
-    assert_condition(
-        after.token_weighted == before.token_weighted,
-        Error::Validation,
-    )?;
-    assert_condition(
-        compare_arrays(&after.udt_type_hash, &before.udt_type_hash),
-        Error::Validation,
-    )?;
-    assert_condition(
-        after.vote_counts.len() == before.vote_counts.len(),
-        Error::Validation,
-    )?;
-    assert_condition(count_unique_counted_voters(&after), Error::Validation)?;
-
-    let mut seen_voters = before.counted_voter_lock_hashes.clone();
-    let mut batch_voters: Vec<[u8; 32]> = Vec::new();
-    let mut deltas = alloc::vec![0u64; before.options.len()];
-    let mut intent_count = 0usize;
-
-    // Track how many intent rows we have paired so fee/change rows can be
-    // skipped without consuming the bounded intent budget.
-    let mut matched_intents = 0usize;
-    let mut index = 1usize;
-    loop {
-        if matched_intents >= MAX_INTENTS_PER_AGG {
-            break;
-        }
-        let input = match load_cell_data(index, Source::Input) {
-            Ok(data) => data,
-            Err(SysError::IndexOutOfBound) => break,
-            Err(err) => return Err(err.into()),
-        };
-
-        // Allow non-intent fee/change inputs in aggregate transactions.
-        // We only process rows where both input/output look like intent cells.
-        //
-        // This avoids forcing tx builders to use "exactly poll+intent inputs"
-        // and prevents accidental decode failures on plain CKB capacity cells.
-        let output = match load_cell_data(index, Source::Output) {
-            Ok(data) => data,
-            Err(SysError::IndexOutOfBound) => {
-                let maybe_input_intent = decode_vote_intent(&input).ok();
-                if let Some(intent) = maybe_input_intent {
-                    if compare_arrays(&intent.poll_type_hash, &poll_type_hash) {
-                        return Err(Error::Validation);
-                    }
-                }
-                index += 1;
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let before_intent = match decode_vote_intent(&input) {
-            Ok(intent) => intent,
-            Err(_) => {
-                index += 1;
-                continue;
-            }
-        };
-        let after_intent = match decode_vote_intent(&output) {
-            Ok(intent) => intent,
-            Err(_) => {
-                if compare_arrays(&before_intent.poll_type_hash, &poll_type_hash) {
-                    return Err(Error::Validation);
-                }
-                index += 1;
-                continue;
-            }
-        };
-        let input_capacity = load_input_capacity(index)?;
-        let output_capacity = load_output_capacity(index)?;
-        let output_lock = load_output_script(index)?;
-
-        assert_condition(!before_intent.aggregated, Error::Validation)?;
-        assert_condition(after_intent.aggregated, Error::Validation)?;
-        assert_condition(
-            compare_arrays(
-                &after_intent.voter_lock_hash,
-                &before_intent.voter_lock_hash,
-            ),
-            Error::Validation,
-        )?;
-        assert_condition(
-            compare_arrays(&after_intent.poll_type_hash, &before_intent.poll_type_hash),
-            Error::Validation,
-        )?;
-        assert_condition(
-            compare_arrays(&before_intent.poll_type_hash, &poll_type_hash),
-            Error::Validation,
-        )?;
-        assert_condition(
-            after_intent.option_index == before_intent.option_index,
-            Error::Validation,
-        )?;
-        assert_condition(
-            after_intent.voted_at_epoch == before_intent.voted_at_epoch,
-            Error::Validation,
-        )?;
-        assert_condition(
-            compare_scripts(&after_intent.refund_lock, &before_intent.refund_lock),
-            Error::Validation,
-        )?;
-        assert_intent_lock_matches_policy(&output_lock, &before_intent.poll_type_hash)?;
-        assert_condition(output_capacity >= input_capacity, Error::Validation)?;
-        assert_condition(
-            (before_intent.option_index as usize) < before.options.len(),
-            Error::Validation,
-        )?;
-        assert_condition(
-            !seen_voters
-                .iter()
-                .any(|existing| existing == &before_intent.voter_lock_hash),
-            Error::Validation,
-        )?;
-
-        let weight = intent_vote_weight_units(input_capacity, before.token_weighted)?;
-        deltas[before_intent.option_index as usize] = deltas[before_intent.option_index as usize]
-            .checked_add(weight)
-            .ok_or(Error::Validation)?;
-        seen_voters.push(before_intent.voter_lock_hash);
-        batch_voters.push(before_intent.voter_lock_hash);
-        intent_count += 1;
-        matched_intents += 1;
-        index += 1;
-    }
-
-    assert_condition(intent_count > 0, Error::Validation)?;
-    assert_condition(
-        after.counted_voter_lock_hashes.len()
-            == before.counted_voter_lock_hashes.len() + batch_voters.len(),
-        Error::Validation,
-    )?;
-
-    for (index, voter) in before.counted_voter_lock_hashes.iter().enumerate() {
-        assert_condition(
-            compare_arrays(&after.counted_voter_lock_hashes[index], voter),
-            Error::Validation,
-        )?;
-    }
-    for (offset, voter) in batch_voters.iter().enumerate() {
-        let next_index = before.counted_voter_lock_hashes.len() + offset;
-        assert_condition(
-            compare_arrays(&after.counted_voter_lock_hashes[next_index], voter),
-            Error::Validation,
-        )?;
-    }
-    for (index, previous_count) in before.vote_counts.iter().enumerate() {
-        let expected = previous_count
-            .checked_add(deltas[index])
-            .ok_or(Error::Validation)?;
-        assert_condition(after.vote_counts[index] == expected, Error::Validation)?;
-    }
-
-    let expected_total = before
-        .total_voters
-        .checked_add(u64::try_from(intent_count).map_err(|_| Error::Validation)?)
-        .ok_or(Error::Validation)?;
-    assert_condition(after.total_voters == expected_total, Error::Validation)?;
-    assert_condition(
-        after.total_voters == after.counted_voter_lock_hashes.len() as u64,
-        Error::Validation,
-    )?;
-    assert_condition(
-        after.pending_intent_count <= before.pending_intent_count,
         Error::Validation,
     )
 }
@@ -2139,15 +1978,11 @@ fn validate_close_poll() -> Result<(), Error> {
     let output_poll = load_cell_data(0, Source::Output)?;
     let before = decode_poll(&input_poll)?;
     let after = decode_poll(&output_poll)?;
-    let epoch = current_epoch()?;
     let poll_type_hash = load_input_type_hash_bytes(0)?;
     let input_poll_lock = load_input_script(0)?;
     let output_poll_lock = load_output_script(0)?;
     let creator_return_lock = load_output_script(1)?;
     let creator_return_capacity = load_output_capacity(1)?;
-
-    // Polls can only be closed after they have actually ended.
-    assert_condition(epoch > before.deadline, Error::Validation)?;
 
     assert_condition(!before.is_closed, Error::Validation)?;
     assert_condition(after.is_closed, Error::Validation)?;
@@ -2203,35 +2038,15 @@ fn validate_close_poll() -> Result<(), Error> {
     // Mode selection:
     // 1) creator close: input[1] lock hash matches poll.creator
     // 2) permissionless recovery: allowed only after deadline + grace period
-    let creator_authorized = match load_input_lock_hash_bytes(1) {
-        Ok(lock_hash) => compare_arrays(&lock_hash, &before.creator),
-        Err(Error::IndexOutOfBound) => false,
-        Err(err) => return Err(err),
-    };
-    if !creator_authorized {
-        let allow_epoch = before
-            .deadline
-            .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
-            .ok_or(Error::Validation)?;
-        assert_condition(epoch > allow_epoch, Error::Validation)?;
-    }
+    let creator_authorized = poll_close_has_creator_authorization(&before)?;
+    require_poll_close_since(&before, creator_authorized)?;
 
     let first_after_auth_input = if creator_authorized { 2usize } else { 1usize };
     let consumed_tally_inputs = if before.shard_count > MAX_DIRECT_CLOSE_SHARDS {
         validate_merged_close_result(&before, &after, &poll_type_hash, first_after_auth_input, 2)?
-    } else if before.shard_count > 0 {
-        validate_sharded_close_result(&before, &after, &poll_type_hash, first_after_auth_input, 2)?
     } else {
-        assert_condition(after.total_voters == before.total_voters, Error::Validation)?;
-        assert_condition(after.vote_counts == before.vote_counts, Error::Validation)?;
-        assert_condition(
-            compare_slice_items(
-                &after.counted_voter_lock_hashes,
-                &before.counted_voter_lock_hashes,
-            ),
-            Error::Validation,
-        )?;
-        0
+        assert_condition(before.shard_count > 0, Error::Validation)?;
+        validate_sharded_close_result(&before, &after, &poll_type_hash, first_after_auth_input, 2)?
     };
 
     let mut output_index = 2usize
@@ -2294,6 +2109,12 @@ fn validate_delegate() -> Result<(), Error> {
     let output_lock = load_output_script(0)?;
     let output_type = load_output_type_script(0)?;
     let output_capacity = load_output_capacity(0)?;
+    let current_script = load_current_script()?;
+
+    assert_condition(
+        compare_scripts(&output_type, &current_script),
+        Error::Validation,
+    )?;
 
     assert_condition(
         compare_arrays(&delegation.delegator_lock_hash, &delegator_lock_hash),
@@ -2325,27 +2146,31 @@ fn validate_delegate() -> Result<(), Error> {
         ),
         Error::Validation,
     )?;
-    if delegation.expires_epoch > 0 {
-        assert_condition(
-            delegation.expires_epoch > current_epoch()?,
-            Error::Validation,
-        )?;
-    }
+    // v1 delegations are revocation-based. The serialized expiry field is
+    // retained for codec compatibility but nonzero values are not executable.
+    assert_condition(delegation.expires_epoch == 0, Error::Validation)?;
     assert_condition(
         output_capacity >= DELEGATION_MIN_SHANNONS,
         Error::Validation,
     )
 }
 
-/// @notice Validates REVOKE_DELEGATION consumption invariants.
+/// @notice Validates delegation-cell destruction under the OP_DELEGATE family.
 /// @dev Revocation keeps lock ownership and preserves minimum reclaimable capacity.
-fn validate_revoke_delegation() -> Result<(), Error> {
+fn validate_delegation_revocation() -> Result<(), Error> {
     let input = load_cell_data(0, Source::Input)?;
     let _delegation = decode_delegation(&input)?;
     let input_lock = load_input_script(0)?;
     let output_lock = load_output_script(0)?;
     let output_capacity = load_output_capacity(0)?;
     let input_capacity = load_input_capacity(0)?;
+    let input_type = load_input_type_script(0)?;
+    let current_script = load_current_script()?;
+
+    assert_condition(
+        compare_scripts(&input_type, &current_script),
+        Error::Validation,
+    )?;
 
     assert_condition(
         compare_scripts(&input_lock, &output_lock),

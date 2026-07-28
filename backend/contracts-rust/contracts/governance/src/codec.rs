@@ -42,6 +42,8 @@ pub struct VoteIntentData {
     pub poll_type_hash: [u8; 32],
     pub voter_lock_hash: [u8; 32],
     pub option_index: u8,
+    // Legacy caller-selected field retained to avoid a silent codec change.
+    // Consensus cutoff uses the authenticated input creation header instead.
     pub voted_at_epoch: u64,
     pub aggregated: bool,
     pub refund_lock: EncodedScript,
@@ -53,6 +55,7 @@ pub struct DelegationData {
     pub delegator_lock_hash: [u8; 32],
     pub delegate_lock_hash: [u8; 32],
     pub poll_type_hash: [u8; 32],
+    // Reserved for codec compatibility. v1 requires zero and uses revocation.
     pub expires_epoch: u64,
 }
 

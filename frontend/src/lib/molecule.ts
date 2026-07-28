@@ -26,6 +26,8 @@ export interface VoteIntentData {
   poll_type_hash: Uint8Array;
   voter_lock_hash: Uint8Array;
   option_index: number;
+  // Legacy codec field retained for compatibility. It is caller-selected and
+  // must never be used as consensus submission time.
   voted_at_epoch: bigint;
   aggregated: boolean;
   refund_lock: EncodedScript;
@@ -35,6 +37,7 @@ export interface DelegationData {
   delegator_lock_hash: Uint8Array;
   delegate_lock_hash: Uint8Array;
   poll_type_hash: Uint8Array;
+  // Reserved in v1. The contract requires zero and delegation ends by revoke.
   expires_epoch: bigint;
 }
 
@@ -110,6 +113,10 @@ function decodeUint64(bytes: Uint8Array, offset = 0): bigint {
     result = (result << 8n) | BigInt(bytes[offset + index]);
   }
   return result;
+}
+
+export function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
 }
 
 function encodeString(value: string): Uint8Array {

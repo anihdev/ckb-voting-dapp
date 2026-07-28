@@ -3,7 +3,7 @@
  * =============
  * Deploys the Rust-built governance ELF to CKB testnet.
  * The contract binary is stored in a cell's data field.
- * Its type hash becomes the "voting type script code_hash".
+ * Its data hash becomes the governance scripts' `data1` code hash.
  *
  * File: backend/deploy/deploy.ts
  * Run:  CKB_PRIVATE_KEY=0x... npx ts-node deploy/deploy.ts
@@ -27,6 +27,7 @@ import {
   assertRpcUrl,
   requirePrivateKey,
 } from "./config";
+import { waitForTransactionConfirmations } from "./tx-lifecycle";
 
 // ─── Read private key from environment ───────────────────────────────────────
 const PRIVATE_KEY = requirePrivateKey();
@@ -93,6 +94,9 @@ async function deploy(): Promise<void> {
   const contractData = ccc.bytesFrom(contractCode);
   const recycledInputs = parseRecycledOutPoints();
   if (recycledInputs.length > 0) {
+    console.warn(
+      "WARNING: recycling removes the old code dep. Do this only when no live historical data1 cells still require it."
+    );
     console.log("Recycling previous code cells:");
     for (const input of recycledInputs) {
       console.log(`  - ${input.previousOutput.txHash}:${input.previousOutput.index}`);
@@ -127,7 +131,7 @@ async function deploy(): Promise<void> {
   console.log(`Waiting for ${MIN_CONFIRMATIONS} confirmations...`);
   await waitForConfirmation(client, txHash, MIN_CONFIRMATIONS);
 
-  // 7. Derive the type hash of the code cell
+  // 7. Derive the data hash of the code cell
   //    code_hash = blake2b(data)  — this is what other scripts reference
   const codeHash = await computeDataHash(client, txHash, 0);
 
@@ -156,24 +160,21 @@ async function waitForConfirmation(
   txHash: string,
   minConf: number
 ): Promise<void> {
-  const POLL_INTERVAL = 5000; // 5 seconds
-  let attempts = 0;
-  while (true) {
-    await sleep(POLL_INTERVAL);
-    attempts++;
-    try {
-      const tx = await withRpcRetry("getTransaction.wait", () => client.getTransaction(txHash)) as any;
-      if (tx && (tx.timeAddedToPool || tx.txStatus || tx.transaction)) {
-        console.log(`  Confirmed after ~${attempts * 5}s`);
-        return;
-      }
-    } catch (_) {}
-    console.log(`  Waiting... (${attempts * 5}s elapsed)`);
-    if (attempts > 120) {
-      console.warn("  Timed out waiting for confirmation");
-      return;
-    }
-  }
+  const timeoutMs = 10 * 60 * 1000;
+  const result = await waitForTransactionConfirmations(client, txHash, {
+    confirmations: minConf,
+    timeoutMs,
+    pollIntervalMs: 5000,
+    transientRetries: RPC_RETRY_MAX - 1,
+    onTransientRetry: (retry, maxRetries) => {
+      console.log(
+        `[rpc-retry] confirmation polling retry ${retry}/${maxRetries}; transaction was already broadcast`
+      );
+    },
+  });
+  console.log(
+    `  Confirmed at block ${String((result as any).blockNumber ?? "unknown")} with requested depth ${minConf}`
+  );
 }
 
 /**

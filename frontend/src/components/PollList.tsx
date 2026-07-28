@@ -9,9 +9,14 @@ import { Poll, TxState } from "../lib/types";
 import { VoteOnPoll } from "./VoteOnPoll";
 import {
   filterPollsByLifecycle,
+  EpochPosition,
+  estimatePollCloseHours,
+  formatApproxWallClockDuration,
   getPollFilterCounts,
   getPollLifecycleStatus,
+  isPollVotingSupported,
   PollLifecycleFilter,
+  UNSUPPORTED_WEIGHTED_POLL_LABEL,
 } from "../lib/protocolUi";
 
 interface Props {
@@ -22,13 +27,15 @@ interface Props {
   voterLockHash: string | null;
   txState: TxState;
   currentEpoch: bigint;
-  onVote: (poll: Poll, optionIndex: number, authorityId?: string, weightUnits?: number) => Promise<string>;
+  currentEpochPosition?: EpochPosition;
+  onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
   onFinalizeShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
   onRefundClosedIntent: (poll: Poll) => Promise<string>;
+  onRefundLateIntent: (poll: Poll) => Promise<string>;
   onRefresh: () => void;
   onConnectWallet: () => void;
   onDelegateForPoll: (pollId: string) => void;
@@ -42,6 +49,7 @@ export function PollList({
   voterLockHash,
   txState,
   currentEpoch,
+  currentEpochPosition,
   onVote,
   onAggregate,
   onFinalizeShards,
@@ -49,6 +57,7 @@ export function PollList({
   onClose,
   onForceClose,
   onRefundClosedIntent,
+  onRefundLateIntent,
   onRefresh,
   onConnectWallet,
   onDelegateForPoll,
@@ -112,8 +121,8 @@ export function PollList({
 
   return (
     <div>
-      <div className="mb-4 flex items-center justify-between">
-        <div className="flex gap-1 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-1">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex w-full gap-1 overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--surface)] p-1 sm:w-auto">
           {tabs.map((tab) => (
             <button
               key={tab.key}
@@ -143,7 +152,7 @@ export function PollList({
         <button
           onClick={onRefresh}
           disabled={loading}
-          className="btn-quiet flex items-center gap-2 text-xs uppercase tracking-[0.12em]"
+          className="btn-quiet flex items-center gap-2 self-end text-xs uppercase sm:self-auto"
         >
           <span className={loading ? "animate-spin" : ""}>*</span>
           {loading ? "Loading..." : "Refresh"}
@@ -228,7 +237,7 @@ export function PollList({
       ) : !isInitialLoading ? (
         <div className="space-y-4">
           <div className="alert alert-info">
-            Shard aggregation processes pending vote intents before the deadline and updates shard tally state on-chain.
+            Shard aggregation processes timely vote intents before or after the deadline, until each shard is finalized.
             Closed polls are archived by default but remain accessible from the Archived or All tabs.
           </div>
           <div className="table-shell">
@@ -249,6 +258,12 @@ export function PollList({
                 {filteredPolls.map((poll) => {
                   const status = pollStatus(poll);
                   const anchorId = pollAnchorId(poll);
+                  const estimatedTimeToClose = formatApproxWallClockDuration(
+                    estimatePollCloseHours(
+                      poll.deadline,
+                      currentEpochPosition ?? { epoch: currentEpoch, index: 0n, length: 1n }
+                    )
+                  );
                   return (
                     <tr key={`row-${poll.id}`}>
                       <td>
@@ -263,14 +278,15 @@ export function PollList({
                       <td className="text-xs subtle">
                         <div>Now: {currentEpoch.toString()}</div>
                         <div>Deadline: {poll.deadline.toString()}</div>
+                        {status === "open" && <div>{estimatedTimeToClose} to close window</div>}
                       </td>
                       <td>
                         <div className="font-semibold" style={{ color: "var(--ink)" }}>{poll.totalVotes.toString()}</div>
                         <div className="text-[11px] subtle">{poll.totalVoters.toString()} voters</div>
                       </td>
                       <td className="font-semibold" style={{ color: "var(--ink)" }}>{poll.pendingIntentCount.toString()}</td>
-                      <td className="text-xs font-semibold uppercase tracking-[0.09em] subtle">
-                        {poll.tokenWeighted ? "Capped weighted" : "1p1v"}
+                      <td className="text-xs font-semibold uppercase subtle">
+                        {poll.tokenWeighted ? UNSUPPORTED_WEIGHTED_POLL_LABEL : "1p1v"}
                       </td>
                       <td>
                         <div className="flex flex-wrap gap-2">
@@ -290,7 +306,7 @@ export function PollList({
                           >
                             {copiedPollId === poll.id ? "Copied" : "Copy Poll ID"}
                           </button>
-                          {isConnected && (
+                          {isConnected && isPollVotingSupported(poll) && (
                             <button
                               onClick={() => onDelegateForPoll(poll.id)}
                               className="btn-quiet px-3 py-1.5 text-xs"
@@ -322,7 +338,9 @@ export function PollList({
               onClose={onClose}
               onForceClose={onForceClose}
               onRefundClosedIntent={onRefundClosedIntent}
+              onRefundLateIntent={onRefundLateIntent}
               currentEpoch={currentEpoch}
+              currentEpochPosition={currentEpochPosition}
             />
           ))}
         </div>

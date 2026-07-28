@@ -13,6 +13,8 @@ import {
   requireGovernanceHashes,
   requirePrivateKey,
 } from "./config";
+import { epochNumber } from "./epoch";
+import { waitForCommittedTransaction } from "./tx-lifecycle";
 
 const PRIVATE_KEY = requirePrivateKey();
 const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
@@ -130,14 +132,11 @@ async function findSignerAuthCell(signer: any, excludedOutPoints: string[] = [])
 /** @notice Resolves chain tip epoch in bigint format across client variants. */
 async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
-    const rawEpoch = await client.getTipEpoch();
-    if (typeof rawEpoch === "bigint") return rawEpoch;
-    if (typeof rawEpoch === "number") return BigInt(rawEpoch);
-    if (typeof rawEpoch === "string") return BigInt(rawEpoch.split(",")[0]);
+    return epochNumber(await client.getTipEpoch());
   }
 
   const tipHeader = await client.getTipHeader();
-  return BigInt(String(tipHeader.epoch).split(",")[0]);
+  return epochNumber(tipHeader.epoch);
 }
 
 /** @notice Seeds demo polls for hosted frontend smoke and UX validation. */
@@ -146,10 +145,9 @@ async function main(): Promise<void> {
   console.log(`RPC: ${RPC_URL}`);
   console.log(`Governance code hash: ${GOVERNANCE_CODE_HASH}`);
 
-  const client = new ccc.ClientPublicTestnet({ url: RPC_URL });
+  const client = new ccc.ClientPublicTestnet({ url: RPC_URL, fallbacks: [RPC_URL] as any });
   const signer = new ccc.SignerCkbPrivateKey(client, PRIVATE_KEY);
   const signerAddress = await signer.getAddressObjSecp256k1();
-  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const creatorLockHash = (ccc as any).bytesFrom(ccc.hashCkb(signerAddress.script.toBytes()));
   const pollScript = ccc.Script.from({
@@ -245,8 +243,6 @@ async function main(): Promise<void> {
           depType: "code",
         },
       ],
-      // The governance script reads the current epoch from header deps.
-      headerDeps: [tipHeader.hash],
       inputs: [{ previousOutput: getOutPoint(typeIdSeedCell), since: 0 }],
       outputs: [
         {
@@ -265,6 +261,7 @@ async function main(): Promise<void> {
     assertPinnedInput0(tx, typeIdSeedKey);
     await signer.signTransaction(tx);
     const txHash = await client.sendTransaction(tx);
+    await waitForCommittedTransaction(client, txHash);
 
     console.log(`Seeded poll ${index + 1}/${DEMO_POLLS.length}: ${txHash}`);
     existingPolls.add(pollKey);

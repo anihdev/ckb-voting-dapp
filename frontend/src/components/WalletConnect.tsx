@@ -50,7 +50,7 @@ export function WalletConnect() {
         <button
           onClick={connect}
           className="btn-primary"
-          style={{ borderRadius: 9999, padding: "9px 20px", fontSize: 12, letterSpacing: "0.06em" }}
+          style={{ borderRadius: 9999, padding: "9px 20px", fontSize: 12, letterSpacing: 0 }}
         >
           Connect Wallet
         </button>
@@ -63,7 +63,7 @@ export function WalletConnect() {
     <div className="wallet-shell wallet-shell-connected">
       <div className="wallet-address-pill">
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", lineHeight: 1.3 }}>
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: 0 }}>
             Available Balance
           </span>
           <span style={{ fontWeight: 600, color: "var(--teal)", fontSize: 13 }}>
@@ -100,7 +100,7 @@ export function WalletConnect() {
       <button
         onClick={disconnect}
         className="btn-danger"
-        style={{ borderRadius: 9999, padding: "8px 16px", fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase" }}
+        style={{ borderRadius: 9999, padding: "8px 16px", fontSize: 11, letterSpacing: 0, textTransform: "uppercase" }}
       >
         Disconnect
       </button>

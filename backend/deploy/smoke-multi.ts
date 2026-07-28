@@ -20,6 +20,7 @@ import {
   assertRpcUrl,
   requireGovernanceHashes,
 } from "./config";
+import { epochNumber, epochParts } from "./epoch";
 
 const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
 const SCRIPT_HASH_TYPE = "data1";
@@ -83,6 +84,8 @@ type CellRef = {
   outPoint: { txHash: string; index: number };
   cellOutput: { lock: any; type?: any; capacity: bigint };
   outputData: string;
+  creationBlockHash: string;
+  creationEpoch: bigint;
 };
 
 type ScenarioResult = {
@@ -416,14 +419,11 @@ function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, da
 
 async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
-    const rawEpoch = await client.getTipEpoch();
-    if (typeof rawEpoch === "bigint") return rawEpoch;
-    if (typeof rawEpoch === "number") return BigInt(rawEpoch);
-    if (typeof rawEpoch === "string") return BigInt(rawEpoch.split(",")[0]);
+    return epochNumber(await client.getTipEpoch());
   }
 
   const tipHeader = await client.getTipHeader();
-  return BigInt(String(tipHeader.epoch).split(",")[0]);
+  return epochNumber(tipHeader.epoch);
 }
 
 async function withRpcRetry<T>(label: string, task: () => Promise<T>): Promise<T> {
@@ -452,12 +452,13 @@ async function withRpcRetry<T>(label: string, task: () => Promise<T>): Promise<T
 }
 
 async function waitForTx(client: any, txHash: string): Promise<void> {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const tx = await withRpcRetry("getTransaction", () => client.getTransaction(txHash));
-    if (tx) return;
+  const committed = await withRpcRetry(
+    "waitTransaction",
+    () => client.waitTransaction(txHash, 0, 120_000, 3000)
+  );
+  if (!committed) {
+    throw new Error(`Timed out waiting for committed transaction ${txHash}`);
   }
-  throw new Error(`Timed out waiting for ${txHash}`);
 }
 
 async function headerByNumber(client: any, blockNumber: bigint): Promise<any> {
@@ -467,11 +468,12 @@ async function headerByNumber(client: any, blockNumber: bigint): Promise<any> {
 function epochLengthFromHeader(header: any): bigint {
   const epoch = header?.epoch;
   if (!epoch) return EPOCH_BLOCKS_FALLBACK;
-  if (Array.isArray(epoch) && epoch.length >= 3) {
-    const length = BigInt(epoch[2]);
+  try {
+    const length = epochParts(epoch).denominator;
     return length > 0n ? length : EPOCH_BLOCKS_FALLBACK;
+  } catch {
+    return EPOCH_BLOCKS_FALLBACK;
   }
-  return EPOCH_BLOCKS_FALLBACK;
 }
 
 async function findHeaderAfterEpoch(
@@ -480,7 +482,7 @@ async function findHeaderAfterEpoch(
   targetEpoch: bigint,
 ): Promise<any> {
   const startNumber = BigInt(startHeader.number);
-  const startEpoch = BigInt(Array.isArray(startHeader.epoch) ? startHeader.epoch[0] : 0);
+  const startEpoch = epochNumber(startHeader.epoch);
   const epochLen = epochLengthFromHeader(startHeader);
   if (targetEpoch <= startEpoch) return startHeader;
 
@@ -499,7 +501,7 @@ async function findHeaderAfterEpoch(
   while (low <= high) {
     const mid = (low + high) / 2n;
     const header = await headerByNumber(client, mid);
-    const epochNo = BigInt(Array.isArray(header.epoch) ? header.epoch[0] : 0);
+    const epochNo = epochNumber(header.epoch);
     if (epochNo >= targetEpoch) {
       candidate = header;
       if (mid === 0n) break;
@@ -509,7 +511,7 @@ async function findHeaderAfterEpoch(
     }
   }
 
-  const candidateEpoch = BigInt(Array.isArray(candidate.epoch) ? candidate.epoch[0] : 0);
+  const candidateEpoch = epochNumber(candidate.epoch);
   if (candidateEpoch < targetEpoch) {
     throw new Error(
       `unable to locate header at target epoch ${targetEpoch} (best=${candidateEpoch})`
@@ -528,6 +530,13 @@ async function loadCommittedCellRef(client: any, txHash: string, index: number):
   if (!output) {
     throw new Error(`Output ${index} missing in tx ${txHash}`);
   }
+  const resolved: any = await withRpcRetry(
+    "getCellWithHeader",
+    () => client.getCellWithHeader({ txHash, index })
+  );
+  if (!resolved?.header?.hash || resolved.header.epoch == null) {
+    throw new Error(`Creation header missing for committed output ${txHash}:${index}`);
+  }
   return {
     outPoint: { txHash, index },
     cellOutput: {
@@ -536,6 +545,8 @@ async function loadCommittedCellRef(client: any, txHash: string, index: number):
       capacity: BigInt(output.capacity),
     },
     outputData,
+    creationBlockHash: String(resolved.header.hash),
+    creationEpoch: epochNumber(resolved.header.epoch),
   };
 }
 
@@ -785,7 +796,6 @@ async function main(): Promise<void> {
   const forceCloserSigner = new ccc.SignerCkbPrivateKey(client, keys.forceCloser);
 
   const creatorAddress = await creatorSigner.getAddressObjSecp256k1();
-  const tipHeader = await withRpcRetry("getTipHeader", () => client.getTipHeader());
   const currentEpoch = await withRpcRetry("getTipEpoch", () => getTipEpoch(client));
   const creatorLockHash = lockHashBytes(creatorAddress.script);
   const smokeLabel = randomBytes(4).toString("hex");
@@ -862,7 +872,6 @@ async function main(): Promise<void> {
 
   const createPollTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
-    headerDeps: [tipHeader.hash],
     inputs: [{ previousOutput: getOutPoint(typeIdSeedCell), since: 0 }],
     outputs: [
       {
@@ -892,13 +901,12 @@ async function main(): Promise<void> {
     const voterSigner = voterSigners[index];
     const voterAddress = await voterSigner.getAddressObjSecp256k1();
     const voterLockHash = lockHashBytes(voterAddress.script);
-    const votedAtEpoch = await withRpcRetry("getTipEpoch", () => getTipEpoch(client));
     const optionIndex = index % 2;
     const intentData: VoteIntentData = {
       poll_type_hash: hexToBytes(pollTypeHash),
       voter_lock_hash: voterLockHash,
       option_index: optionIndex,
-      voted_at_epoch: votedAtEpoch,
+      voted_at_epoch: 0n,
       aggregated: false,
       refund_lock: normalizeScript(voterAddress.script),
     };
@@ -913,7 +921,6 @@ async function main(): Promise<void> {
         governanceCellDep(),
         { outPoint: pollCell.outPoint, depType: "code" },
       ],
-      headerDeps: [tipHeader.hash],
       inputs: [{
         previousOutput: {
           txHash: intentAuthCell.outPoint.txHash,
@@ -986,13 +993,23 @@ async function main(): Promise<void> {
         outPointKey(shardCell),
         ...voterIntentCells.map(outPointKey),
       ]);
+      for (const intentCell of voterIntentCells) {
+        if (intentCell.creationEpoch > pollData.deadline) {
+          throw new Error(`Late intent ${outPointKey(intentCell)} cannot be aggregated`);
+        }
+      }
+      const intentOriginHeaders = Array.from(
+        new Map(
+          voterIntentCells.map((cell) => [cell.creationBlockHash.toLowerCase(), cell.creationBlockHash])
+        ).values()
+      );
 
       const aggregateTx = ccc.Transaction.from({
         cellDeps: [
           governanceCellDep(),
           { outPoint: pollCell.outPoint, depType: "code" },
         ],
-        headerDeps: [tipHeader.hash],
+        headerDeps: intentOriginHeaders,
         inputs: [
           { previousOutput: shardCell.outPoint },
           ...voterIntentCells.map((intentCell) => ({ previousOutput: intentCell.outPoint })),
@@ -1031,24 +1048,12 @@ async function main(): Promise<void> {
       await waitForTx(client, aggregateHash);
       console.log(`CREATE_TALLY_SHARD aggregate: ${aggregateHash}`);
 
-      aggregatedShardCell = {
-        outPoint: { txHash: aggregateHash, index: 0 },
-        cellOutput: {
-          lock: shardCell.cellOutput.lock,
-          type: shardCell.cellOutput.type,
-          capacity: shardCell.cellOutput.capacity,
-        },
-        outputData: bytesToHex(updatedShardBytes),
-      };
-      aggregatedIntentCells = voterIntentCells.map((intentCell, index) => ({
-        outPoint: { txHash: aggregateHash, index: index + 1 },
-        cellOutput: {
-          lock: intentLock,
-          type: intentType,
-          capacity: intentCell.cellOutput.capacity,
-        },
-        outputData: aggregateOutputsData[index],
-      }));
+      aggregatedShardCell = await loadCommittedCellRef(client, aggregateHash, 0);
+      aggregatedIntentCells = await Promise.all(
+        voterIntentCells.map((_, index) =>
+          loadCommittedCellRef(client, aggregateHash, index + 1)
+        )
+      );
     }
   ));
 

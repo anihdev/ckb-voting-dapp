@@ -2,7 +2,7 @@
  * Frontend CKB Helpers
  * ====================
  * Contains protocol constants, script helpers, and lightweight transaction
- * builders aligned to the current six-operation governance contract. It also
+ * builders aligned to the current sharded governance lifecycle. It also
  * validates hosted runtime config so production deployments do not silently
  * boot with placeholder governance hashes.
  */
@@ -10,14 +10,17 @@ import { ccc } from "@ckb-ccc/core";
 import {
   CREATOR_DEPOSIT_SHANNONS,
   DELEGATION_MIN_SHANNONS,
-  MAX_WEIGHT_UNITS_PER_INTENT,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_SHARDS_PER_MERGE,
   MAX_TALLY_SHARDS,
   MERGE_COVERAGE_BYTES,
   MAX_DURATION_EPOCHS,
+  MAX_DEADLINE_EPOCH,
+  MAX_OPTION_BYTES,
   MAX_OPTIONS,
+  MAX_QUESTION_BYTES,
+  MIN_OPTIONS,
   MIN_DURATION_EPOCHS,
   OP,
   SHANNONS_PER_CKB,
@@ -40,11 +43,11 @@ import {
   decodeTallyMergeResultData,
   decodeVoteIntentData,
   encodeVoteIntentData,
+  utf8ByteLength,
 } from "./molecule";
 
 const SCRIPT_HASH_TYPE = "data1";
 const ZERO_HASH_32 = `0x${"00".repeat(32)}`;
-const AGGREGATE_FEE_RESERVE_SHANNONS = 1_000_000n;
 
 export const GOVERNANCE_CODE_HASH =
   (import.meta as any).env?.VITE_GOVERNANCE_CODE_HASH ??
@@ -56,7 +59,7 @@ export const GOVERNANCE_SCRIPT_TX_HASH =
 
 export const CKB_RPC_URL =
   (import.meta as any).env?.VITE_CKB_RPC_URL ??
-  "https://testnet.ckb.dev/rpc";
+  "https://testnet.ckb.dev/";
 
 export {
   OP,
@@ -65,17 +68,20 @@ export {
   VOTER_DEPOSIT_SHANNONS,
   DELEGATION_MIN_SHANNONS,
   TALLY_SHARD_MIN_SHANNONS,
-  MAX_WEIGHT_UNITS_PER_INTENT,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_SHARDS_PER_MERGE,
   MAX_TALLY_SHARDS,
   MERGE_COVERAGE_BYTES,
   MAX_OPTIONS,
+  MIN_OPTIONS,
+  MAX_QUESTION_BYTES,
+  MAX_OPTION_BYTES,
   MIN_DURATION_EPOCHS,
   MAX_DURATION_EPOCHS,
   ZERO_HASH_HEX,
   FORCE_CLOSE_GRACE_EPOCHS,
+  MAX_DEADLINE_EPOCH,
 };
 
 /**
@@ -141,34 +147,6 @@ export function estimateOutputCapacity(lockScript: any, typeScript: any | undefi
   const typeBytes = typeScript ? (ccc as any).Script.from(typeScript).toBytes().length : 0;
   const occupiedBytes = 8 + lockBytes + typeBytes + dataBytes + 32;
   return BigInt(occupiedBytes) * SHANNONS_PER_CKB;
-}
-
-function sanitizeWeightUnits(
-  requestedWeightUnits: number | undefined,
-  tokenWeighted: boolean
-): bigint {
-  const normalized = BigInt(requestedWeightUnits ?? 1);
-  if (normalized < 1n) {
-    throw new Error("Vote weight must be at least 1");
-  }
-  if (normalized > MAX_WEIGHT_UNITS_PER_INTENT) {
-    throw new Error(`Vote weight cannot exceed ${MAX_WEIGHT_UNITS_PER_INTENT.toString()} units`);
-  }
-  if (!tokenWeighted && normalized !== 1n) {
-    throw new Error("Weighted vote amounts are only valid for token-weighted polls");
-  }
-  return normalized;
-}
-
-function computeIntentWeightUnits(intentCapacity: bigint, tokenWeighted: boolean): bigint {
-  if (!tokenWeighted) {
-    return 1n;
-  }
-  const rawUnits = intentCapacity / VOTER_DEPOSIT_SHANNONS;
-  if (rawUnits < 1n) {
-    throw new Error("Intent capacity is below the minimum weighted voting unit");
-  }
-  return rawUnits > MAX_WEIGHT_UNITS_PER_INTENT ? MAX_WEIGHT_UNITS_PER_INTENT : rawUnits;
 }
 
 function encodeOpArgs(op: number, scopeHex = "0x"): string {
@@ -340,20 +318,87 @@ export async function getSignerLockHashHex(signer: any): Promise<string> {
   return bytesToHex(await getSignerLockHash(signer));
 }
 
+/** @notice Returns the integer epoch from CCC and legacy epoch representations. */
+export function epochNumber(epochLike: any): bigint {
+  const normalized =
+    typeof epochLike === "string" && epochLike.includes(",")
+      ? epochLike.split(",").slice(0, 3)
+      : epochLike;
+  try {
+    return BigInt((ccc as any).Epoch.from(normalized).integer);
+  } catch {
+    throw new Error("CKB client returned an invalid epoch value");
+  }
+}
+
+export interface ChainTipStatus {
+  epoch: bigint;
+  epochIndex: bigint;
+  epochLength: bigint;
+  blockNumber: bigint;
+  blockTimestamp: bigint;
+  bestKnownBlockNumber: bigint | null;
+  bestKnownBlockTimestamp: bigint | null;
+  initialBlockDownload: boolean | null;
+}
+
+function optionalRpcBigInt(value: unknown): bigint | null {
+  if (typeof value !== "bigint" && typeof value !== "number" && typeof value !== "string") {
+    return null;
+  }
+
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @notice Reads the RPC node tip and optional peer-derived sync target.
+ * @dev `sync_state` describes the connected RPC node, not the user's wallet.
+ * Some hosted or wallet-backed clients disable the net RPC module, so sync
+ * fields intentionally fall back to null while the canonical tip remains usable.
+ */
+export async function getChainTipStatus(client: any): Promise<ChainTipStatus> {
+  const tipHeader = await client.getTipHeader();
+  const epoch = (ccc as any).Epoch.from(tipHeader.epoch);
+  let syncState: any = null;
+
+  if (typeof client?.requestor?.request === "function") {
+    try {
+      syncState = await client.requestor.request("sync_state", []);
+    } catch {
+      syncState = null;
+    }
+  }
+
+  return {
+    epoch: BigInt(epoch.integer),
+    epochIndex: BigInt(epoch.numerator),
+    epochLength: BigInt(epoch.denominator),
+    blockNumber: BigInt(tipHeader.number),
+    blockTimestamp: BigInt(tipHeader.timestamp),
+    bestKnownBlockNumber: optionalRpcBigInt(syncState?.best_known_block_number),
+    bestKnownBlockTimestamp: optionalRpcBigInt(syncState?.best_known_block_timestamp),
+    initialBlockDownload:
+      typeof syncState?.ibd === "boolean" ? syncState.ibd : null,
+  };
+}
+
 /**
  * @notice Reads chain tip epoch from client APIs.
- * @dev Supports different return types used by CCC client variants.
+ * @dev CCC 1.18 returns Epoch objects; older client adapters may return packed
+ * numbers or comma-delimited tuples.
  */
 export async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
     const rawEpoch = await client.getTipEpoch();
-    if (typeof rawEpoch === "bigint") return rawEpoch;
-    if (typeof rawEpoch === "number") return BigInt(rawEpoch);
-    if (typeof rawEpoch === "string") return BigInt(rawEpoch.split(",")[0]);
+    return epochNumber(rawEpoch);
   }
 
   const tipHeader = await client.getTipHeader();
-  return BigInt(String(tipHeader.epoch).split(",")[0]);
+  return epochNumber(tipHeader.epoch);
 }
 
 /**
@@ -365,20 +410,31 @@ export async function buildCreatePollTx(
   input: {
     question: string;
     options: string[];
-    durationEpochs: number;
+    deadlineEpoch: bigint;
     shardCount?: number;
     tokenWeighted?: boolean;
-    udtTypeHash?: string;
   }
 ): Promise<any> {
+  if (input.tokenWeighted) {
+    throw new Error("Weighted polls are unsupported in the equal-weight v1 deployment");
+  }
   const client = signer.client;
-  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const creatorLockHash = await getSignerLockHash(signer);
   const signerAddress = await getSignerAddressObj(signer);
   const shardCount = input.shardCount ?? 8;
   if (!Number.isInteger(shardCount) || shardCount <= 0 || shardCount > MAX_TALLY_SHARDS) {
     throw new Error(`shardCount must be between 1 and ${MAX_TALLY_SHARDS}`);
+  }
+  if (input.deadlineEpoch <= currentEpoch) {
+    throw new Error("deadlineEpoch must be after the currently observed tip epoch");
+  }
+  const durationEpochs = input.deadlineEpoch - currentEpoch;
+  if (durationEpochs < MIN_DURATION_EPOCHS || durationEpochs > MAX_DURATION_EPOCHS) {
+    throw new Error(`deadlineEpoch must be ${MIN_DURATION_EPOCHS}-${MAX_DURATION_EPOCHS} epochs after the observed tip`);
+  }
+  if (input.deadlineEpoch > MAX_DEADLINE_EPOCH) {
+    throw new Error(`deadlineEpoch exceeds the protocol maximum ${MAX_DEADLINE_EPOCH}`);
   }
 
   const typeIdSeedCell = await findSignerAuthCell(signer);
@@ -391,7 +447,7 @@ export async function buildCreatePollTx(
     question: input.question,
     options: input.options,
     vote_counts: input.options.map(() => 0n),
-    deadline: currentEpoch + BigInt(input.durationEpochs),
+    deadline: input.deadlineEpoch,
     creator: creatorLockHash,
     creator_lock: normalizeScript(signerAddress.script),
     is_closed: false,
@@ -399,8 +455,10 @@ export async function buildCreatePollTx(
     creator_deposit: CREATOR_DEPOSIT_SHANNONS,
     pending_intent_count: 0n,
     counted_voter_lock_hashes: [],
-    token_weighted: input.tokenWeighted ?? false,
-    udt_type_hash: (ccc as any).bytesFrom(input.udtTypeHash ?? ZERO_HASH_HEX),
+    token_weighted: false,
+    // Retained codec field for historical cells; new equal-weight polls use
+    // one canonical zero value and expose no active UDT configuration input.
+    udt_type_hash: (ccc as any).bytesFrom(ZERO_HASH_HEX),
     shard_count: shardCount,
   });
 
@@ -434,7 +492,6 @@ export async function buildCreatePollTx(
   });
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
-    headerDeps: [tipHeader.hash],
     inputs: [{ previousOutput: getOutPoint(typeIdSeedCell), since: 0 }],
     outputs: [
       {
@@ -465,11 +522,9 @@ export async function buildCreateVoteIntentTx(
     optionIndex: number;
     pollCell: any;
     delegationCell?: any;
-    weightUnits?: number;
   }
 ): Promise<any> {
   const client = signer.client;
-  const tipHeader = await client.getTipHeader();
   const epoch = await getTipEpoch(client);
   const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const pollTypeHash = hashScript(getCellType(input.pollCell));
@@ -479,14 +534,15 @@ export async function buildCreateVoteIntentTx(
   if (pollData.is_closed) {
     throw new Error("Poll is already closed");
   }
+  if (pollData.token_weighted) {
+    throw new Error("Weighted polls are unsupported; only recovery actions are available");
+  }
   if (epoch > pollData.deadline) {
     throw new Error("Poll deadline has already passed");
   }
   if (!Number.isInteger(input.optionIndex) || input.optionIndex < 0 || input.optionIndex >= pollData.options.length) {
     throw new Error("Vote option index is invalid for this poll");
   }
-  const voteWeightUnits = sanitizeWeightUnits(input.weightUnits, pollData.token_weighted);
-
   const signerLockHash = await getSignerLockHash(signer);
   const delegationData = input.delegationCell
     ? decodeDelegationData((ccc as any).bytesFrom(input.delegationCell.outputData ?? "0x"))
@@ -502,11 +558,17 @@ export async function buildCreateVoteIntentTx(
     if (!bytesEqual(delegationData.delegate_lock_hash, signerLockHash)) {
       throw new Error("Connected wallet is not the delegation delegate");
     }
-    if (delegationData.expires_epoch > 0n && epoch > delegationData.expires_epoch) {
-      throw new Error("Delegation has expired");
+    if (delegationData.expires_epoch !== 0n) {
+      throw new Error("v1 delegations must be revocation-based (expires_epoch = 0)");
     }
   }
   const voterLockHash = delegationData ? delegationData.delegator_lock_hash : signerLockHash;
+  if (
+    bytesEqual(pollData.creator, voterLockHash) ||
+    bytesEqual(pollData.creator, signerLockHash)
+  ) {
+    throw new Error("Poll creator cannot submit vote intents, directly or as a delegate");
+  }
   const signerAddress = await getSignerAddressObj(signer);
   const signerAuthCell = await findSignerAuthCell(signer);
   const signerAuthKey = outPointKey(signerAuthCell);
@@ -521,22 +583,16 @@ export async function buildCreateVoteIntentTx(
     poll_type_hash: (ccc as any).bytesFrom(input.pollTypeHash),
     voter_lock_hash: voterLockHash,
     option_index: input.optionIndex,
-    voted_at_epoch: epoch,
+    // Retained codec slot only. Aggregation authenticates the intent input's
+    // creation header and never trusts this caller-selected field.
+    voted_at_epoch: 0n,
     aggregated: false,
     refund_lock: refundLock,
   });
   const intentType = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, input.pollTypeHash);
   const intentCapacity = estimateOutputCapacity(intentLock, intentType, intentData.length);
-  const weightedIntentCapacity = voteWeightUnits * VOTER_DEPOSIT_SHANNONS;
-  const maxWeightedIntentCapacity = MAX_WEIGHT_UNITS_PER_INTENT * VOTER_DEPOSIT_SHANNONS;
-  let outputIntentCapacity = [intentCapacity, weightedIntentCapacity]
+  const outputIntentCapacity = [intentCapacity, VOTER_DEPOSIT_SHANNONS]
     .reduce((max, current) => (current > max ? current : max), 0n);
-
-  if (pollData.token_weighted && outputIntentCapacity > maxWeightedIntentCapacity) {
-    throw new Error(
-      `Weighted intent occupied capacity exceeds cap (${maxWeightedIntentCapacity / SHANNONS_PER_CKB} CKB)`
-    );
-  }
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [
@@ -552,7 +608,6 @@ export async function buildCreateVoteIntentTx(
           }]
         : []),
     ],
-    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(signerAuthCell) },
     ],
@@ -584,26 +639,38 @@ export async function buildCreateVoteIntentTx(
  */
 export async function buildDelegateTx(
   signer: any,
-  input: { delegateLockHash: string; pollTypeHash?: string; expiresEpoch?: bigint }
+  input: {
+    delegateLockHash: string;
+    pollTypeHash?: string;
+    forbiddenDelegateLockHash?: string;
+  }
 ): Promise<any> {
-  const tipHeader = await signer.client.getTipHeader();
   const signerAddress = await getSignerAddressObj(signer);
   const delegatorLockHash = await getSignerLockHash(signer);
   const delegateLockHash = await resolveDelegateLockHash(signer, input.delegateLockHash);
+  const delegatorLockHashHex = bytesToHex(delegatorLockHash).toLowerCase();
+  if (delegateLockHash.toLowerCase() === delegatorLockHashHex) {
+    throw new Error("Delegator and delegate must be different wallets");
+  }
+  if (
+    input.forbiddenDelegateLockHash &&
+    delegateLockHash.toLowerCase() === input.forbiddenDelegateLockHash.toLowerCase()
+  ) {
+    throw new Error("The poll creator cannot act as a voting delegate for this poll");
+  }
   const signerAuthCell = await findSignerAuthCell(signer);
   const signerAuthKey = outPointKey(signerAuthCell);
   const delegationData = encodeDelegationData({
     delegator_lock_hash: delegatorLockHash,
     delegate_lock_hash: (ccc as any).bytesFrom(delegateLockHash),
     poll_type_hash: (ccc as any).bytesFrom(input.pollTypeHash ?? ZERO_HASH_HEX),
-    expires_epoch: input.expiresEpoch ?? 0n,
+    expires_epoch: 0n,
   });
   const delegationType = buildGovernanceTypeScript(OP.DELEGATE, input.pollTypeHash ?? ZERO_HASH_HEX);
   const delegationCapacity = estimateOutputCapacity(signerAddress.script, delegationType, delegationData.length);
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
-    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(signerAuthCell) },
     ],
@@ -801,6 +868,77 @@ function assertPinnedInputs(tx: any, expectedOutPointKeys: string[], context: st
   }
 }
 
+export function absoluteEpochSince(epoch: bigint): bigint {
+  if (epoch < 0n || epoch > 0xffffffn) {
+    throw new Error("absolute epoch since number exceeds the 24-bit CKB encoding");
+  }
+  return (ccc as any).Since.from({
+    relative: "absolute",
+    metric: "epoch",
+    value: (ccc as any).epochToHex([epoch, 0n, 1n]),
+  }).toNum();
+}
+
+function setProtocolInputSince(
+  tx: any,
+  expectedOutPointKey: string,
+  since: bigint,
+  context: string
+): void {
+  assertPinnedInputs(tx, [expectedOutPointKey], context);
+  tx.inputs[0].since = since;
+  assertProtocolInputSince(tx, expectedOutPointKey, since, context);
+}
+
+function assertProtocolInputSince(
+  tx: any,
+  expectedOutPointKey: string,
+  expectedSince: bigint,
+  context: string
+): void {
+  assertPinnedInputs(tx, [expectedOutPointKey], context);
+  if (BigInt(tx.inputs[0].since) !== expectedSince) {
+    throw new Error(`${context} protocol input since changed after completion`);
+  }
+}
+
+async function resolveCellCreationHeader(
+  client: any,
+  cell: any
+): Promise<{ hash: string; epoch: bigint }> {
+  if (typeof client.getCellWithHeader !== "function") {
+    throw new Error("Connected CKB client cannot resolve input creation headers");
+  }
+  const resolved = await client.getCellWithHeader(getOutPoint(cell));
+  const header = resolved?.header;
+  if (!header?.hash || header.epoch == null) {
+    throw new Error(`Intent ${outPointKey(cell)} is not committed with a resolvable creation header`);
+  }
+  let epoch: bigint;
+  try {
+    epoch = epochNumber(header.epoch);
+  } catch {
+    throw new Error(`Intent ${outPointKey(cell)} has an invalid creation epoch`);
+  }
+  return {
+    hash: String(header.hash),
+    epoch,
+  };
+}
+
+export function deduplicateHeaderHashes(headers: Array<{ hash: string }>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const { hash } of headers) {
+    const key = hash.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(hash);
+    }
+  }
+  return result;
+}
+
 /**
  * @notice Builds a shard aggregation transaction for the active sharded tally path.
  * @dev Poll cell is referenced as a cell dep; only one tally shard cell is updated.
@@ -809,8 +947,6 @@ export async function buildAggregateTallyShardTx(
   signer: any,
   input: { pollCell: any; shardCell: any; intentCells: any[] }
 ): Promise<any> {
-  const tipHeader = await signer.client.getTipHeader();
-  const currentEpoch = await getTipEpoch(signer.client);
   const pollOutput = getCellOutput(input.pollCell);
   const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const pollTypeHash = hashScript(pollOutput.type);
@@ -821,8 +957,8 @@ export async function buildAggregateTallyShardTx(
   if (pollData.is_closed) {
     throw new Error("Poll is already closed");
   }
-  if (currentEpoch > pollData.deadline) {
-    throw new Error("Poll deadline has already passed");
+  if (pollData.token_weighted) {
+    throw new Error("Weighted polls are unsupported; only recovery actions are available");
   }
   if (pollData.shard_count <= 0) {
     throw new Error("Poll is not configured for sharded aggregation");
@@ -849,7 +985,10 @@ export async function buildAggregateTallyShardTx(
   const seenVoters = new Set(shardData.counted_voter_lock_hashes.map((hash) => bytesToHex(hash).toLowerCase()));
   const nextVoteCounts = [...shardData.vote_counts];
   const appendedVoters: Uint8Array[] = [];
-  const nextIntentOutputs = input.intentCells.map((cell) => {
+  const intentOrigins = await Promise.all(
+    input.intentCells.map((cell) => resolveCellCreationHeader(signer.client, cell))
+  );
+  const nextIntentOutputs = input.intentCells.map((cell, index) => {
     const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
     const intentPollHash = bytesToHex(decoded.poll_type_hash).toLowerCase();
     const voterHash = bytesToHex(decoded.voter_lock_hash).toLowerCase();
@@ -863,6 +1002,9 @@ export async function buildAggregateTallyShardTx(
     if (decoded.option_index >= pollData.options.length) {
       throw new Error("Intent option index is invalid for this poll");
     }
+    if (intentOrigins[index].epoch > pollData.deadline) {
+      throw new Error("Late intent cannot be aggregated; refund it to its refund lock");
+    }
     const derivedShardId = deriveTallyShardId(decoded.poll_type_hash, decoded.voter_lock_hash, shardData.shard_count);
     if (derivedShardId !== shardData.shard_id) {
       throw new Error("Intent belongs to a different tally shard");
@@ -873,8 +1015,7 @@ export async function buildAggregateTallyShardTx(
 
     seenVoters.add(voterHash);
     appendedVoters.push(decoded.voter_lock_hash);
-    const weight = computeIntentWeightUnits(getCellCapacity(cell), pollData.token_weighted);
-    nextVoteCounts[decoded.option_index] += weight;
+    nextVoteCounts[decoded.option_index] += 1n;
 
     return {
       output: {
@@ -911,7 +1052,9 @@ export async function buildAggregateTallyShardTx(
         depType: "code",
       },
     ],
-    headerDeps: [tipHeader.hash],
+    // Source::Input authenticates each intent's creation block against these
+    // exact, first-seen-deduplicated header dependencies.
+    headerDeps: deduplicateHeaderHashes(intentOrigins),
     inputs: [
       { previousOutput: getOutPoint(input.shardCell) },
       ...input.intentCells.map((cell) => ({ previousOutput: getOutPoint(cell) })),
@@ -947,7 +1090,6 @@ export async function buildMergeTallyShardsTx(
   signer: any,
   input: { pollCell: any; shardCells?: any[]; mergeResultCells?: any[] }
 ): Promise<any> {
-  const tipHeader = await signer.client.getTipHeader();
   const pollOutput = getCellOutput(input.pollCell);
   const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const pollTypeHash = hashScript(pollOutput.type);
@@ -1040,7 +1182,6 @@ export async function buildMergeTallyShardsTx(
         depType: "code",
       },
     ],
-    headerDeps: [tipHeader.hash],
     inputs: [
       ...shardCells.map((cell) => ({ previousOutput: getOutPoint(cell) })),
       ...mergeResultCells.map((cell) => ({ previousOutput: getOutPoint(cell) })),
@@ -1075,7 +1216,6 @@ export async function buildFinalizeTallyShardTx(
   signer: any,
   input: { pollCell: any; shardCell: any }
 ): Promise<any> {
-  const tipHeader = await signer.client.getTipHeader();
   const currentEpoch = await getTipEpoch(signer.client);
   const pollOutput = getCellOutput(input.pollCell);
   const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
@@ -1100,6 +1240,7 @@ export async function buildFinalizeTallyShardTx(
   if (scriptKey(getCellType(input.shardCell)) !== scriptKey(shardScript)) {
     throw new Error("Shard type does not match governance shard policy");
   }
+  const requiredSince = absoluteEpochSince(pollData.deadline + 1n);
 
   const finalizedShard = encodeTallyShardData({
     ...shardData,
@@ -1113,7 +1254,6 @@ export async function buildFinalizeTallyShardTx(
         depType: "code",
       },
     ],
-    headerDeps: [tipHeader.hash],
     inputs: [{ previousOutput: getOutPoint(input.shardCell) }],
     outputs: [
       {
@@ -1129,93 +1269,20 @@ export async function buildFinalizeTallyShardTx(
   const finalizePinnedKeys = [outPointKey(input.shardCell)];
   await tx.completeInputsByCapacity(signer);
   assertPinnedInputs(tx, finalizePinnedKeys, "CREATE_TALLY_SHARD finalization");
+  setProtocolInputSince(
+    tx,
+    finalizePinnedKeys[0],
+    requiredSince,
+    "CREATE_TALLY_SHARD finalization"
+  );
   await tx.completeFeeBy(signer, 1000);
   assertPinnedInputs(tx, finalizePinnedKeys, "CREATE_TALLY_SHARD finalization");
-  return tx;
-}
-
-/**
- * @notice Builds the transitional AGGREGATE_VOTES transaction.
- * @dev Legacy path for non-sharded historical cells only. Modern polls use
- * buildAggregateTallyShardTx so the poll cell is not a second tally source.
- */
-export async function buildAggregateVotesTx(
-  signer: any,
-  input: { pollCell: any; intentCells: any[] }
-): Promise<any> {
-  const tipHeader = await signer.client.getTipHeader();
-  const pollOutput = getCellOutput(input.pollCell);
-  const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
-  const pollTypeHash = hashScript(pollOutput.type);
-  const nextVoteCounts = [...previousPoll.vote_counts];
-  if (previousPoll.shard_count > 0) {
-    throw new Error("Legacy poll-cell aggregation is disabled for sharded polls");
-  }
-
-  const nextIntentOutputs = input.intentCells.map((cell) => {
-    const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
-    if (bytesToHex(decoded.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
-      throw new Error("Intent cell does not belong to the selected poll");
-    }
-    const weight = computeIntentWeightUnits(getCellCapacity(cell), previousPoll.token_weighted);
-    nextVoteCounts[decoded.option_index] += weight;
-    return {
-      decoded,
-      output: {
-        lock: buildIntentLockScript(pollTypeHash),
-        type: getCellType(cell),
-        capacity: getCellCapacity(cell),
-      },
-      data: bytesToHex(
-        encodeVoteIntentData({
-          ...decoded,
-          aggregated: true,
-        })
-      ),
-    };
-  });
-
-  const appendedVoters = nextIntentOutputs.map((item) => item.decoded.voter_lock_hash);
-
-  const updatedPoll = encodePollData({
-    ...previousPoll,
-    vote_counts: nextVoteCounts,
-    total_voters: previousPoll.total_voters + BigInt(input.intentCells.length),
-    pending_intent_count:
-      previousPoll.pending_intent_count > BigInt(input.intentCells.length)
-        ? previousPoll.pending_intent_count - BigInt(input.intentCells.length)
-        : 0n,
-    counted_voter_lock_hashes: [...previousPoll.counted_voter_lock_hashes, ...appendedVoters],
-  });
-  const updatedPollMinCapacity = estimateOutputCapacity(
-    pollOutput.lock,
-    pollOutput.type,
-    updatedPoll.length
+  assertProtocolInputSince(
+    tx,
+    finalizePinnedKeys[0],
+    requiredSince,
+    "CREATE_TALLY_SHARD finalization"
   );
-  const updatedPollCandidateCapacity = getCellCapacity(input.pollCell) - AGGREGATE_FEE_RESERVE_SHANNONS;
-  const updatedPollCapacity = updatedPollCandidateCapacity > updatedPollMinCapacity
-    ? updatedPollCandidateCapacity
-    : updatedPollMinCapacity;
-
-  const tx = (ccc as any).Transaction.from({
-    cellDeps: [buildGovernanceCellDep()],
-    headerDeps: [tipHeader.hash],
-    inputs: [
-      { previousOutput: getOutPoint(input.pollCell) },
-      ...input.intentCells.map((cell) => ({ previousOutput: getOutPoint(cell) })),
-    ],
-    outputs: [
-      {
-        lock: pollOutput.lock,
-        type: pollOutput.type,
-        capacity: updatedPollCapacity,
-      },
-      ...nextIntentOutputs.map((item) => item.output),
-    ],
-    outputsData: [bytesToHex(updatedPoll), ...nextIntentOutputs.map((item) => item.data)],
-    witnesses: new Array(input.intentCells.length + 1).fill("0x"),
-  });
-
   return tx;
 }
 
@@ -1228,7 +1295,6 @@ export async function buildClosePollTx(
   input: { pollCell: any; intentCells: any[]; shardCells?: any[]; mergeResultCell?: any }
 ): Promise<any> {
   const client = signer.client;
-  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const pollOutput = getCellOutput(input.pollCell);
   const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
@@ -1237,12 +1303,20 @@ export async function buildClosePollTx(
     throw new Error("Poll cannot be closed before deadline");
   }
   const shardCells = input.shardCells ?? [];
-  const sharded = previousPoll.shard_count > 0;
+  if (previousPoll.shard_count <= 0) {
+    throw new Error("Non-sharded poll-cell aggregation is retired in this deployment");
+  }
   const largeSharded = previousPoll.shard_count > MAX_DIRECT_CLOSE_SHARDS;
+  if (largeSharded && shardCells.length > 0) {
+    throw new Error("Large sharded close accepts only the complete merge result, not shard cells");
+  }
+  if (!largeSharded && input.mergeResultCell) {
+    throw new Error("Small sharded close accepts only the complete finalized shard set");
+  }
   if (largeSharded && !input.mergeResultCell) {
     throw new Error("Large sharded close requires a complete final merge result cell");
   }
-  if (sharded && !largeSharded && shardCells.length !== previousPoll.shard_count) {
+  if (!largeSharded && shardCells.length !== previousPoll.shard_count) {
     throw new Error("Sharded close requires the complete finalized shard set");
   }
 
@@ -1262,7 +1336,7 @@ export async function buildClosePollTx(
     }
     finalVoteCounts = result.vote_counts;
     finalTotalVoters = result.total_voters;
-  } else if (sharded) {
+  } else {
     finalVoteCounts = previousPoll.options.map(() => 0n);
     finalTotalVoters = 0n;
     const seenShardIds = new Set<number>();
@@ -1327,7 +1401,7 @@ export async function buildClosePollTx(
     ...previousPoll,
     vote_counts: finalVoteCounts,
     total_voters: finalTotalVoters,
-    counted_voter_lock_hashes: sharded ? [] : previousPoll.counted_voter_lock_hashes,
+    counted_voter_lock_hashes: [],
     is_closed: true,
     pending_intent_count: 0n,
   });
@@ -1356,7 +1430,6 @@ export async function buildClosePollTx(
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
-    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(input.pollCell) },
       { previousOutput: getOutPoint(creatorAuthCell) },
@@ -1391,8 +1464,21 @@ export async function buildClosePollTx(
 
   await tx.completeInputsByCapacity(signer);
   assertPinnedInputs(tx, closePinnedKeys, "CLOSE_POLL creator close");
+  const requiredSince = absoluteEpochSince(previousPoll.deadline + 1n);
+  setProtocolInputSince(
+    tx,
+    closePinnedKeys[0],
+    requiredSince,
+    "CLOSE_POLL creator close"
+  );
   await tx.completeFeeBy(signer, 1000);
   assertPinnedInputs(tx, closePinnedKeys, "CLOSE_POLL creator close");
+  assertProtocolInputSince(
+    tx,
+    closePinnedKeys[0],
+    requiredSince,
+    "CLOSE_POLL creator close"
+  );
   return tx;
 }
 
@@ -1405,18 +1491,25 @@ export async function buildForceCloseTx(
   input: { pollCell: any; intentCells: any[]; shardCells?: any[]; mergeResultCell?: any }
 ): Promise<any> {
   const client = signer.client;
-  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const pollOutput = getCellOutput(input.pollCell);
   const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const pollTypeHash = hashScript(pollOutput.type);
   const shardCells = input.shardCells ?? [];
-  const sharded = previousPoll.shard_count > 0;
+  if (previousPoll.shard_count <= 0) {
+    throw new Error("Non-sharded poll-cell aggregation is retired in this deployment");
+  }
   const largeSharded = previousPoll.shard_count > MAX_DIRECT_CLOSE_SHARDS;
+  if (largeSharded && shardCells.length > 0) {
+    throw new Error("Large sharded force-close accepts only the complete merge result, not shard cells");
+  }
+  if (!largeSharded && input.mergeResultCell) {
+    throw new Error("Small sharded force-close accepts only the complete finalized shard set");
+  }
   if (largeSharded && !input.mergeResultCell) {
     throw new Error("Large sharded force-close requires a complete final merge result cell");
   }
-  if (sharded && !largeSharded && shardCells.length !== previousPoll.shard_count) {
+  if (!largeSharded && shardCells.length !== previousPoll.shard_count) {
     throw new Error("Sharded force-close requires the complete finalized shard set");
   }
 
@@ -1436,7 +1529,7 @@ export async function buildForceCloseTx(
     }
     finalVoteCounts = result.vote_counts;
     finalTotalVoters = result.total_voters;
-  } else if (sharded) {
+  } else {
     finalVoteCounts = previousPoll.options.map(() => 0n);
     finalTotalVoters = 0n;
     const seenShardIds = new Set<number>();
@@ -1489,7 +1582,7 @@ export async function buildForceCloseTx(
     ...previousPoll,
     vote_counts: finalVoteCounts,
     total_voters: finalTotalVoters,
-    counted_voter_lock_hashes: sharded ? [] : previousPoll.counted_voter_lock_hashes,
+    counted_voter_lock_hashes: [],
     is_closed: true,
     pending_intent_count: 0n,
   });
@@ -1526,7 +1619,6 @@ export async function buildForceCloseTx(
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [buildGovernanceCellDep()],
-    headerDeps: [tipHeader.hash],
     inputs: [
       { previousOutput: getOutPoint(input.pollCell) },
       ...(largeSharded && input.mergeResultCell
@@ -1560,8 +1652,21 @@ export async function buildForceCloseTx(
 
   await tx.completeInputsByCapacity(signer);
   assertPinnedInputs(tx, forceClosePinnedKeys, "CLOSE_POLL force-close");
+  const requiredSince = absoluteEpochSince(allowEpoch + 1n);
+  setProtocolInputSince(
+    tx,
+    forceClosePinnedKeys[0],
+    requiredSince,
+    "CLOSE_POLL force-close"
+  );
   await tx.completeFeeBy(signer, 1000);
   assertPinnedInputs(tx, forceClosePinnedKeys, "CLOSE_POLL force-close");
+  assertProtocolInputSince(
+    tx,
+    forceClosePinnedKeys[0],
+    requiredSince,
+    "CLOSE_POLL force-close"
+  );
   return tx;
 }
 
@@ -1613,8 +1718,66 @@ export async function buildRefundClosedIntentTx(
 }
 
 /**
- * @notice Builds a REVOKE_DELEGATION transaction.
- * @dev Consumes delegation cell and unlocks its occupied capacity back to delegator lock.
+ * Builds an immediate full-capacity refund for an intent committed after the
+ * poll deadline. The creation header is both checked off chain and supplied
+ * so the contract can authenticate it through Source::Input.
+ */
+export async function buildRefundLateIntentTx(
+  signer: any,
+  input: { pollCell: any; intentCell: any }
+): Promise<any> {
+  const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
+  if (pollData.is_closed) {
+    throw new Error("Use the post-close refund path for a closed poll");
+  }
+  const pollTypeHash = hashScript(getCellType(input.pollCell));
+  const intent = decodeVoteIntentData((ccc as any).bytesFrom(input.intentCell.outputData ?? "0x"));
+  if (bytesToHex(intent.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
+    throw new Error("Intent cell does not belong to the supplied poll");
+  }
+  if (intent.aggregated) {
+    throw new Error("Aggregated intent markers remain locked until poll close");
+  }
+  const origin = await resolveCellCreationHeader(signer.client, input.intentCell);
+  if (origin.epoch <= pollData.deadline) {
+    throw new Error("Only an intent created after the deadline can use the late refund path");
+  }
+
+  const inputCapacity = getCellCapacity(input.intentCell);
+  const tx = (ccc as any).Transaction.from({
+    cellDeps: [
+      buildGovernanceCellDep(),
+      {
+        outPoint: getOutPoint(input.pollCell),
+        depType: "code",
+      },
+    ],
+    headerDeps: [origin.hash],
+    inputs: [{ previousOutput: getOutPoint(input.intentCell) }],
+    outputs: [
+      {
+        lock: denormalizeScript(intent.refund_lock),
+        capacity: inputCapacity,
+      },
+    ],
+    outputsData: ["0x"],
+    witnesses: ["0x"],
+  });
+
+  const pinnedKeys = [outPointKey(input.intentCell)];
+  await tx.completeInputsByCapacity(signer);
+  assertPinnedInputs(tx, pinnedKeys, "late intent refund");
+  await tx.completeFeeBy(signer, 1000);
+  assertPinnedInputs(tx, pinnedKeys, "late intent refund");
+  if (BigInt(tx.outputs[0].capacity) !== inputCapacity) {
+    throw new Error("late intent refund must preserve the intent's exact full capacity");
+  }
+  return tx;
+}
+
+/**
+ * @notice Builds a delegation revocation transaction.
+ * @dev Consumes an OP.DELEGATE cell; retired opcode 0x06 is never emitted.
  */
 export async function buildRevokeDelegationTx(
   signer: any,
@@ -1637,9 +1800,9 @@ export async function buildRevokeDelegationTx(
 
   const revokePinnedKeys = [outPointKey(input.delegationCell)];
   await tx.completeInputsByCapacity(signer);
-  assertPinnedInputs(tx, revokePinnedKeys, "REVOKE_DELEGATION");
+  assertPinnedInputs(tx, revokePinnedKeys, "delegation revocation");
   await tx.completeFeeBy(signer, 1000);
-  assertPinnedInputs(tx, revokePinnedKeys, "REVOKE_DELEGATION");
+  assertPinnedInputs(tx, revokePinnedKeys, "delegation revocation");
   return tx;
 }
 
@@ -1662,11 +1825,22 @@ export function validateCreatePollInput(input: {
   question: string;
   options: string[];
   durationEpochs: number;
+  tokenWeighted?: boolean;
 }): string | null {
+  if (input.tokenWeighted) return "Weighted polls are unsupported in the equal-weight v1 deployment";
   if (!input.question.trim()) return "Question is required";
-  if (input.question.length > 256) return "Question exceeds 256 bytes";
-  if (input.options.length < 2 || input.options.length > MAX_OPTIONS) return "Options must be between 2 and 10";
-  if (input.options.some((option) => !option.trim() || option.length > 64)) return "Each option must be 1-64 bytes";
+  if (utf8ByteLength(input.question) > MAX_QUESTION_BYTES) {
+    return `Question exceeds ${MAX_QUESTION_BYTES.toString()} UTF-8 bytes`;
+  }
+  if (input.options.length < MIN_OPTIONS || input.options.length > MAX_OPTIONS) {
+    return `Options must be between ${MIN_OPTIONS.toString()} and ${MAX_OPTIONS.toString()}`;
+  }
+  if (input.options.some((option) => !option.trim() || utf8ByteLength(option) > MAX_OPTION_BYTES)) {
+    return `Each option must be 1-${MAX_OPTION_BYTES.toString()} UTF-8 bytes`;
+  }
+  if (!Number.isSafeInteger(input.durationEpochs)) {
+    return "Duration must be a whole number of epochs";
+  }
   if (BigInt(input.durationEpochs) < MIN_DURATION_EPOCHS || BigInt(input.durationEpochs) > MAX_DURATION_EPOCHS) {
     return "Duration must be between 1 and 1000 epochs";
   }

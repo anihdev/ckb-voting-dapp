@@ -12,7 +12,7 @@ Conceptually it looked like this:
 
 ```text
 VoteIntent cells
-  -> AGGREGATE_VOTES
+  -> AGGREGATE_VOTES (retired opcode 0x03)
   -> consume PollCell
   -> update PollData.vote_counts / total_voters / counted_voter_lock_hashes
   -> output new PollCell
@@ -91,7 +91,7 @@ TallyShardCell 1
 ...
 ```
 
-The poll cell no longer has to be consumed during normal aggregation. It is referenced as a dependency so the contract can verify poll configuration and deadline, but the live mutable tally update happens in one shard cell.
+The poll cell no longer has to be consumed during normal aggregation. It is referenced as a dependency so the contract can verify poll configuration, while the live mutable tally update happens in one shard cell. Deadline eligibility comes from each consumed intent cell's authenticated creation header, not from a caller-selected header dep.
 
 ## What A Shard Means Here
 
@@ -125,7 +125,8 @@ Local implementation references:
 
 - Rust shard derivation: `backend/contracts-rust/contracts/governance/src/helpers.rs` (`derive_tally_shard_id`)
 - TypeScript mirror: `frontend/src/lib/ckb.ts` (`deriveTallyShardId`)
-- Deterministic vectors and model tests: `tests/contract.test.ts`
+- Deterministic shard-assignment tests: `tests/ckb-helpers.test.ts`
+- Contract lifecycle/runtime tests: `backend/contracts-rust/integration-tests/tests/governance_vm.rs`
 
 ## How Shards Reduce Contention
 
@@ -177,12 +178,15 @@ CREATE_VOTE_INTENT
 
 CREATE_TALLY_SHARD aggregation
   -> aggregator consumes pending intents for one shard
+  -> each intent input proves its creation epoch through Source::Input
+  -> intent must have been created at or before the deadline
   -> aggregator updates only that shard cell
   -> consumed pending intents become aggregated marker cells
   -> poll cell is not consumed
+  -> timely intents can aggregate after the deadline until shard finalization
 
 CREATE_TALLY_SHARD finalization
-  -> after deadline, each shard is finalized
+  -> shard input carries absolute epoch since strictly after deadline
   -> finalization freezes that shard tally
 
 Small poll close
@@ -200,6 +204,10 @@ Large poll close
 Post-close omitted intent refund
   -> omitted live intent cells can be refunded after close
   -> this protects deposits, but does not prove the omitted vote was counted
+
+Immediate late intent refund
+  -> an intent created after the deadline cannot be aggregated
+  -> its authenticated creation epoch enables exact full-capacity refund
 ```
 
 Local implementation references:
@@ -258,6 +266,7 @@ The contract checks:
 - the shard belongs to the poll
 - the shard is not finalized
 - each intent belongs to the same poll
+- each intent's exact creation header is present and authenticates an epoch at or before the deadline
 - each intent maps to that shard
 - option index is valid
 - voter has not already been counted in that shard
@@ -265,6 +274,8 @@ The contract checks:
 - shard capacity is preserved
 
 The important point is that the poll cell is not consumed in this transaction.
+
+The aggregation transaction itself may be committed after the deadline. That is intentional: inclusion time belongs to the intent being counted, while finalization closes the shard to further aggregation. A header supplied as `header_deps[0]` is caller-selected and is never treated as the chain tip.
 
 ## Why Close And Merge Became More Complex
 
@@ -329,9 +340,11 @@ This design reduces aggregation contention. It does not solve every governance p
 
 It does not prove vote completeness. If valid live intents remain unaggregated and shards are finalized, those omitted intents can be refunded after close, but their votes are not added to the final tally.
 
+Final tally correctness is therefore over the intents actually aggregated. Completeness remains coordinator/indexer-dependent. Consuming applications define quorum, pass/fail thresholds, and decision policy; this protocol does not execute treasury actions automatically.
+
 It does not provide privacy. Current vote intent data still exposes the option choice and voting authority information.
 
-It does not give aggregators a protocol reward yet. Aggregators pay transaction fees from their own unlocked CKB. In a production version, incentives likely need a creator-funded maintenance budget, DAO-funded operator, Fiber-based reimbursement, or a protocol bounty cell.
+It does not give aggregators a protocol reward yet. Permissionless means anyone is authorized, not that anyone is paid. The testnet demo funds operator roles. Creator-funded maintenance budgets, managed operators, Fiber reimbursement, or protocol bounty cells are future work.
 
 It does not remove all contention. Same-shard aggregation still serializes on that shard cell. Finalization, merge, and close also have their own lifecycle dependencies.
 
@@ -362,16 +375,20 @@ The cost is complexity: more cells, more lifecycle steps, more frontend states, 
 
 Official CKB resources:
 
-- CKB Cell Model: https://docs.nervos.org/docs/ckb-fundamentals/cell-model
-- CKB transaction structure and transaction states: https://docs.nervos.org/docs/tech-explanation/transaction
-- How CKB works: https://docs.nervos.org/docs/getting-started/how-ckb-works
-- Script group execution: https://docs.nervos.org/docs/tech-explanation/script-group-exe
+- [CKB Cell Model](https://docs.nervos.org/docs/ckb-fundamentals/cell-model)
+- [CKB transaction structure and transaction states](https://docs.nervos.org/docs/tech-explanation/transaction)
+- [How CKB works](https://docs.nervos.org/docs/getting-started/how-ckb-works)
+- [Script group execution](https://docs.nervos.org/docs/tech-explanation/script-group-exe)
 
 Repository documents:
 
-- `CONTENTION_FIRST_MVP_PLAN.md`
-- `README.md`
-- `ZK_COMPLETENESS_DESIGN.md`
+- [README.md](README.md)
+
+Timing references:
+
+- [RFC 0017: transaction since](https://nervosnetwork.github.io/rfcs/rfcs/0017-tx-valid-since/0017-tx-valid-since.html)
+- [RFC 0022: transaction header deps](https://nervosnetwork.github.io/rfcs/rfcs/0022-transaction-structure/0022-transaction-structure.html)
+- [RFC 0009: VM syscalls](https://nervosnetwork.github.io/rfcs/rfcs/0009-vm-syscalls/0009-vm-syscalls.html)
 
 Repository implementation:
 
@@ -383,4 +400,5 @@ Repository implementation:
 - `frontend/src/lib/protocolUi.ts`
 - `frontend/src/hooks/usePolls.ts`
 - `backend/contracts-rust/integration-tests/tests/governance_vm.rs`
-- `tests/contract.test.ts`
+- `tests/ckb-helpers.test.ts`
+- `tests/protocol-ui.test.ts`

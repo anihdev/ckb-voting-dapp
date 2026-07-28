@@ -1,10 +1,12 @@
+/// This script is used to check the balances of all roles' accounts with CKB for testing purposes.
+
 import { ccc } from '@ckb-ccc/core';
 import { config as load } from 'dotenv';
 import * as path from 'path';
 load({ path: path.resolve(__dirname, '../../.env') });
 
-const rpc = process.env.CKB_RPC_URL || process.env.VITE_CKB_RPC_URL || 'https://testnet.ckb.dev/rpc';
-const client = new ccc.ClientPublicTestnet({ url: rpc });
+const rpc = process.env.CKB_RPC_URL || process.env.VITE_CKB_RPC_URL || 'https://testnet.ckb.dev/';
+const client = new ccc.ClientPublicTestnet({ url: rpc, fallbacks: [rpc] as any });
 
 function req(name: string): string {
   const v = process.env[name]?.trim();

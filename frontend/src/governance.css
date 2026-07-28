@@ -107,7 +107,7 @@
   font-weight: 800;
   font-size: 13px;
   color: #fff;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
   flex-shrink: 0;
 }
 
@@ -116,7 +116,7 @@
   font-weight: 700;
   font-size: 17px;
   color: var(--ink);
-  letter-spacing: -0.3px;
+  letter-spacing: 0;
   line-height: 1.2;
 }
 
@@ -124,7 +124,7 @@
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--ink-3);
-  letter-spacing: 0.15em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -145,7 +145,7 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--teal);
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   text-transform: uppercase;
   margin-bottom: 24px;
 }
@@ -164,7 +164,7 @@
   font-weight: 800;
   color: var(--ink);
   line-height: 1.1;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
   max-width: 640px;
 }
 
@@ -225,7 +225,7 @@
   font-size: 10px;
   color: var(--ink-3);
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: 0;
 }
 
 .governance-theme .metric-value {
@@ -234,7 +234,7 @@
   font-weight: 700;
   color: var(--ink);
   margin-top: 6px;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
 }
 
 .governance-theme .metric-value.mono {
@@ -243,6 +243,12 @@
   margin-top: 8px;
   color: var(--ink-2);
   letter-spacing: 0;
+}
+
+.governance-theme .chain-tip-value {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  white-space: nowrap;
 }
 
 .governance-theme .action-grid {
@@ -270,7 +276,7 @@
   font-size: 14px;
   font-weight: 700;
   color: var(--ink);
-  letter-spacing: -0.2px;
+  letter-spacing: 0;
 }
 
 .governance-theme .card-sub {
@@ -287,7 +293,7 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--ink-3);
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 
 .governance-theme .status-pill {
@@ -298,7 +304,7 @@
   padding: 3px 10px;
   font-family: var(--font-mono);
   font-size: 10px;
-  letter-spacing: 0.1em;
+  letter-spacing: 0;
   text-transform: uppercase;
   white-space: nowrap;
 }
@@ -356,7 +362,7 @@
   font-weight: 600;
   cursor: pointer;
   transition: background 0.18s ease, transform 0.15s ease;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
 }
 
 .governance-theme .btn-primary:hover {
@@ -424,7 +430,7 @@
   font-size: 10px;
   color: var(--ink-3);
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   margin-bottom: 8px;
 }
 
@@ -483,6 +489,7 @@
 }
 
 .governance-theme .poll-option {
+  width: 100%;
   background: var(--surface-2);
   border: 2px solid var(--line);
   border-radius: var(--r-md);
@@ -494,6 +501,10 @@
   transition: border-color 0.18s ease, background 0.18s ease, transform 0.15s ease;
   position: relative;
   overflow: hidden;
+  appearance: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
 }
 
 .governance-theme .poll-option.is-actionable {
@@ -567,7 +578,7 @@
   font-size: 11px;
   color: var(--ink-3);
   font-family: var(--font-mono);
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   background: var(--surface-2);
 }
 
@@ -576,7 +587,7 @@
   font-size: 10px;
   color: var(--ink-3);
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   padding: 12px 16px;
   text-align: left;
   border-bottom: 1px solid var(--line);
@@ -693,7 +704,7 @@
   font-size: 10px;
   color: var(--teal);
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: 0;
 }
 
 .governance-theme .section-title {
@@ -701,7 +712,7 @@
   font-size: 18px;
   font-weight: 700;
   color: var(--ink);
-  letter-spacing: -0.3px;
+  letter-spacing: 0;
 }
 
 .governance-theme .subtle {
@@ -724,7 +735,7 @@
   color: var(--ink-3);
   font-family: var(--font-mono);
   font-size: 10px;
-  letter-spacing: 0.06em;
+  letter-spacing: 0;
   line-height: 1.35;
   margin-bottom: 3px;
   max-width: 100%;
@@ -758,7 +769,7 @@
 .governance-theme .tx-step-label {
   font-family: var(--font-mono);
   font-size: 10px;
-  letter-spacing: 0.06em;
+  letter-spacing: 0;
   display: none;
 }
 
@@ -796,7 +807,7 @@
   font-size: 18px;
   font-weight: 700;
   color: var(--ink);
-  letter-spacing: -0.2px;
+  letter-spacing: 0;
 }
 
 .governance-theme .confirm-body {
@@ -811,7 +822,7 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--amber);
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
 }
 
 .governance-theme .confirm-progress {
@@ -979,9 +990,37 @@
     font-size: 30px;
   }
 
+  .governance-theme .hero {
+    padding-top: 24px;
+    padding-bottom: 20px;
+  }
+
+  .governance-theme .hero-kicker {
+    margin-bottom: 14px;
+  }
+
+  .governance-theme .hero-desc {
+    margin-top: 10px;
+    line-height: 1.6;
+  }
+
+  .governance-theme .hero-desc-secondary,
+  .governance-theme .hero-chips,
+  .governance-theme .hero-note {
+    display: none;
+  }
+
   .governance-theme .stats-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
+  }
+
+  .governance-theme .status-metric {
+    padding: 16px 12px;
+  }
+
+  .governance-theme .chain-tip-value {
+    font-size: 16px;
   }
 
   .governance-theme .action-grid {
@@ -994,7 +1033,15 @@
   }
 
   .governance-theme .protocol-strip {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .governance-theme .protocol-cell:nth-child(3n) {
+    border-right: 1px solid var(--line);
+  }
+
+  .governance-theme .protocol-cell:nth-child(2n) {
+    border-right: none;
   }
 
   .governance-theme .protocol-cell {
@@ -1003,7 +1050,7 @@
 
   .governance-theme .protocol-op {
     font-size: 9px;
-    letter-spacing: 0.02em;
+    letter-spacing: 0;
   }
 
 }

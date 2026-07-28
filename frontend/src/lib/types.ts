@@ -11,7 +11,6 @@ export interface CellRef {
 }
 
 export type TallyFrontierSource =
-  | "poll-cell"
   | "live-shards"
   | "merge-frontier"
   | "complete-merge"
@@ -51,6 +50,7 @@ export interface Poll {
   winnerIndex: number | null;
   authorityOptions: VoteAuthorityOption[];
   outstandingIntentCount: number;
+  lateIntentCount: number;
   refundableIntentCount: number;
 }
 
@@ -60,7 +60,10 @@ export interface VoteIntent {
   outPoint: CellRef;
   voterLockHash: string;
   optionIndex: number;
+  /** Legacy caller-selected codec value; not an authenticated cutoff time. */
   votedAtEpoch: bigint;
+  /** Authenticated creation epoch resolved from the intent cell's block. */
+  createdEpoch: bigint | null;
   aggregated: boolean;
   capacity: bigint;
 }
@@ -114,7 +117,6 @@ export interface DelegationRecord {
 export interface DelegateParams {
   delegateLockHash: string;
   pollId?: string;
-  expiresEpoch?: bigint;
 }
 
 export type TxStatus =
@@ -123,6 +125,7 @@ export type TxStatus =
   | "signing"
   | "sending"
   | "confirming"
+  | "unconfirmed"
   | "success"
   | "error";
 

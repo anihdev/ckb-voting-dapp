@@ -6,34 +6,48 @@
 
 import React, { useState } from "react";
 import { CreatePollParams } from "../hooks/usePolls";
-import { MAX_WEIGHT_UNITS_PER_INTENT, SHANNONS_PER_CKB, VOTER_DEPOSIT_SHANNONS } from "../lib/constants";
+import {
+  MAX_OPTION_BYTES,
+  MAX_OPTIONS,
+  MAX_QUESTION_BYTES,
+  MIN_OPTIONS,
+} from "../lib/constants";
+import { utf8ByteLength } from "../lib/molecule";
+import {
+  epochSpanInUnit,
+  formatApproxEpochDuration,
+  PollDurationUnit,
+  pollDurationToEpochs,
+} from "../lib/protocolUi";
+import { isTransactionInFlight } from "../lib/txLifecycle";
 import { TxState } from "../lib/types";
 import { TxStatus } from "./TxStatus";
 
 interface Props {
   onSubmit: (params: CreatePollParams) => Promise<string>;
   txState: TxState;
+  currentEpoch: bigint;
 }
 
-const DEFAULT_DURATION = 100;
+const DEFAULT_DURATION_VALUE = 1;
+const DEFAULT_DURATION_UNIT: PollDurationUnit = "days";
 
-export function CreatePoll({ onSubmit, txState }: Props) {
+export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState(["", ""]);
-  const [duration, setDuration] = useState(DEFAULT_DURATION);
-  const [tokenWeighted, setTokenWeighted] = useState(false);
+  const [durationValue, setDurationValue] = useState(DEFAULT_DURATION_VALUE);
+  const [durationUnit, setDurationUnit] = useState<PollDurationUnit>(DEFAULT_DURATION_UNIT);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
-  const perUnitCkb = VOTER_DEPOSIT_SHANNONS / SHANNONS_PER_CKB;
-  const maxEffectiveCkb = (VOTER_DEPOSIT_SHANNONS * MAX_WEIGHT_UNITS_PER_INTENT) / SHANNONS_PER_CKB;
 
-  const isBusy =
-    txState.status !== "idle" &&
-    txState.status !== "success" &&
-    txState.status !== "error";
+  const isBusy = submitting || isTransactionInFlight(txState.status);
+  const questionBytes = utf8ByteLength(question);
+  const durationEpochs = pollDurationToEpochs(durationValue, durationUnit);
+  const estimatedDeadline = currentEpoch + BigInt(durationEpochs);
 
   const addOption = () => {
-    if (options.length < 10) setOptions([...options, ""]);
+    if (options.length < MAX_OPTIONS) setOptions([...options, ""]);
   };
 
   const removeOption = (index: number) => {
@@ -49,19 +63,29 @@ export function CreatePoll({ onSubmit, txState }: Props) {
 
   const validate = (): string | null => {
     if (!question.trim()) return "Question is required";
-    if (question.length > 256) return "Question exceeds 256 characters";
+    if (questionBytes > MAX_QUESTION_BYTES) {
+      return `Question exceeds ${MAX_QUESTION_BYTES.toString()} UTF-8 bytes`;
+    }
 
     const filledOptions = options.filter((option) => option.trim());
-    if (filledOptions.length < 2) return "At least 2 non-empty options required";
+    if (filledOptions.length < MIN_OPTIONS) return `At least ${MIN_OPTIONS.toString()} non-empty options required`;
 
     for (const option of filledOptions) {
-      if (option.length > 64) {
-        return `Option "${option.slice(0, 20)}..." exceeds 64 characters`;
+      if (utf8ByteLength(option) > MAX_OPTION_BYTES) {
+        return `Option "${option.slice(0, 20)}..." exceeds ${MAX_OPTION_BYTES.toString()} UTF-8 bytes`;
       }
     }
 
-    if (duration < 1 || duration > 1000) return "Duration must be 1-1000 epochs";
+    if (durationEpochs < 1 || durationEpochs > 1000) {
+      return "Duration must convert to 1-1000 whole epochs";
+    }
     return null;
+  };
+
+  const changeDurationUnit = (nextUnit: PollDurationUnit) => {
+    const preservedEpochs = Math.max(1, durationEpochs);
+    setDurationValue(epochSpanInUnit(preservedEpochs, nextUnit));
+    setDurationUnit(nextUnit);
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -74,22 +98,24 @@ export function CreatePoll({ onSubmit, txState }: Props) {
     }
 
     setError(null);
+    setSubmitting(true);
 
     try {
       await onSubmit({
         question: question.trim(),
         options: options.filter((option) => option.trim()),
-        durationEpochs: duration,
-        tokenWeighted,
+        durationEpochs,
       });
 
       setQuestion("");
       setOptions(["", ""]);
-      setDuration(DEFAULT_DURATION);
-      setTokenWeighted(false);
+      setDurationValue(DEFAULT_DURATION_VALUE);
+      setDurationUnit(DEFAULT_DURATION_UNIT);
       setExpanded(false);
     } catch (caughtError: any) {
       setError(caughtError.message ?? "Transaction failed");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -103,7 +129,7 @@ export function CreatePoll({ onSubmit, txState }: Props) {
         <div className="kicker">Poll Creation</div>
         <div className="mt-3 text-2xl">Create Your Own Poll</div>
         <div className="mt-1 text-sm subtle">
-          Open your poll builder to define question, options, and voting mode.
+          Open your poll builder to define question, options, and duration.
         </div>
       </button>
     );
@@ -113,7 +139,11 @@ export function CreatePoll({ onSubmit, txState }: Props) {
     <div className="card-shell">
       <div className="mb-5 flex items-center justify-between">
         <h2 className="section-title text-xl">Create New Poll</h2>
-        <button onClick={() => setExpanded(false)} className="btn-quiet px-3 py-1.5 text-xs uppercase tracking-[0.1em]">
+        <button
+          onClick={() => setExpanded(false)}
+          disabled={isBusy}
+          className="btn-quiet px-3 py-1.5 text-xs uppercase"
+        >
           Close
         </button>
       </div>
@@ -130,13 +160,13 @@ export function CreatePoll({ onSubmit, txState }: Props) {
             className="input resize-none"
             disabled={isBusy}
           />
-          <div className="hint text-right">{question.length}/256</div>
+          <div className="hint text-right">{questionBytes.toString()}/{MAX_QUESTION_BYTES.toString()} UTF-8 bytes</div>
         </div>
 
         <div>
           <label className="label">
             Options
-            <span className="ml-1 font-normal hint inline">(2-10)</span>
+            <span className="ml-1 font-normal hint inline">({MIN_OPTIONS.toString()}-{MAX_OPTIONS.toString()})</span>
           </label>
           <div className="space-y-2">
             {options.map((option, index) => (
@@ -154,7 +184,7 @@ export function CreatePoll({ onSubmit, txState }: Props) {
                   <button
                     type="button"
                     onClick={() => removeOption(index)}
-                    className="btn-danger px-3 py-2 text-xs uppercase tracking-[0.08em]"
+                    className="btn-danger px-3 py-2 text-xs uppercase"
                     disabled={isBusy}
                   >
                     Remove
@@ -163,7 +193,7 @@ export function CreatePoll({ onSubmit, txState }: Props) {
               </div>
             ))}
           </div>
-          {options.length < 10 && (
+          {options.length < MAX_OPTIONS && (
             <button
               type="button"
               onClick={addOption}
@@ -176,44 +206,51 @@ export function CreatePoll({ onSubmit, txState }: Props) {
         </div>
 
         <div>
-          <label className="label">
-            Duration
-            <span className="ml-1 font-normal hint inline">(epochs)</span>
-          </label>
-          <div className="flex items-center gap-3">
+          <label className="label">Voting duration</label>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <input
               type="number"
-              value={duration}
-              onChange={(event) => setDuration(parseInt(event.target.value, 10) || 0)}
-              min={1}
-              max={1000}
-              className="input w-28"
+              value={durationValue}
+              onChange={(event) => setDurationValue(Number(event.target.value))}
+              min={durationUnit === "days" ? 0.25 : 1}
+              max={durationUnit === "days" ? 166.6667 : durationUnit === "hours" ? 4000 : 1000}
+              step={durationUnit === "days" ? 0.25 : 1}
+              className="input w-full sm:w-32"
               disabled={isBusy}
             />
-            <span className="text-sm subtle">
-              ~= {Math.round((duration * 4) / 60)} hours
-              <span className="ml-1 hint inline">(1 epoch ~= 4 min)</span>
-            </span>
+            <div
+              role="group"
+              aria-label="Voting duration unit"
+              className="grid w-full grid-cols-3 overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)] sm:w-64"
+            >
+              {(["hours", "days", "epochs"] as PollDurationUnit[]).map((unit) => (
+                <button
+                  key={unit}
+                  type="button"
+                  onClick={() => changeDurationUnit(unit)}
+                  disabled={isBusy}
+                  aria-pressed={durationUnit === unit}
+                  className="min-h-10 px-3 text-xs font-semibold capitalize transition"
+                  style={
+                    durationUnit === unit
+                      ? { background: "var(--teal-dim)", color: "var(--teal)" }
+                      : { color: "var(--ink-2)" }
+                  }
+                >
+                  {unit}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="mt-2 text-sm subtle">
+            Protocol duration: {formatApproxEpochDuration(BigInt(Math.max(0, durationEpochs)))}
           </div>
           <div className="hint">
-            Poll duration is measured in CKB epochs. Closure eligibility begins after the deadline epoch.
+            Estimated deadline: epoch {estimatedDeadline.toString()}. Close becomes valid after that epoch.
           </div>
-        </div>
-
-        <label className="alert alert-warn" style={{ display: "grid", gridTemplateColumns: "16px minmax(0, 1fr)", alignItems: "start", columnGap: 10 }}>
-          <input
-            type="checkbox"
-            checked={tokenWeighted}
-            onChange={(event) => setTokenWeighted(event.target.checked)}
-            disabled={isBusy}
-            style={{ marginTop: 2 }}
-          />
-          <span style={{ lineHeight: 1.5, wordBreak: "break-word" }}>
-            Enable capped weighted voting (vote intents can lock more CKB for higher capped weight).
-          </span>
-        </label>
-        <div className="hint">
-          Weighted mode cap: 1 unit = {perUnitCkb.toString()} CKB, max {MAX_WEIGHT_UNITS_PER_INTENT.toString()} units ({maxEffectiveCkb.toString()} CKB effective). Extra CKB above cap adds no extra weight.
+          <div className="hint">
+            Hours and days use CKB's approximate four-hour epoch target and round up. The on-chain epoch deadline remains authoritative.
+          </div>
         </div>
 
         <div className="alert alert-warn">

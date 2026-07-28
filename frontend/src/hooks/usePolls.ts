@@ -2,11 +2,11 @@
  * usePolls Hook
  * =============
  * Indexes governance poll and intent cells and exposes transaction flows that
- * follow the contract's six-operation model, including off-chain duplicate
+ * follow the contract's sharded lifecycle, including off-chain duplicate
  * intent checks and delegated voting authority discovery.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { ccc } from "@ckb-ccc/core";
 import {
   buildAggregateTallyShardTx,
@@ -19,8 +19,10 @@ import {
   buildDelegateTx,
   buildGovernanceTypeScript,
   buildRefundClosedIntentTx,
+  buildRefundLateIntentTx,
   buildRevokeDelegationTx,
   deriveTallyShardId,
+  epochNumber,
   getTipEpoch,
   getSignerLockHashHex,
   hashScript,
@@ -53,19 +55,21 @@ import {
   selectCloseTimeIntentRefunds,
   tallyMergeCoverageComplete,
 } from "../lib/protocolUi";
+import {
+  monitorSubmittedTransaction,
+  TransactionUnconfirmedError,
+} from "../lib/txLifecycle";
 
 export interface CreatePollParams {
   question: string;
   options: string[];
   durationEpochs: number;
-  tokenWeighted?: boolean;
 }
 
 export interface CastVoteParams {
   poll: Poll;
   optionIndex: number;
   authorityId?: string;
-  weightUnits?: number;
 }
 
 function deriveWinnerIndex(voteCounts: bigint[]): number | null {
@@ -91,52 +95,14 @@ function deriveWinnerIndex(voteCounts: bigint[]): number | null {
 
 async function resolveCellCreatedEpoch(
   client: any,
-  txHash: string,
-  headerEpochCache: Map<string, bigint | null>
+  cell: any
 ): Promise<bigint | null> {
   try {
-    const txView = await client.getTransaction(txHash);
-    const blockHash =
-      txView?.txStatus?.blockHash ??
-      txView?.tx_status?.block_hash ??
-      txView?.txStatus?.block_hash ??
-      txView?.tx_status?.blockHash ??
-      null;
-
-    if (!blockHash) return null;
-    if (headerEpochCache.has(blockHash)) {
-      return headerEpochCache.get(blockHash) ?? null;
-    }
-
-    const header = await client.getHeader(blockHash);
-    const rawEpoch =
-      header?.epoch ??
-      header?.header?.epoch ??
-      header?.inner?.epoch ??
-      null;
-
-    if (rawEpoch === null || rawEpoch === undefined) {
-      headerEpochCache.set(blockHash, null);
-      return null;
-    }
-
-    const parsed = BigInt(String(rawEpoch).split(",")[0]);
-    headerEpochCache.set(blockHash, parsed);
-    return parsed;
+    const resolved = await client.getCellWithHeader(cell.outPoint);
+    const header = resolved?.header;
+    return header?.epoch == null ? null : epochNumber(header.epoch);
   } catch {
     return null;
-  }
-}
-
-async function waitForTx(client: any, txHash: string): Promise<void> {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    try {
-      const tx = await client.getTransaction(txHash);
-      if (tx) return;
-    } catch {
-      // Keep polling while the network indexes the transaction.
-    }
   }
 }
 
@@ -187,13 +153,14 @@ function buildCloseIntentRefundSelection(input: {
   });
 }
 
-export function usePolls(signer: any | null) {
+export function usePolls(signer: any | null, readClient: any | null = signer?.client ?? null) {
   const [polls, setPolls] = useState<Poll[]>([]);
   const [intents, setIntents] = useState<Record<string, VoteIntent[]>>({});
   const [delegations, setDelegations] = useState<DelegationRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [txState, setTxState] = useState<TxState>({ status: "idle", txHash: null, error: null });
+  const trackedTxHashRef = useRef<string | null>(null);
   const [pollCells, setPollCells] = useState<Record<string, any>>({});
   const [intentCells, setIntentCells] = useState<Record<string, any[]>>({});
   const [tallyShardCells, setTallyShardCells] = useState<Record<string, any[]>>({});
@@ -201,12 +168,12 @@ export function usePolls(signer: any | null) {
   const [delegationCells, setDelegationCells] = useState<Record<string, any>>({});
 
   const fetchPolls = useCallback(async () => {
-    if (!signer) return;
+    const client = signer?.client ?? readClient;
+    if (!client) return;
 
     setLoading(true);
     setLoadError(null);
     try {
-      const client = signer.client;
       const pollScript = buildGovernanceTypeScript(OP.CREATE_POLL);
       const nextPolls: Poll[] = [];
       const nextIntents: Record<string, VoteIntent[]> = {};
@@ -216,9 +183,7 @@ export function usePolls(signer: any | null) {
       const nextTallyShards: Record<string, TallyShard[]> = {};
       const nextTallyMergeResultCells: Record<string, any[]> = {};
       const nextTallyMergeResults: Record<string, TallyMergeResult[]> = {};
-      const headerEpochCache = new Map<string, bigint | null>();
-      const currentLockHashHex = await getSignerLockHashHex(signer);
-      const tipEpoch = await getTipEpoch(client);
+      const currentLockHashHex = signer ? await getSignerLockHashHex(signer) : null;
 
       for await (const cell of client.findCells({
         script: pollScript,
@@ -228,13 +193,16 @@ export function usePolls(signer: any | null) {
         try {
           const pollBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
           const pollData = decodePollData(pollBytes);
+          if (pollData.shard_count <= 0) {
+            console.warn("Ignoring retired non-sharded poll cell", cell.outPoint);
+            continue;
+          }
           const pollId = hashScript(cell.cellOutput?.type ?? cell.output?.type);
           const voteCounts = pollData.vote_counts;
           const totalVotes = voteCounts.reduce((sum, count) => sum + count, 0n);
           const createdEpoch = await resolveCellCreatedEpoch(
             client,
-            cell.outPoint.txHash,
-            headerEpochCache
+            cell
           );
           nextPollCells[pollId] = cell;
 
@@ -261,10 +229,10 @@ export function usePolls(signer: any | null) {
             tallyShards: [],
             tallyMergeResults: [],
             tallyFrontier: {
-              source: pollData.shard_count > 0 && pollData.is_closed ? "closed-poll" : "poll-cell",
+              source: pollData.is_closed ? "closed-poll" : "live-shards",
               coveredShardCount: 0,
               shardCount: pollData.shard_count,
-              coverageComplete: pollData.shard_count === 0,
+              coverageComplete: false,
               selectedMergeResultIds: [],
               selectedShardIds: [],
               uncoveredShardIds: pollData.shard_count > 0
@@ -275,6 +243,7 @@ export function usePolls(signer: any | null) {
             winnerIndex: deriveWinnerIndex(voteCounts),
             authorityOptions: [],
             outstandingIntentCount: 0,
+            lateIntentCount: 0,
             refundableIntentCount: 0,
           });
 
@@ -393,6 +362,7 @@ export function usePolls(signer: any | null) {
             if (intentBytes.length < 74) continue;
 
             const intentData = decodeVoteIntentData(intentBytes);
+            const createdEpoch = await resolveCellCreatedEpoch(client, cell);
             nextIntentCellsForPoll.push(cell);
             nextIntents[poll.id].push({
               id: `${cell.outPoint.txHash}:${cell.outPoint.index}`,
@@ -404,6 +374,7 @@ export function usePolls(signer: any | null) {
               voterLockHash: bytesToHex(intentData.voter_lock_hash),
               optionIndex: intentData.option_index,
               votedAtEpoch: intentData.voted_at_epoch,
+              createdEpoch,
               aggregated: intentData.aggregated,
               capacity: BigInt(cell.cellOutput?.capacity ?? cell.output?.capacity ?? 0),
             });
@@ -419,96 +390,111 @@ export function usePolls(signer: any | null) {
       const nextDelegationCells: Record<string, any> = {};
       const delegationScript = buildGovernanceTypeScript(OP.DELEGATE);
 
-      for await (const cell of client.findCells({
-        script: delegationScript,
-        scriptType: "type",
-        scriptSearchMode: "prefix",
-      })) {
-        try {
-          const delegationBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
-          if (delegationBytes.length !== 104) continue;
+      if (currentLockHashHex) {
+        for await (const cell of client.findCells({
+          script: delegationScript,
+          scriptType: "type",
+          scriptSearchMode: "prefix",
+        })) {
+          try {
+            const delegationBytes = (ccc as any).bytesFrom(cell.outputData ?? "0x");
+            if (delegationBytes.length !== 104) continue;
 
-          const delegation = decodeDelegationData(delegationBytes);
-          const delegatorLockHash = bytesToHex(delegation.delegator_lock_hash);
-          const delegateLockHash = bytesToHex(delegation.delegate_lock_hash);
+            const delegation = decodeDelegationData(delegationBytes);
+            const delegatorLockHash = bytesToHex(delegation.delegator_lock_hash);
+            const delegateLockHash = bytesToHex(delegation.delegate_lock_hash);
 
-          if (
-            delegatorLockHash !== currentLockHashHex &&
-            delegateLockHash !== currentLockHashHex
-          ) {
-            continue;
+            if (
+              delegatorLockHash !== currentLockHashHex &&
+              delegateLockHash !== currentLockHashHex
+            ) {
+              continue;
+            }
+
+            const id = `${cell.outPoint.txHash}:${cell.outPoint.index}`;
+            nextDelegationCells[id] = cell;
+            nextDelegations.push({
+              id,
+              outPoint: {
+                txHash: cell.outPoint.txHash,
+                index: Number(cell.outPoint.index),
+              },
+              delegatorLockHash,
+              delegateLockHash,
+              pollId:
+                bytesToHex(delegation.poll_type_hash) === `0x${"00".repeat(32)}`
+                  ? null
+                  : bytesToHex(delegation.poll_type_hash),
+              expiresEpoch: delegation.expires_epoch,
+              capacity: BigInt((cell.cellOutput ?? cell.output).capacity),
+              isDelegator: delegatorLockHash === currentLockHashHex,
+            });
+          } catch (error) {
+            console.warn("Failed to decode delegation cell", error);
           }
-
-          const id = `${cell.outPoint.txHash}:${cell.outPoint.index}`;
-          nextDelegationCells[id] = cell;
-          nextDelegations.push({
-            id,
-            outPoint: {
-              txHash: cell.outPoint.txHash,
-              index: Number(cell.outPoint.index),
-            },
-            delegatorLockHash,
-            delegateLockHash,
-            pollId:
-              bytesToHex(delegation.poll_type_hash) === `0x${"00".repeat(32)}`
-                ? null
-                : bytesToHex(delegation.poll_type_hash),
-            expiresEpoch: delegation.expires_epoch,
-            capacity: BigInt((cell.cellOutput ?? cell.output).capacity),
-            isDelegator: delegatorLockHash === currentLockHashHex,
-          });
-        } catch (error) {
-          console.warn("Failed to decode delegation cell", error);
         }
       }
 
       for (const poll of nextPolls) {
         const pollIntents = nextIntents[poll.id] ?? [];
         const pendingPollIntents = pollIntents.filter((intent) => !intent.aggregated);
+        const timelyPendingIntents = pendingPollIntents.filter(
+          (intent) => intent.createdEpoch !== null && intent.createdEpoch <= poll.deadline
+        );
+        const latePendingIntents = pendingPollIntents.filter(
+          (intent) => intent.createdEpoch !== null && intent.createdEpoch > poll.deadline
+        );
         const authorityOptions: VoteAuthorityOption[] = [];
 
-        const directIntents = pollIntents.filter(
-          (intent) => intent.voterLockHash === currentLockHashHex
-        );
-
-        authorityOptions.push({
-          id: "self",
-          mode: "self",
-          label: "Vote as connected wallet",
-          voterLockHash: currentLockHashHex,
-          delegationId: null,
-          hasIntent: directIntents.length > 0,
-          hasPendingIntent: directIntents.some((intent) => !intent.aggregated),
-          hasAggregatedIntent: directIntents.some((intent) => intent.aggregated),
-        });
-
-        const applicableDelegations = nextDelegations
-          .filter((delegation) => delegation.delegateLockHash === currentLockHashHex)
-          .filter((delegation) => delegation.pollId === null || delegation.pollId === poll.id)
-          .filter((delegation) => delegation.expiresEpoch === 0n || delegation.expiresEpoch >= tipEpoch);
-
-        for (const delegation of applicableDelegations) {
-          const delegatedIntents = pollIntents.filter(
-            (intent) => intent.voterLockHash === delegation.delegatorLockHash
+        if (currentLockHashHex) {
+          const directIntents = pollIntents.filter(
+            (intent) => intent.voterLockHash === currentLockHashHex
           );
 
           authorityOptions.push({
-            id: delegation.id,
-            mode: "delegation",
-            label: `Vote for ${delegation.delegatorLockHash.slice(0, 14)}...`,
-            voterLockHash: delegation.delegatorLockHash,
-            delegationId: delegation.id,
-            hasIntent: delegatedIntents.length > 0,
-            hasPendingIntent: delegatedIntents.some((intent) => !intent.aggregated),
-            hasAggregatedIntent: delegatedIntents.some((intent) => intent.aggregated),
+            id: "self",
+            mode: "self",
+            label: "Vote as connected wallet",
+            voterLockHash: currentLockHashHex,
+            delegationId: null,
+            hasIntent: directIntents.length > 0,
+            hasPendingIntent: directIntents.some((intent) => !intent.aggregated),
+            hasAggregatedIntent: directIntents.some((intent) => intent.aggregated),
           });
+
+          const applicableDelegations = nextDelegations
+            .filter((delegation) => delegation.delegateLockHash === currentLockHashHex)
+            .filter((delegation) => delegation.pollId === null || delegation.pollId === poll.id)
+            .filter(
+              (delegation) =>
+                delegation.delegatorLockHash.toLowerCase() !== poll.creator.toLowerCase()
+            )
+            .filter((delegation) => delegation.expiresEpoch === 0n);
+
+          for (const delegation of applicableDelegations) {
+            const delegatedIntents = pollIntents.filter(
+              (intent) => intent.voterLockHash === delegation.delegatorLockHash
+            );
+
+            authorityOptions.push({
+              id: delegation.id,
+              mode: "delegation",
+              label: `Vote for ${delegation.delegatorLockHash.slice(0, 14)}...`,
+              voterLockHash: delegation.delegatorLockHash,
+              delegationId: delegation.id,
+              hasIntent: delegatedIntents.length > 0,
+              hasPendingIntent: delegatedIntents.some((intent) => !intent.aggregated),
+              hasAggregatedIntent: delegatedIntents.some((intent) => intent.aggregated),
+            });
+          }
         }
 
         poll.authorityOptions = authorityOptions;
         // UI action gates should follow indexer-observed pending intents until
         // poll.pending_intent_count is promoted to strict on-chain accounting.
-        poll.pendingIntentCount = BigInt(pendingPollIntents.length);
-        poll.outstandingIntentCount = pendingPollIntents.length;
+        poll.pendingIntentCount = BigInt(timelyPendingIntents.length);
+        poll.outstandingIntentCount = timelyPendingIntents.length;
+        poll.lateIntentCount = latePendingIntents.length;
         poll.refundableIntentCount = pollIntents.length;
       }
 
@@ -525,7 +511,35 @@ export function usePolls(signer: any | null) {
     } finally {
       setLoading(false);
     }
-  }, [signer]);
+  }, [readClient, signer]);
+
+  const trackSubmittedTransaction = useCallback(
+    async (txHash: string): Promise<void> => {
+      if (!signer) return;
+
+      trackedTxHashRef.current = txHash;
+      setTxState({ status: "confirming", txHash, error: null });
+      const outcome = await monitorSubmittedTransaction({
+        client: signer.client,
+        txHash,
+        onCommitted: async () => {
+          if (trackedTxHashRef.current === txHash) {
+            setTxState({ status: "success", txHash, error: null });
+          }
+          await fetchPolls();
+        },
+        onUnconfirmed: (error) => {
+          if (trackedTxHashRef.current === txHash) {
+            setTxState({ status: "unconfirmed", txHash, error: error.message });
+          }
+        },
+      });
+      if (outcome === "unconfirmed") {
+        throw new TransactionUnconfirmedError(txHash);
+      }
+    },
+    [fetchPolls, signer]
+  );
 
   const createPoll = useCallback(
     async (params: CreatePollParams) => {
@@ -536,28 +550,35 @@ export function usePolls(signer: any | null) {
 
       setTxState({ status: "building", txHash: null, error: null });
       try {
-        const tx = await buildCreatePollTx(signer, params);
+        // Duration is a builder/UI policy. The transaction commits the exact
+        // absolute epoch chosen from this observed tip; the VM cannot prove an
+        // output transaction's eventual inclusion epoch.
+        const observedEpoch = await getTipEpoch(signer.client);
+        const tx = await buildCreatePollTx(signer, {
+          ...params,
+          deadlineEpoch: observedEpoch + BigInt(params.durationEpochs),
+        });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, signer]
+    [signer, trackSubmittedTransaction]
   );
 
   const castVote = useCallback(
-    async ({ poll, optionIndex, authorityId, weightUnits }: CastVoteParams) => {
+    async ({ poll, optionIndex, authorityId }: CastVoteParams) => {
       if (!signer) throw new Error("Wallet not connected");
+      if (poll.tokenWeighted) {
+        throw new Error("Weighted polls are unsupported; only recovery actions are available");
+      }
 
       const selectedAuthority =
         poll.authorityOptions.find((authority) => authority.id === (authorityId ?? "self")) ??
@@ -585,24 +606,20 @@ export function usePolls(signer: any | null) {
           optionIndex,
           pollCell,
           delegationCell,
-          weightUnits,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [delegationCells, fetchPolls, pollCells, signer]
+    [delegationCells, pollCells, signer, trackSubmittedTransaction]
   );
 
   const closePoll = useCallback(
@@ -628,25 +645,22 @@ export function usePolls(signer: any | null) {
         const tx = await buildClosePollTx(signer, {
           pollCell,
           intentCells: closeIntentSelection.included.map((candidate) => candidate.cell),
-          shardCells: indexedShardCells,
+          shardCells: poll.shardCount > MAX_DIRECT_CLOSE_SHARDS ? [] : indexedShardCells,
           mergeResultCell: finalMergeResultCell,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, intentCells, pollCells, signer, tallyMergeResultCells, tallyShardCells]
+    [intentCells, pollCells, signer, tallyMergeResultCells, tallyShardCells, trackSubmittedTransaction]
   );
 
   const forceClose = useCallback(
@@ -672,25 +686,22 @@ export function usePolls(signer: any | null) {
         const tx = await buildForceCloseTx(signer, {
           pollCell,
           intentCells: closeIntentSelection.included.map((candidate) => candidate.cell),
-          shardCells: indexedShardCells,
+          shardCells: poll.shardCount > MAX_DIRECT_CLOSE_SHARDS ? [] : indexedShardCells,
           mergeResultCell: finalMergeResultCell,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, intentCells, pollCells, signer, tallyMergeResultCells, tallyShardCells]
+    [intentCells, pollCells, signer, tallyMergeResultCells, tallyShardCells, trackSubmittedTransaction]
   );
 
   const refundClosedIntent = useCallback(
@@ -733,31 +744,74 @@ export function usePolls(signer: any | null) {
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, intentCells, pollCells, signer]
+    [intentCells, pollCells, signer, trackSubmittedTransaction]
+  );
+
+  const refundLateIntent = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
+      if (poll.isClosed) throw new Error("Use the post-close refund path for a closed poll");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+      const lateIntent = (intents[poll.id] ?? []).find(
+        (intent) => !intent.aggregated &&
+          intent.createdEpoch !== null &&
+          intent.createdEpoch > poll.deadline
+      );
+      if (!lateIntent) throw new Error("No authenticated late intent is indexed for refund");
+      const intentCell = (intentCells[poll.id] ?? []).find(
+        (cell) => `${cell.outPoint.txHash}:${cell.outPoint.index}` === lateIntent.id
+      );
+      if (!intentCell) throw new Error("Late intent cell is no longer live");
+
+      setTxState({ status: "building", txHash: null, error: null });
+      try {
+        const tx = await buildRefundLateIntentTx(signer, { pollCell, intentCell });
+        setTxState({ status: "signing", txHash: null, error: null });
+        const txHash = await signAndSendTx(signer, tx);
+        await trackSubmittedTransaction(txHash);
+        return txHash;
+      } catch (error: any) {
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
+        throw error;
+      }
+    },
+    [intentCells, intents, pollCells, signer, trackSubmittedTransaction]
   );
 
   const aggregatePoll = useCallback(
     async (poll: Poll) => {
       if (!signer) throw new Error("Wallet not connected");
+      if (poll.tokenWeighted) {
+        throw new Error("Weighted polls are unsupported; only recovery actions are available");
+      }
 
       const pollCell = pollCells[poll.id];
+      const indexedIntents = new Map(
+        (intents[poll.id] ?? []).map((intent) => [intent.id, intent])
+      );
       const pendingIntentCells = (intentCells[poll.id] ?? []).filter((cell) => {
         try {
           const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
-          return !decoded.aggregated;
+          const id = `${cell.outPoint.txHash}:${cell.outPoint.index}`;
+          const indexed = indexedIntents.get(id);
+          return !decoded.aggregated &&
+            indexed?.createdEpoch !== null &&
+            indexed?.createdEpoch !== undefined &&
+            indexed.createdEpoch <= poll.deadline;
         } catch {
           return false;
         }
@@ -801,20 +855,17 @@ export function usePolls(signer: any | null) {
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, intentCells, pollCells, signer, tallyShardCells]
+    [intentCells, intents, pollCells, signer, tallyShardCells, trackSubmittedTransaction]
   );
 
   const finalizeShards = useCallback(
@@ -844,20 +895,17 @@ export function usePolls(signer: any | null) {
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, pollCells, signer, tallyShardCells]
+    [pollCells, signer, tallyShardCells, trackSubmittedTransaction]
   );
 
   const mergeShards = useCallback(
@@ -927,49 +975,57 @@ export function usePolls(signer: any | null) {
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, pollCells, signer, tallyMergeResultCells, tallyShardCells]
+    [pollCells, signer, tallyMergeResultCells, tallyShardCells, trackSubmittedTransaction]
   );
 
   const createDelegation = useCallback(
     async (params: DelegateParams) => {
       if (!signer) throw new Error("Wallet not connected");
 
+      const normalizedPollId = params.pollId.toLowerCase();
+      const targetPoll = polls.find((poll) => poll.id.toLowerCase() === normalizedPollId);
+      if (!targetPoll) {
+        throw new Error("Delegation scope must reference an indexed poll");
+      }
+      const signerLockHash = await getSignerLockHashHex(signer);
+      if (targetPoll.creator.toLowerCase() === signerLockHash.toLowerCase()) {
+        throw new Error("Poll creators cannot delegate voting authority for their own poll");
+      }
+      const tipEpoch = await getTipEpoch(signer.client);
+      if (targetPoll.isClosed || tipEpoch > targetPoll.deadline) {
+        throw new Error("Delegation can only be created for an open poll before its deadline");
+      }
+
       setTxState({ status: "building", txHash: null, error: null });
       try {
         const tx = await buildDelegateTx(signer, {
           delegateLockHash: params.delegateLockHash,
-          pollTypeHash: params.pollId,
-          expiresEpoch: params.expiresEpoch,
+          pollTypeHash: targetPoll.id,
+          forbiddenDelegateLockHash: targetPoll.creator,
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [fetchPolls, signer]
+    [polls, signer, trackSubmittedTransaction]
   );
 
   const revokeDelegation = useCallback(
@@ -986,20 +1042,17 @@ export function usePolls(signer: any | null) {
         });
         setTxState({ status: "signing", txHash: null, error: null });
         const txHash = await signAndSendTx(signer, tx);
-        setTxState({ status: "confirming", txHash, error: null });
-
-        waitForTx(signer.client, txHash).then(async () => {
-          setTxState({ status: "success", txHash, error: null });
-          await fetchPolls();
-        });
+        await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
-        setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+        }
         throw error;
       }
     },
-    [delegationCells, fetchPolls, signer]
+    [delegationCells, signer, trackSubmittedTransaction]
   );
 
   const currentEpoch = useCallback(async (): Promise<bigint> => {
@@ -1025,6 +1078,7 @@ export function usePolls(signer: any | null) {
     revokeDelegation,
     forceClose,
     refundClosedIntent,
+    refundLateIntent,
     currentEpoch,
   };
 }

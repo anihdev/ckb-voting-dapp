@@ -67,6 +67,43 @@ export function TxStatus({ txState }: Props) {
     );
   }
 
+  if (status === "unconfirmed") {
+    return (
+      <div
+        className="alert"
+        style={{
+          display: "flex",
+          gap: 12,
+          borderColor: "var(--amber)",
+          background: "var(--amber-dim)",
+        }}
+      >
+        <span style={{ fontSize: 16, color: "var(--amber)", lineHeight: 1 }}>!</span>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontWeight: 600, color: "var(--amber)" }}>Confirmation not verified</div>
+          <div style={{ fontSize: 11, marginTop: 3 }}>
+            The transaction was broadcast, but the app did not observe it committed before the confirmation timeout.
+          </div>
+          {error && (
+            <div style={{ fontSize: 11, marginTop: 3, fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>
+              {error}
+            </div>
+          )}
+          {txHash && (
+            <a
+              href={`${EXPLORER_BASE}/${txHash}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ display: "inline-block", marginTop: 5, color: "var(--teal)", fontSize: 11 }}
+            >
+              Check transaction on Explorer -&gt;
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const currentStep = STEPS.findIndex((step) => step.key === status);
 
   return (
@@ -146,7 +183,7 @@ export function TxStatus({ txState }: Props) {
 
       {status === "success" && (
         <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--teal)" }}>
-           Transaction confirmed on CKB.
+          Transaction committed on CKB.
         </div>
       )}
     </div>

@@ -10,6 +10,8 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  // Deployment and local development share the repository-root environment file.
+  envDir: path.resolve(__dirname, "../.."),
   resolve: {
     alias: {
       // Keep source imports stable even though the package root is frontend/src.

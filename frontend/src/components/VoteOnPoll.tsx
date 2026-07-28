@@ -13,15 +13,20 @@ import {
   FORCE_CLOSE_GRACE_EPOCHS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_DIRECT_CLOSE_SHARDS,
-  MAX_WEIGHT_UNITS_PER_INTENT,
-  SHANNONS_PER_CKB,
-  VOTER_DEPOSIT_SHANNONS,
 } from "../lib/constants";
 import {
   canFinalizeTallyShardFromUi,
+  EpochPosition,
+  estimatePollCloseHours,
+  formatApproxEpochDuration,
+  formatApproxWallClockDuration,
   getFinalizeShardConfirmationMessage,
+  isPollVotingSupported,
   tallyMergeCoverageComplete,
+  UNSUPPORTED_WEIGHTED_POLL_LABEL,
+  UNSUPPORTED_WEIGHTED_POLL_MESSAGE,
 } from "../lib/protocolUi";
+import { isTransactionInFlight } from "../lib/txLifecycle";
 
 interface Props {
   anchorId?: string;
@@ -29,14 +34,16 @@ interface Props {
   voterAddress: string | null;
   voterLockHash: string | null;
   txState: TxState;
-  onVote: (poll: Poll, optionIndex: number, authorityId?: string, weightUnits?: number) => Promise<string>;
+  onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
   onFinalizeShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
   onRefundClosedIntent: (poll: Poll) => Promise<string>;
+  onRefundLateIntent: (poll: Poll) => Promise<string>;
   currentEpoch: bigint;
+  currentEpochPosition?: EpochPosition;
 }
 
 interface PendingConfirmAction {
@@ -45,8 +52,6 @@ interface PendingConfirmAction {
   confirmLabel: string;
   execute: () => Promise<void>;
 }
-
-const APPROX_MINUTES_PER_EPOCH = 4;
 
 function toErrorMessage(caughtError: unknown, fallback: string): string {
   if (caughtError instanceof Error && caughtError.message) {
@@ -71,16 +76,6 @@ function mapActionErrorToUserMessage(rawMessage: string): string {
   return rawMessage;
 }
 
-function formatEpochDuration(epochSpan: bigint): string {
-  if (epochSpan <= 0n) return "0 epochs (~0m)";
-  const minutes = Number(epochSpan) * APPROX_MINUTES_PER_EPOCH;
-  if (minutes < 60) {
-    return `${epochSpan.toString()} epochs (~${minutes}m)`;
-  }
-  const hours = minutes / 60;
-  return `${epochSpan.toString()} epochs (~${hours.toFixed(1)}h)`;
-}
-
 function tallySourceLabel(source: Poll["tallyFrontier"]["source"]): string {
   switch (source) {
     case "live-shards":
@@ -91,9 +86,8 @@ function tallySourceLabel(source: Poll["tallyFrontier"]["source"]): string {
       return "Tally source: complete merge result";
     case "closed-poll":
       return "Tally source: closed poll result";
-    case "poll-cell":
     default:
-      return "Tally source: legacy poll cell";
+      return "Tally source: live shard cells";
   }
 }
 
@@ -110,23 +104,23 @@ export function VoteOnPoll({
   onClose,
   onForceClose,
   onRefundClosedIntent,
+  onRefundLateIntent,
   currentEpoch,
+  currentEpochPosition,
 }: Props) {
   const [selected, setSelected] = useState<number | null>(null);
   const [authorityId, setAuthorityId] = useState<string>("self");
-  const [weightUnits, setWeightUnits] = useState<number>(1);
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [intentSubmitted, setIntentSubmitted] = useState(false);
   const [confirmingForceClose, setConfirmingForceClose] = useState(false);
   const [pendingConfirmAction, setPendingConfirmAction] = useState<PendingConfirmAction | null>(null);
-  const perUnitCkb = VOTER_DEPOSIT_SHANNONS / SHANNONS_PER_CKB;
-  const maxEffectiveCkb = (VOTER_DEPOSIT_SHANNONS * MAX_WEIGHT_UNITS_PER_INTENT) / SHANNONS_PER_CKB;
   const isCreator =
     Boolean(voterLockHash) &&
     poll.creator.toLowerCase() === (voterLockHash ?? "").toLowerCase();
 
-  const isBusy = submitting;
+  const isBusy = submitting || isTransactionInFlight(txState.status);
+  const votingSupported = isPollVotingSupported(poll);
   const isExpired = currentEpoch > poll.deadline;
   const forceCloseGraceEndEpoch = poll.deadline + FORCE_CLOSE_GRACE_EPOCHS;
   const forceCloseOpen = currentEpoch > forceCloseGraceEndEpoch;
@@ -140,7 +134,6 @@ export function VoteOnPoll({
     directCloseTooLarge &&
     poll.tallyMergeResults.some((result) => tallyMergeCoverageComplete(result.coverage, poll.shardCount));
   const closeStateReady =
-    !poll.shardCount ||
     (!directCloseTooLarge && allShardsFinalized) ||
     (directCloseTooLarge && hasCompleteMergeResult);
   const tallyCoverageComplete = poll.tallyFrontier.coverageComplete;
@@ -148,7 +141,7 @@ export function VoteOnPoll({
   const tallyCoverageText =
     poll.tallyFrontier.shardCount > 0
       ? `${poll.tallyFrontier.coveredShardCount.toString()}/${poll.tallyFrontier.shardCount.toString()} shards covered`
-      : "non-sharded historical poll";
+      : "no shard coverage indexed";
   const uncoveredPreview = poll.tallyFrontier.uncoveredShardIds.slice(0, 8).join(", ");
   const uncoveredSuffix =
     poll.tallyFrontier.uncoveredShardIds.length > 8
@@ -160,7 +153,10 @@ export function VoteOnPoll({
     hasCreatedEpoch && poll.deadline > createdEpoch ? poll.deadline - createdEpoch : 0n;
   const elapsedSinceCreated =
     hasCreatedEpoch && currentEpoch > createdEpoch ? currentEpoch - createdEpoch : 0n;
-  const epochsLeft = !isExpired ? poll.deadline - currentEpoch : 0n;
+  const estimatedCloseHours = estimatePollCloseHours(
+    poll.deadline,
+    currentEpochPosition ?? { epoch: currentEpoch, index: 0n, length: 1n }
+  );
   const epochsPastDeadline = isExpired ? currentEpoch - poll.deadline : 0n;
   const selectedAuthority = useMemo(
     () =>
@@ -169,6 +165,9 @@ export function VoteOnPoll({
       null,
     [authorityId, poll.authorityOptions]
   );
+  const selectedAuthorityRepresentsCreator =
+    Boolean(selectedAuthority) &&
+    selectedAuthority?.voterLockHash.toLowerCase() === poll.creator.toLowerCase();
 
   useEffect(() => {
     if (!selectedAuthority && poll.authorityOptions[0]) {
@@ -195,12 +194,7 @@ export function VoteOnPoll({
     setLocalError(null);
 
     try {
-      await onVote(
-        poll,
-        selected,
-        selectedAuthority?.id,
-        poll.tokenWeighted ? weightUnits : 1
-      );
+      await onVote(poll, selected, selectedAuthority?.id);
       setIntentSubmitted(true);
       setSelected(null);
     } catch (caughtError: any) {
@@ -284,6 +278,18 @@ export function VoteOnPoll({
     }
   };
 
+  const handleRefundLateIntent = async () => {
+    setSubmitting(true);
+    setLocalError(null);
+    try {
+      await onRefundLateIntent(poll);
+    } catch (caughtError: any) {
+      setLocalError(mapActionErrorToUserMessage(toErrorMessage(caughtError, "Late intent refund failed")));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const requestConfirmation = (action: PendingConfirmAction) => {
     if (isBusy) return;
     setPendingConfirmAction(action);
@@ -303,12 +309,19 @@ export function VoteOnPoll({
   const hasWallet = Boolean(voterAddress);
   const canVote =
     hasWallet &&
+    votingSupported &&
     !isCreator &&
+    !selectedAuthorityRepresentsCreator &&
     !poll.isClosed &&
     !isExpired &&
     Boolean(selectedAuthority) &&
     !selectedAuthority?.hasIntent;
-  const canAggregate = hasWallet && !poll.isClosed && !isExpired && poll.pendingIntentCount > 0n;
+  const canAggregate =
+    hasWallet &&
+    votingSupported &&
+    !poll.isClosed &&
+    poll.pendingIntentCount > 0n &&
+    poll.tallyShards.some((shard) => !shard.finalized);
   const canFinalizeShards =
     hasWallet &&
     canFinalizeTallyShardFromUi(poll, currentEpoch) &&
@@ -335,10 +348,18 @@ export function VoteOnPoll({
     hasWallet &&
     poll.isClosed &&
     poll.refundableIntentCount > 0;
+  const canRefundLateIntent =
+    hasWallet &&
+    !poll.isClosed &&
+    poll.lateIntentCount > 0;
   const optionIsActionable = canVote && !isBusy;
 
-  const authorityDescription = isCreator
+  const authorityDescription = !votingSupported
+    ? "Weighted voting is disabled for this indexed poll. Only lifecycle recovery actions remain available."
+    : isCreator
     ? "You are viewing this poll as its creator. Vote intent submission is disabled in creator view."
+    : selectedAuthorityRepresentsCreator
+      ? "This delegated authority represents the poll creator. Consensus does not allow the creator to vote through a delegate."
     : selectedAuthority
       ? selectedAuthority.mode === "self"
         ? selectedAuthority.hasIntent
@@ -350,7 +371,7 @@ export function VoteOnPoll({
           ? selectedAuthority.hasPendingIntent
             ? "This delegated voter already has a pending intent on this poll. Intent changes are disabled."
             : "This delegated voter already has an aggregated vote intent on this poll."
-          : "This delegate can create an intent for the delegator using the live delegation cell as a read-only cell dep. Delegation grants intent authority, not ownership."
+          : "This delegate can create an intent for the delegator using the live delegation cell as a read-only cell dep. In testnet v1, the delegate funds the intent capacity and the exact refund returns to the delegator."
       : "No voting authority is available for this poll.";
 
   return (
@@ -392,7 +413,7 @@ export function VoteOnPoll({
           <span>|</span>
           <span>{isCreator ? "Creator view" : "Voter view"}</span>
           <span>|</span>
-          <span>{poll.tokenWeighted ? "Capped weighted mode" : "1 voter = 1 vote"}</span>
+          <span>{poll.tokenWeighted ? UNSUPPORTED_WEIGHTED_POLL_LABEL : "1 voter = 1 vote"}</span>
           <span>|</span>
           <span>{poll.shardCount.toString()} tally shards</span>
           <span>|</span>
@@ -412,28 +433,41 @@ export function VoteOnPoll({
           </div>
           {hasCreatedEpoch && (
             <>
-              <div>Planned live window: {formatEpochDuration(plannedLiveEpochs)}</div>
-              <div>Time passed since creation: {formatEpochDuration(elapsedSinceCreated)}</div>
+              <div>Planned live window: {formatApproxEpochDuration(plannedLiveEpochs)}</div>
+              <div>Time passed since creation: {formatApproxEpochDuration(elapsedSinceCreated)}</div>
             </>
           )}
           {!isExpired ? (
-            <div>Time left until close window: {formatEpochDuration(epochsLeft)}</div>
+            <div>
+              Estimated time until close window: {formatApproxWallClockDuration(estimatedCloseHours)}
+            </div>
           ) : (
-            <div>Time passed since deadline: {formatEpochDuration(epochsPastDeadline)}</div>
+            <div>Time passed since deadline: {formatApproxEpochDuration(epochsPastDeadline)}</div>
           )}
         </div>
 
         {!poll.isClosed && (
           <div className="mt-3 space-y-2 text-xs">
-            <div className="alert alert-info">
-              Submitting intent records your choice now; tally updates after aggregation.
-            </div>
-            <div className="alert alert-warn">
-              Intent finality: once your vote intent is recorded on-chain, it cannot be changed for this poll. Review authority, option, and weight before submit.
-            </div>
+            {poll.tokenWeighted && (
+              <div className="alert alert-error">
+                {UNSUPPORTED_WEIGHTED_POLL_MESSAGE}
+              </div>
+            )}
+            {votingSupported && (
+              <>
+                <div className="alert alert-info">
+                  Submitting intent records your choice now; tally updates after aggregation.
+                </div>
+                <div className="alert alert-warn">
+                  Intent finality: once your vote intent is recorded on-chain, it cannot be changed for this poll. Review authority and option before submit.
+                </div>
+              </>
+            )}
             {isCreator && (
               <div className="alert alert-info">
-                Creator close is available after the deadline when tally state is ready. Shard aggregation, finalization, merge, force-close after grace, and omitted-intent refunds are maintenance actions any connected wallet can run with enough CKB.
+                {votingSupported
+                  ? "Creator close is available after the deadline when tally state is ready. Shard aggregation, finalization, merge, force-close after grace, and omitted-intent refunds are maintenance actions any connected wallet can run with enough CKB."
+                  : "Creator close remains available after the deadline when recovery state is ready. Finalization, merge, force-close after grace, and omitted-intent refunds remain recovery actions; aggregation is disabled."}
               </div>
             )}
             {!isExpired && (
@@ -451,9 +485,16 @@ export function VoteOnPoll({
                 Grace period elapsed. Anyone can force-close now so deposits are not locked indefinitely.
               </div>
             )}
-            {!isExpired && poll.pendingIntentCount > 0n && (
+            {poll.pendingIntentCount > 0n && (
               <div className="alert" style={{ background: "var(--surface-2)", border: "1px solid var(--line)", color: "var(--ink-2)" }}>
-                Pending intents detected. Aggregate before deadline to keep tally state current and reduce close-time backlog.
+                {votingSupported
+                  ? "Timely pending intents detected. They may be aggregated after the deadline until their shard is finalized."
+                  : "Pending weighted intents cannot be aggregated by this deployment. Finalize and close the poll to make omitted intent capacity recoverable."}
+              </div>
+            )}
+            {!poll.isClosed && poll.lateIntentCount > 0 && (
+              <div className="alert alert-warn">
+                {poll.lateIntentCount.toString()} intent(s) were committed after the deadline. They cannot count and are eligible for full-capacity refund.
               </div>
             )}
             {poll.shardCount > 0 && (
@@ -493,41 +534,9 @@ export function VoteOnPoll({
       </div>
 
       <div className="space-y-2.5 px-4 pb-4 sm:px-5">
-        {!isCreator && poll.tokenWeighted && (
-          <div className="alert alert-warn rounded-xl px-3.5 py-3">
-            <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide" style={{ color: "var(--amber)" }}>
-              Vote weight units
-            </label>
-            <input
-              type="number"
-              min={1}
-              max={Number(MAX_WEIGHT_UNITS_PER_INTENT)}
-              value={weightUnits}
-              onChange={(event) => {
-                const parsed = parseInt(event.target.value, 10);
-                if (Number.isNaN(parsed)) {
-                  setWeightUnits(1);
-                  return;
-                }
-                if (parsed < 1) {
-                  setWeightUnits(1);
-                  return;
-                }
-                const max = Number(MAX_WEIGHT_UNITS_PER_INTENT);
-                setWeightUnits(parsed > max ? max : parsed);
-              }}
-              disabled={isBusy}
-              className="input"
-            />
-            <p className="mt-2 text-xs" style={{ color: "var(--amber)" }}>
-              1 unit = {perUnitCkb.toString()} CKB, max {MAX_WEIGHT_UNITS_PER_INTENT.toString()} units ({maxEffectiveCkb.toString()} CKB effective). Extra CKB above cap adds no extra weight.
-            </p>
-          </div>
-        )}
-
-        {!isCreator && poll.authorityOptions.length > 0 && (
+        {!isCreator && votingSupported && poll.authorityOptions.length > 0 && (
           <div className="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3.5 py-3">
-            <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide subtle">
+            <label className="mb-1.5 block text-xs font-semibold uppercase subtle">
               Voting authority
             </label>
             <select
@@ -588,9 +597,12 @@ export function VoteOnPoll({
             const isSelected = selected === index;
 
             return (
-              <div
+              <button
+                type="button"
                 key={index}
-                onClick={() => canVote && !isBusy && setSelected(index)}
+                onClick={() => setSelected(index)}
+                disabled={!optionIsActionable}
+                aria-pressed={isSelected}
                 className={`poll-option${isSelected ? " selected" : ""}${optionIsActionable ? " is-actionable" : " disabled"}`}
                 title={optionIsActionable ? "Select this option to submit vote intent" : "Voting is not available for this poll state/authority"}
               >
@@ -603,7 +615,7 @@ export function VoteOnPoll({
                     {canVote && (
                       <div className="poll-option-radio" />
                     )}
-                    {isWinner && <span className="text-xs font-semibold uppercase tracking-[0.08em]" style={{ color: "#34d399" }}>Winner</span>}
+                    {isWinner && <span className="text-xs font-semibold uppercase" style={{ color: "#34d399" }}>Winner</span>}
                     <span className="text-sm font-medium text-[var(--ink)]">{option}</span>
                   </div>
                   <div className="ml-3 flex-shrink-0 text-right text-xs subtle">
@@ -611,7 +623,7 @@ export function VoteOnPoll({
                     <span className="ml-1" style={{ color: "var(--ink-3)" }}>({percentage}%)</span>
                   </div>
                 </div>
-              </div>
+              </button>
             );
           })}
         </div>
@@ -623,7 +635,7 @@ export function VoteOnPoll({
         )}
       </div>
 
-      {(canVote || canAggregate || canFinalizeShards || canMergeShards || canClose || canForceClose || canRefundClosedIntent) && (
+      {(canVote || canAggregate || canFinalizeShards || canMergeShards || canClose || canForceClose || canRefundClosedIntent || canRefundLateIntent) && (
         <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:px-5" style={{ borderTop: "1px solid var(--line)" }}>
           {confirmingForceClose ? (
             <div className="w-full">
@@ -655,12 +667,9 @@ export function VoteOnPoll({
                 <button
                   onClick={() => {
                     if (selected === null) return;
-                    const weightSummary = poll.tokenWeighted
-                      ? ` Weight: ${weightUnits} unit(s).`
-                      : "";
                     requestConfirmation({
                       title: "Confirm Vote Intent Submission",
-                      message: `You are about to record a vote intent for "${poll.options[selected]}". Once recorded on-chain, this intent cannot be changed for this poll.${weightSummary}`,
+                      message: `You are about to record a vote intent for "${poll.options[selected]}". Once recorded on-chain, this intent cannot be changed for this poll.${selectedAuthority?.mode === "delegation" ? " Testnet v1 uses your wallet to fund the intent capacity and refunds that capacity to the represented delegator." : ""}`,
                       confirmLabel: "Confirm Intent",
                       execute: handleVote,
                     });
@@ -681,7 +690,7 @@ export function VoteOnPoll({
                   onClick={() => {
                     requestConfirmation({
                       title: "Confirm Aggregation",
-                      message: "This will consume pending intents for one shard and update shard tally state on-chain. Any connected wallet with enough CKB can run this before the deadline.",
+                      message: "This will consume authenticated timely intents for one shard and update shard tally state on-chain. It remains valid after the deadline until that shard is finalized.",
                       confirmLabel: "Run Shard Aggregation",
                       execute: handleAggregate,
                     });
@@ -768,6 +777,23 @@ export function VoteOnPoll({
                   className="btn-quiet w-full sm:w-auto"
                 >
                   Refund Omitted Intent
+                </button>
+              )}
+
+              {canRefundLateIntent && (
+                <button
+                  onClick={() => {
+                    requestConfirmation({
+                      title: "Refund Late Intent",
+                      message: "This consumes one intent whose authenticated creation epoch is after the deadline and returns its exact full capacity to the encoded refund lock.",
+                      confirmLabel: "Refund Late Intent",
+                      execute: handleRefundLateIntent,
+                    });
+                  }}
+                  disabled={isBusy}
+                  className="btn-quiet w-full sm:w-auto"
+                >
+                  Refund Late Intent
                 </button>
               )}
             </>

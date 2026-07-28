@@ -14,7 +14,7 @@ loadDotenv({ path: path.resolve(__dirname, "../../.env") });
 export const NETWORK: "testnet" | "mainnet" = "testnet";
 
 export const RPC_URLS = {
-  testnet: "https://testnet.ckb.dev/rpc",
+  testnet: "https://testnet.ckb.dev/",
   mainnet: "https://mainnet.ckb.dev/rpc",
 };
 

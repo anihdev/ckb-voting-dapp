@@ -22,6 +22,104 @@ import {
 export const FINALIZE_PENDING_INTENTS_WARNING =
   "Pending intents are still indexed. Finalizing can leave them uncounted; they remain refundable after close.";
 
+export const UNSUPPORTED_WEIGHTED_POLL_LABEL = "Weighted voting disabled; recovery only";
+export const UNSUPPORTED_WEIGHTED_POLL_MESSAGE =
+  "Weighted voting is unsupported in this equal-weight deployment. New voting and aggregation are disabled; finalization, close, and exact-capacity recovery remain available.";
+
+export const CKB_EPOCH_TARGET_HOURS = 4;
+
+export type PollDurationUnit = "hours" | "days" | "epochs";
+
+export interface EpochPosition {
+  epoch: bigint;
+  index: bigint;
+  length: bigint;
+}
+
+/** Converts a human duration to whole CKB epochs without rounding it down. */
+export function pollDurationToEpochs(
+  value: number,
+  unit: PollDurationUnit
+): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+
+  const rawEpochs =
+    unit === "epochs"
+      ? value
+      : (unit === "days" ? value * 24 : value) / CKB_EPOCH_TARGET_HOURS;
+  const epochs = Math.ceil(rawEpochs);
+  return Number.isSafeInteger(epochs) ? epochs : 0;
+}
+
+/** Preserves an existing whole-epoch span when the form changes units. */
+export function epochSpanInUnit(
+  epochSpan: number,
+  unit: PollDurationUnit
+): number {
+  if (!Number.isSafeInteger(epochSpan) || epochSpan <= 0) return 0;
+  if (unit === "epochs") return epochSpan;
+
+  const hours = epochSpan * CKB_EPOCH_TARGET_HOURS;
+  return unit === "hours" ? hours : Number((hours / 24).toFixed(4));
+}
+
+export function formatApproxWallClockDuration(totalHours: number): string {
+  if (!Number.isFinite(totalHours) || totalHours <= 0) return "about 0 hours";
+
+  if (totalHours < 1) {
+    const minutes = Math.max(1, Math.round(totalHours * 60));
+    return `about ${minutes.toString()} ${minutes === 1 ? "minute" : "minutes"}`;
+  }
+
+  if (totalHours < 24) {
+    const rounded = Math.round(totalHours * 10) / 10;
+    return `about ${rounded.toString()} ${rounded === 1 ? "hour" : "hours"}`;
+  }
+
+  const days = Math.round((totalHours / 24) * 10) / 10;
+  return `about ${days.toString()} ${days === 1 ? "day" : "days"}`;
+}
+
+/**
+ * Estimates time until the first epoch in which close is valid.
+ * The protocol requires current_epoch > deadline, so the close window starts
+ * at deadline + 1 rather than at the beginning of the deadline epoch.
+ */
+export function estimatePollCloseHours(
+  deadline: bigint,
+  position: EpochPosition
+): number {
+  if (position.epoch > deadline) return 0;
+  if (position.length <= 0n || position.index < 0n || position.index >= position.length) {
+    return Number(deadline + 1n - position.epoch) * CKB_EPOCH_TARGET_HOURS;
+  }
+
+  const wholeEpochs = Number(deadline + 1n - position.epoch);
+  const currentFraction = Number(position.index) / Number(position.length);
+  return Math.max(0, (wholeEpochs - currentFraction) * CKB_EPOCH_TARGET_HOURS);
+}
+
+export function formatApproxEpochDuration(epochSpan: bigint): string {
+  if (epochSpan <= 0n) return "0 epochs (~0 hours)";
+
+  const totalHours = Number(epochSpan) * CKB_EPOCH_TARGET_HOURS;
+  const epochLabel = epochSpan === 1n ? "epoch" : "epochs";
+  if (totalHours < 24) {
+    return `${epochSpan.toString()} ${epochLabel} (~${totalHours.toString()} hours)`;
+  }
+
+  const days = totalHours / 24;
+  const dayText = Number.isInteger(days) ? days.toString() : days.toFixed(1);
+  const dayLabel = days === 1 ? "day" : "days";
+  return `${epochSpan.toString()} ${epochLabel} (~${dayText} ${dayLabel})`;
+}
+
+export function isPollVotingSupported(
+  poll: Pick<Poll, "tokenWeighted">
+): boolean {
+  return !poll.tokenWeighted;
+}
+
 export type PollLifecycleFilter = "open" | "needsClose" | "archived" | "all";
 export type PollLifecycleStatus = "open" | "needsClose" | "archived";
 
@@ -260,18 +358,7 @@ export function computeCanonicalTallyFrontier(input: {
   const fallbackTotalVoters = input.pollTotalVoters ?? fallbackVoteCounts.reduce((sum, count) => sum + count, 0n);
 
   if (input.shardCount <= 0) {
-    return {
-      voteCounts: fallbackVoteCounts,
-      totalVoters: fallbackTotalVoters,
-      totalVotes: fallbackVoteCounts.reduce((sum, count) => sum + count, 0n),
-      source: "poll-cell",
-      shardCount: 0,
-      coveredShardCount: 0,
-      coverageComplete: true,
-      selectedMergeResultIds: [],
-      selectedShardIds: [],
-      uncoveredShardIds: [],
-    };
+    throw new Error("Non-sharded poll-cell aggregation is retired in this deployment");
   }
 
   if (input.pollIsClosed) {
@@ -440,8 +527,10 @@ export function buildProtocolTimeline(
   currentEpoch: bigint
 ): ProtocolTimelineStep[] {
   const hasPolls = polls.length > 0;
-  const hasIntent = polls.some((poll) => poll.totalVoters > 0n || poll.pendingIntentCount > 0n);
-  const hasAggregated = polls.some((poll) => poll.totalVotes > 0n);
+  const supportedPolls = polls.filter(isPollVotingSupported);
+  const hasSupportedPolls = supportedPolls.length > 0;
+  const hasIntent = supportedPolls.some((poll) => poll.totalVoters > 0n || poll.pendingIntentCount > 0n);
+  const hasAggregated = supportedPolls.some((poll) => poll.totalVotes > 0n);
   const hasExpiredOpen = polls.some((poll) => !poll.isClosed && currentEpoch > poll.deadline);
   const hasClosed = polls.some((poll) => poll.isClosed);
   const hasDelegation = delegations.length > 0;
@@ -457,7 +546,7 @@ export function buildProtocolTimeline(
       op: "CREATE_VOTE_INTENT",
       label: "Record vote intent",
       detail: "Store independent voter or delegated intent cells.",
-      state: hasIntent ? "completed" : hasPolls ? "live" : "pending",
+      state: hasIntent ? "completed" : hasSupportedPolls ? "live" : "pending",
     },
     {
       op: "CREATE_TALLY_SHARD",
@@ -478,7 +567,7 @@ export function buildProtocolTimeline(
       state: hasDelegation ? "completed" : hasPolls ? "live" : "pending",
     },
     {
-      op: "REVOKE_DELEGATION",
+      op: "DELEGATE",
       label: "Revoke delegation",
       detail: "Delegators consume delegation cells to revoke authority.",
       state: hasDelegation ? "live" : "pending",

@@ -1,7 +1,7 @@
 /**
  * Governance Smoke Script
  * =======================
- * Exercises the full Rust lifecycle on testnet with a private-key signer:
+ * Exercises the immediate Rust lifecycle on testnet with a private-key signer:
  * create poll, create vote intent, shard aggregate, and delegation
  * create/revoke. Post-deadline shard finalization, MERGE_TALLY_SHARDS, and
  * close need a controlled epoch wait/local harness and are not sent here.
@@ -26,6 +26,7 @@ import {
   requireGovernanceHashes,
   requirePrivateKey,
 } from "./config";
+import { epochNumber } from "./epoch";
 
 const PRIVATE_KEY = requirePrivateKey();
 const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
@@ -42,6 +43,8 @@ type CellRef = {
   outPoint: { txHash: string; index: number };
   cellOutput: { lock: any; type?: any; capacity: bigint };
   outputData: string;
+  creationBlockHash?: string;
+  creationEpoch?: bigint;
 };
 
 /** @notice Computes the script hash used for poll id and type binding checks. */
@@ -135,25 +138,32 @@ function estimateOutputCapacity(lockScript: any, typeScript: any | undefined, da
 /** @notice Resolves chain tip epoch in bigint format across client variants. */
 async function getTipEpoch(client: any): Promise<bigint> {
   if (typeof client.getTipEpoch === "function") {
-    const rawEpoch = await client.getTipEpoch();
-    if (typeof rawEpoch === "bigint") return rawEpoch;
-    if (typeof rawEpoch === "number") return BigInt(rawEpoch);
-    if (typeof rawEpoch === "string") return BigInt(rawEpoch.split(",")[0]);
+    return epochNumber(await client.getTipEpoch());
   }
 
   const tipHeader = await client.getTipHeader();
-  return BigInt(String(tipHeader.epoch).split(",")[0]);
+  return epochNumber(tipHeader.epoch);
 }
 
-/** @notice Polls RPC until a transaction is indexed or times out. */
+/** @notice Waits until a transaction is committed on chain. */
 async function waitForTx(client: any, txHash: string): Promise<void> {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    const tx = await client.getTransaction(txHash);
-    if (tx) return;
+  const committed = await client.waitTransaction(txHash, 0, 90_000, 3000);
+  if (!committed) {
+    throw new Error(`Timed out waiting for committed transaction ${txHash}`);
   }
+}
 
-  throw new Error(`Timed out waiting for ${txHash}`);
+async function attachCommittedOrigin(client: any, cell: CellRef): Promise<CellRef> {
+  const resolved = await client.getCellWithHeader(cell.outPoint);
+  const header = resolved?.header;
+  if (!header?.hash || header.epoch == null) {
+    throw new Error(`Cell ${outPointKey(cell)} is not committed with a resolvable creation header`);
+  }
+  return {
+    ...cell,
+    creationBlockHash: String(header.hash),
+    creationEpoch: epochNumber(header.epoch),
+  };
 }
 
 /** @notice Finds a signer-owned auth cell suitable for fee/change handling. */
@@ -198,10 +208,9 @@ async function main(): Promise<void> {
   console.log(`Governance code hash: ${GOVERNANCE_CODE_HASH}`);
   console.log(`Governance script tx: ${GOVERNANCE_SCRIPT_TX_HASH}`);
 
-  const client = new ccc.ClientPublicTestnet({ url: RPC_URL });
+  const client = new ccc.ClientPublicTestnet({ url: RPC_URL, fallbacks: [RPC_URL] as any });
   const signer = new ccc.SignerCkbPrivateKey(client, PRIVATE_KEY);
   const signerAddress = await signer.getAddressObjSecp256k1();
-  const tipHeader = await client.getTipHeader();
   const currentEpoch = await getTipEpoch(client);
   const signerLockHash = lockHashBytes(signerAddress.script);
   const smokeLabel = randomBytes(4).toString("hex");
@@ -263,7 +272,6 @@ async function main(): Promise<void> {
 
   const createPollTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
-    headerDeps: [tipHeader.hash],
     inputs: [{ previousOutput: getOutPoint(typeIdSeedCell), since: 0 }],
     outputs: [
       {
@@ -295,12 +303,11 @@ async function main(): Promise<void> {
   };
 
   const intentType = governanceTypeScript(0x02, pollTypeHash);
-  const intentEpoch = await getTipEpoch(client);
   const intentData: VoteIntentData = {
     poll_type_hash: (ccc as any).bytesFrom(pollTypeHash),
     voter_lock_hash: signerLockHash,
     option_index: 0,
-    voted_at_epoch: intentEpoch,
+    voted_at_epoch: 0n,
     aggregated: false,
     refund_lock: normalizeScript(signerAddress.script),
   };
@@ -324,7 +331,6 @@ async function main(): Promise<void> {
         depType: "code",
       },
     ],
-    headerDeps: [tipHeader.hash],
     inputs: [
       {
         previousOutput: {
@@ -356,7 +362,7 @@ async function main(): Promise<void> {
   await waitForTx(client, createIntentHash);
   console.log(`CREATE_VOTE_INTENT: ${createIntentHash}`);
 
-  const intentCell: CellRef = {
+  const intentCell = await attachCommittedOrigin(client, {
     outPoint: { txHash: createIntentHash, index: 0 },
     cellOutput: {
       lock: intentType,
@@ -364,7 +370,10 @@ async function main(): Promise<void> {
       capacity: intentCapacity > VOTER_DEPOSIT_SHANNONS ? intentCapacity : VOTER_DEPOSIT_SHANNONS,
     },
     outputData: ccc.hexFrom(intentBytes),
-  };
+  });
+  if ((intentCell.creationEpoch ?? pollData.deadline + 1n) > pollData.deadline) {
+    throw new Error("Smoke intent was committed after the poll deadline and cannot aggregate");
+  }
 
   const shardCell: CellRef = {
     outPoint: { txHash: createPollHash, index: 1 },
@@ -394,7 +403,7 @@ async function main(): Promise<void> {
         depType: "code",
       },
     ],
-    headerDeps: [tipHeader.hash],
+    headerDeps: [intentCell.creationBlockHash!],
     inputs: [
       { previousOutput: shardCell.outPoint },
       { previousOutput: intentCell.outPoint },
@@ -453,7 +462,6 @@ async function main(): Promise<void> {
   const delegationCapacity = estimateOutputCapacity(signerAddress.script, delegationType, delegationBytes.length);
   const delegateTx = ccc.Transaction.from({
     cellDeps: [governanceCellDep()],
-    headerDeps: [tipHeader.hash],
     outputs: [
       {
         lock: signerAddress.script,
@@ -487,7 +495,7 @@ async function main(): Promise<void> {
   await signer.signTransaction(revokeTx);
   const revokeHash = await client.sendTransaction(revokeTx);
   await waitForTx(client, revokeHash);
-  console.log(`REVOKE_DELEGATION: ${revokeHash}`);
+  console.log(`Delegation revocation (0x05 lifecycle): ${revokeHash}`);
 
   const decodedAggregatedIntent = decodeVoteIntentData(aggregatedIntentBytes);
   if (!decodedAggregatedIntent.aggregated) {

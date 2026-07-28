@@ -19,10 +19,10 @@ const MAX_CYCLES: u64 = 100_000_000;
 
 const OP_CREATE_POLL: u8 = 0x01;
 const OP_CREATE_VOTE_INTENT: u8 = 0x02;
-const OP_AGGREGATE_VOTES: u8 = 0x03;
+const OP_RETIRED_AGGREGATE_VOTES: u8 = 0x03;
 const OP_CLOSE_POLL: u8 = 0x04;
 const OP_DELEGATE: u8 = 0x05;
-const OP_REVOKE_DELEGATION: u8 = 0x06;
+const OP_RETIRED_REVOKE_DELEGATION: u8 = 0x06;
 const OP_CREATE_TALLY_SHARD: u8 = 0x07;
 const OP_MERGE_TALLY_SHARDS: u8 = 0x08;
 
@@ -37,6 +37,11 @@ const MAX_SHARDS_PER_MERGE: usize = 8;
 const MAX_DIRECT_CLOSE_SHARDS: u32 = 8;
 const FORCE_CLOSE_GRACE_EPOCHS: u64 = 10;
 const POLL_CELL_SHANNONS: u64 = 900 * SHANNONS_PER_CKB;
+const SINCE_RELATIVE_FLAG: u64 = 1 << 63;
+const SINCE_EPOCH_METRIC: u64 = 0x2000_0000_0000_0000;
+const SINCE_TIMESTAMP_METRIC: u64 = 0x4000_0000_0000_0000;
+const SINCE_RESERVED_FLAG: u64 = 0x0100_0000_0000_0000;
+const MAX_DEADLINE_EPOCH: u64 = (1u64 << 24) - FORCE_CLOSE_GRACE_EPOCHS - 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EncodedScript {
@@ -130,6 +135,8 @@ struct PollFixture {
     shard_data: Vec<TallyShardData>,
 }
 
+type AggregationIntent = (OutPoint, VoteIntentData, Script, u64, Byte32);
+
 fn script_binary() -> Bytes {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -153,12 +160,7 @@ fn fixture(epoch: u64) -> Fixture {
     let always_success = context
         .build_script(&always_success_op, Bytes::new())
         .expect("always-success script");
-    let header = HeaderBuilder::default()
-        .number(epoch)
-        .epoch(EpochNumberWithFraction::new(epoch, 0, 1).pack())
-        .build();
-    let header_hash = header.hash();
-    context.insert_header(header);
+    let header_hash = insert_epoch_header(&mut context, epoch);
 
     Fixture {
         context,
@@ -198,15 +200,6 @@ fn create_poll_script(fixture: &mut Fixture, type_id: &[u8; 32]) -> Script {
     governance_script(fixture, OP_CREATE_POLL, type_id)
 }
 
-#[allow(dead_code)]
-fn aggregate_votes_script(
-    context: &mut Context,
-    governance_op: &OutPoint,
-    poll_type_hash: &[u8; 32],
-) -> Script {
-    governance_script_from_parts(context, governance_op, OP_AGGREGATE_VOTES, poll_type_hash)
-}
-
 fn close_poll_script(fixture: &mut Fixture, poll_type_hash: &[u8; 32]) -> Script {
     governance_script(fixture, OP_CLOSE_POLL, poll_type_hash)
 }
@@ -230,15 +223,6 @@ fn delegate_script(
     poll_type_hash: &[u8; 32],
 ) -> Script {
     governance_script_from_parts(context, governance_op, OP_DELEGATE, poll_type_hash)
-}
-
-#[allow(dead_code)]
-fn revoke_delegation_script(
-    context: &mut Context,
-    governance_op: &OutPoint,
-    poll_type_hash: &[u8; 32],
-) -> Script {
-    governance_script_from_parts(context, governance_op, OP_REVOKE_DELEGATION, poll_type_hash)
 }
 
 fn tally_shard_script(fixture: &mut Fixture, poll_type_hash: &[u8; 32], shard_id: u32) -> Script {
@@ -297,7 +281,14 @@ fn cell_dep(out_point: OutPoint) -> CellDep {
 }
 
 fn input(out_point: OutPoint) -> CellInput {
-    CellInput::new_builder().previous_output(out_point).build()
+    input_with_since(out_point, 0)
+}
+
+fn input_with_since(out_point: OutPoint, since: u64) -> CellInput {
+    CellInput::new_builder()
+        .since(since)
+        .previous_output(out_point)
+        .build()
 }
 
 fn output(capacity: u64, lock: Script, type_script: Option<Script>) -> CellOutput {
@@ -333,8 +324,58 @@ fn blank_witness() -> Bytes {
     WitnessArgs::default().as_bytes()
 }
 
+fn insert_epoch_header(context: &mut Context, epoch: u64) -> Byte32 {
+    let header = HeaderBuilder::default()
+        .number(epoch)
+        .epoch(EpochNumberWithFraction::new(epoch, 0, 1).pack())
+        .build();
+    let header_hash = header.hash();
+    context.insert_header(header);
+    header_hash
+}
+
+fn link_cell_to_epoch(context: &mut Context, out_point: &OutPoint, epoch: u64) -> Byte32 {
+    let header_hash = insert_epoch_header(context, epoch);
+    context.link_cell_with_block(out_point.clone(), header_hash.clone(), 0);
+    header_hash
+}
+
+fn absolute_epoch_since(epoch: u64) -> u64 {
+    SINCE_EPOCH_METRIC | EpochNumberWithFraction::new(epoch, 0, 1).full_value()
+}
+
+fn invalid_since_values(strictly_after: u64) -> Vec<u64> {
+    let valid_epoch = strictly_after + 1;
+    let epoch_value = EpochNumberWithFraction::new(valid_epoch, 0, 1).full_value();
+    vec![
+        0,
+        absolute_epoch_since(strictly_after),
+        SINCE_RELATIVE_FLAG | SINCE_EPOCH_METRIC | epoch_value,
+        epoch_value,
+        SINCE_TIMESTAMP_METRIC | epoch_value,
+        SINCE_RESERVED_FLAG | SINCE_EPOCH_METRIC | epoch_value,
+        SINCE_EPOCH_METRIC | valid_epoch,
+        SINCE_EPOCH_METRIC | EpochNumberWithFraction::new_unchecked(valid_epoch, 1, 1).full_value(),
+        u64::MAX,
+    ]
+}
+
+fn tx_with_headers(
+    mut builder: TransactionBuilder,
+    header_hashes: impl IntoIterator<Item = Byte32>,
+) -> TransactionBuilder {
+    let mut unique = Vec::new();
+    for header_hash in header_hashes {
+        if !unique.iter().any(|existing| existing == &header_hash) {
+            unique.push(header_hash.clone());
+            builder = builder.header_dep(header_hash);
+        }
+    }
+    builder
+}
+
 fn tx_with_header(builder: TransactionBuilder, header_hash: Byte32) -> TransactionBuilder {
-    builder.header_dep(header_hash)
+    tx_with_headers(builder, [header_hash])
 }
 
 fn verify_ok(context: &mut Context, tx: ckb_testtool::ckb_types::core::TransactionView) -> Cycle {
@@ -478,6 +519,17 @@ fn mutate_byte(bytes: Bytes, offset: usize, value: u8) -> Bytes {
     Bytes::from(data)
 }
 
+fn append_output(
+    tx: ckb_testtool::ckb_types::core::TransactionView,
+    cell_output: CellOutput,
+    data: Bytes,
+) -> ckb_testtool::ckb_types::core::TransactionView {
+    tx.as_advanced_builder()
+        .output(cell_output)
+        .output_data(data.pack())
+        .build()
+}
+
 fn calc_type_id(input: &CellInput, output_index: u64) -> [u8; 32] {
     let mut blake2b = new_blake2b();
     blake2b.update(input.as_slice());
@@ -556,6 +608,9 @@ fn create_poll_tx(
     wrong_type_id: Option<[u8; 32]>,
     omit_last_shard: bool,
     swap_shard_outputs: bool,
+    token_weighted: bool,
+    udt_type_hash: [u8; 32],
+    deadline_override: Option<u64>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
     let seed_op = plain_cell(
         &mut fixture.context,
@@ -572,7 +627,7 @@ fn create_poll_tx(
         question: b"Choose a protocol path?".to_vec(),
         options: vec![b"yes".to_vec(), b"no".to_vec()],
         vote_counts: vec![0, 0],
-        deadline: fixture.epoch + 5,
+        deadline: deadline_override.unwrap_or(fixture.epoch + 5),
         creator: creator_hash,
         creator_lock: encode_script(&fixture.always_success),
         is_closed: false,
@@ -580,8 +635,8 @@ fn create_poll_tx(
         creator_deposit: CREATOR_DEPOSIT_SHANNONS,
         pending_intent_count: 0,
         counted_voter_lock_hashes: Vec::new(),
-        token_weighted: false,
-        udt_type_hash: [0u8; 32],
+        token_weighted,
+        udt_type_hash,
         shard_count,
     };
     let poll_bytes = encode_poll(&poll);
@@ -630,7 +685,12 @@ fn create_poll_tx(
 
 fn create_poll_fixture(epoch: u64, shard_count: u32, finalized_shards: bool) -> PollFixture {
     let mut fixture = fixture(epoch);
-    let creator_lock = fixture.always_success.clone();
+    // Keep the creator distinct from the fixture's default participant lock so
+    // voting tests exercise the protocol's creator-exclusion rule explicitly.
+    let creator_lock = fixture
+        .context
+        .build_script(&fixture.always_success_op, Bytes::from(vec![0xC0]))
+        .expect("creator always-success lock");
     let creator_auth_op = plain_cell(
         &mut fixture.context,
         creator_lock.clone(),
@@ -716,6 +776,29 @@ fn close_poll_tx(
     include_creator_auth: bool,
     creator_auth_override: Option<OutPoint>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
+    let threshold = if include_creator_auth {
+        fixture.open_poll.deadline
+    } else {
+        fixture
+            .open_poll
+            .deadline
+            .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
+            .expect("force-close threshold")
+    };
+    close_poll_tx_with_since(
+        fixture,
+        include_creator_auth,
+        creator_auth_override,
+        absolute_epoch_since(threshold + 1),
+    )
+}
+
+fn close_poll_tx_with_since(
+    fixture: &mut PollFixture,
+    include_creator_auth: bool,
+    creator_auth_override: Option<OutPoint>,
+    protocol_since: u64,
+) -> ckb_testtool::ckb_types::core::TransactionView {
     let mut closed = fixture.open_poll.clone();
     closed.is_closed = true;
     closed.vote_counts = vec![0, 0];
@@ -724,7 +807,7 @@ fn close_poll_tx(
     closed.counted_voter_lock_hashes.clear();
 
     let mut builder = TransactionBuilder::default()
-        .input(input(fixture.poll_op.clone()))
+        .input(input_with_since(fixture.poll_op.clone(), protocol_since))
         .output(output(
             POLL_CELL_SHANNONS,
             fixture.poll_lock.clone(),
@@ -786,6 +869,16 @@ fn poll_dep_from_data(fixture: &mut PollFixture, poll: PollData) -> OutPoint {
         fixture.poll_type.clone(),
         encode_poll(&poll),
     )
+}
+
+fn replace_fixture_poll_input(fixture: &mut PollFixture) {
+    fixture.poll_op = governance_cell(
+        &mut fixture.context,
+        POLL_CELL_SHANNONS,
+        fixture.poll_lock.clone(),
+        fixture.poll_type.clone(),
+        encode_poll(&fixture.open_poll),
+    );
 }
 
 fn shard_script_for_fixture(fixture: &mut PollFixture, shard_id: u32) -> Script {
@@ -871,7 +964,7 @@ fn intent_cell_from_data(
     intent: VoteIntentData,
     type_scope: [u8; 32],
     capacity: u64,
-) -> (OutPoint, VoteIntentData, Script) {
+) -> (OutPoint, VoteIntentData, Script, Byte32) {
     let intent_type = vote_intent_script(&mut fixture.context, &fixture.governance_op, &type_scope);
     let op = governance_cell(
         &mut fixture.context,
@@ -880,7 +973,8 @@ fn intent_cell_from_data(
         intent_type.clone(),
         encode_vote_intent(&intent),
     );
-    (op, intent, intent_type)
+    let creation_header = link_cell_to_epoch(&mut fixture.context, &op, fixture.epoch);
+    (op, intent, intent_type, creation_header)
 }
 
 fn voter_for_shard_excluding(
@@ -940,7 +1034,7 @@ fn build_tally_shard_aggregation_tx(
     shard_op: OutPoint,
     before_shard: TallyShardData,
     after_shard: TallyShardData,
-    intents: Vec<(OutPoint, VoteIntentData, Script, u64)>,
+    intents: Vec<AggregationIntent>,
     marker_overrides: Vec<Option<(VoteIntentData, Script, Script, u64)>>,
     poll_dep: Option<OutPoint>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
@@ -960,7 +1054,10 @@ fn build_tally_shard_aggregation_tx(
         ))
         .witness(blank_witness().pack());
 
-    for (index, (intent_op, intent, intent_script, capacity)) in intents.into_iter().enumerate() {
+    let mut header_hashes = vec![fixture.header_hash.clone()];
+    for (index, (intent_op, intent, intent_script, capacity, creation_header)) in
+        intents.into_iter().enumerate()
+    {
         let (marker, marker_lock, marker_type, marker_capacity) = marker_overrides
             .get(index)
             .cloned()
@@ -980,9 +1077,10 @@ fn build_tally_shard_aggregation_tx(
             .output(output(marker_capacity, marker_lock, Some(marker_type)))
             .output_data(encode_vote_intent(&marker).pack())
             .witness(blank_witness().pack());
+        header_hashes.push(creation_header);
     }
 
-    tx_with_header(builder, fixture.header_hash.clone()).build()
+    tx_with_headers(builder, header_hashes).build()
 }
 
 fn build_tally_shard_finalization_tx(
@@ -992,10 +1090,28 @@ fn build_tally_shard_finalization_tx(
     after_shard: TallyShardData,
     poll_dep: Option<OutPoint>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
+    build_tally_shard_finalization_tx_with_since(
+        fixture,
+        shard_op,
+        before_shard,
+        after_shard,
+        poll_dep,
+        absolute_epoch_since(fixture.open_poll.deadline + 1),
+    )
+}
+
+fn build_tally_shard_finalization_tx_with_since(
+    fixture: &mut PollFixture,
+    shard_op: OutPoint,
+    before_shard: TallyShardData,
+    after_shard: TallyShardData,
+    poll_dep: Option<OutPoint>,
+    protocol_since: u64,
+) -> ckb_testtool::ckb_types::core::TransactionView {
     let shard_script = shard_script_for_fixture(fixture, before_shard.shard_id);
     tx_with_header(
         TransactionBuilder::default()
-            .input(input(shard_op))
+            .input(input_with_since(shard_op, protocol_since))
             .output(output(
                 TALLY_SHARD_MIN_SHANNONS,
                 shard_script.clone(),
@@ -1023,6 +1139,39 @@ fn close_poll_with_inputs_tx(
     intent_inputs: Vec<(OutPoint, VoteIntentData, Script, u64)>,
     creator_return_capacity: u64,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
+    let threshold = if include_creator_auth {
+        poll_before.deadline
+    } else {
+        poll_before
+            .deadline
+            .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
+            .expect("force-close threshold")
+    };
+    close_poll_with_inputs_tx_at_since(
+        fixture,
+        poll_before,
+        poll_after,
+        include_creator_auth,
+        tally_inputs,
+        tally_return_locks,
+        intent_inputs,
+        creator_return_capacity,
+        absolute_epoch_since(threshold + 1),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn close_poll_with_inputs_tx_at_since(
+    fixture: &mut PollFixture,
+    poll_before: PollData,
+    poll_after: PollData,
+    include_creator_auth: bool,
+    tally_inputs: Vec<(OutPoint, u64)>,
+    tally_return_locks: Vec<Script>,
+    intent_inputs: Vec<(OutPoint, VoteIntentData, Script, u64)>,
+    creator_return_capacity: u64,
+    protocol_since: u64,
+) -> ckb_testtool::ckb_types::core::TransactionView {
     let poll_op = governance_cell(
         &mut fixture.context,
         POLL_CELL_SHANNONS,
@@ -1031,7 +1180,7 @@ fn close_poll_with_inputs_tx(
         encode_poll(&poll_before),
     );
     let mut builder = TransactionBuilder::default()
-        .input(input(poll_op))
+        .input(input_with_since(poll_op, protocol_since))
         .output(output(
             POLL_CELL_SHANNONS,
             fixture.poll_lock.clone(),
@@ -1100,7 +1249,10 @@ fn close_poll_with_return_overrides_tx(
         encode_poll(&poll_before),
     );
     let mut builder = TransactionBuilder::default()
-        .input(input(poll_op))
+        .input(input_with_since(
+            poll_op,
+            absolute_epoch_since(poll_before.deadline + 1),
+        ))
         .output(output(
             POLL_CELL_SHANNONS,
             fixture.poll_lock.clone(),
@@ -1267,12 +1419,7 @@ fn closed_poll_from_result(
 
 fn set_fixture_epoch(fixture: &mut PollFixture, epoch: u64) {
     fixture.epoch = epoch;
-    let header = HeaderBuilder::default()
-        .number(epoch)
-        .epoch(EpochNumberWithFraction::new(epoch, 0, 1).pack())
-        .build();
-    fixture.header_hash = header.hash();
-    fixture.context.insert_header(header);
+    fixture.header_hash = insert_epoch_header(&mut fixture.context, epoch);
 }
 
 fn build_create_intent_tx(
@@ -1371,6 +1518,28 @@ fn refund_omitted_intent_tx(
     .build()
 }
 
+fn refund_intent_with_origin_tx(
+    fixture: &mut PollFixture,
+    intent_op: OutPoint,
+    poll_dep: OutPoint,
+    refund_lock: Script,
+    output_capacity: u64,
+    creation_header: Byte32,
+) -> ckb_testtool::ckb_types::core::TransactionView {
+    tx_with_headers(
+        TransactionBuilder::default()
+            .input(input(intent_op))
+            .output(output(output_capacity, refund_lock, None))
+            .output_data(Bytes::new().pack())
+            .cell_dep(cell_dep(fixture.governance_op.clone()))
+            .cell_dep(cell_dep(fixture.always_success_op.clone()))
+            .cell_dep(cell_dep(poll_dep))
+            .witness(blank_witness().pack()),
+        [fixture.header_hash.clone(), creation_header],
+    )
+    .build()
+}
+
 fn shadow_same_index_type_update_tx(
     fixture: &mut PollFixture,
     input_lock: Script,
@@ -1405,7 +1574,7 @@ fn shadow_same_index_type_update_tx(
 #[test]
 fn create_poll_type_id_and_complete_shards_pass() {
     let mut fixture = fixture(10);
-    let tx = create_poll_tx(&mut fixture, 2, None, false, false);
+    let tx = create_poll_tx(&mut fixture, 2, None, false, false, false, [0u8; 32], None);
 
     verify_ok(&mut fixture.context, tx);
 }
@@ -1413,7 +1582,16 @@ fn create_poll_type_id_and_complete_shards_pass() {
 #[test]
 fn create_poll_wrong_type_id_args_fail() {
     let mut fixture = fixture(10);
-    let tx = create_poll_tx(&mut fixture, 2, Some([0xAA; 32]), false, false);
+    let tx = create_poll_tx(
+        &mut fixture,
+        2,
+        Some([0xAA; 32]),
+        false,
+        false,
+        false,
+        [0u8; 32],
+        None,
+    );
 
     let err = verify_err(&mut fixture.context, tx);
     assert_exit_code(&err, 5);
@@ -1422,12 +1600,66 @@ fn create_poll_wrong_type_id_args_fail() {
 #[test]
 fn create_poll_missing_or_misordered_shard_outputs_fail() {
     let mut missing = fixture(10);
-    let missing_tx = create_poll_tx(&mut missing, 2, None, true, false);
+    let missing_tx = create_poll_tx(&mut missing, 2, None, true, false, false, [0u8; 32], None);
     assert_exit_code(&verify_err(&mut missing.context, missing_tx), 1);
 
     let mut misordered = fixture(10);
-    let misordered_tx = create_poll_tx(&mut misordered, 2, None, false, true);
+    let misordered_tx = create_poll_tx(
+        &mut misordered,
+        2,
+        None,
+        false,
+        true,
+        false,
+        [0u8; 32],
+        None,
+    );
     assert_exit_code(&verify_err(&mut misordered.context, misordered_tx), 5);
+}
+
+#[test]
+fn create_poll_enforces_maximum_encodable_deadline() {
+    let mut maximum = fixture(10);
+    let valid = create_poll_tx(
+        &mut maximum,
+        1,
+        None,
+        false,
+        false,
+        false,
+        [0u8; 32],
+        Some(MAX_DEADLINE_EPOCH),
+    );
+    verify_ok(&mut maximum.context, valid);
+
+    let mut overflow = fixture(10);
+    let invalid = create_poll_tx(
+        &mut overflow,
+        1,
+        None,
+        false,
+        false,
+        false,
+        [0u8; 32],
+        Some(MAX_DEADLINE_EPOCH + 1),
+    );
+    assert_exit_code(&verify_err(&mut overflow.context, invalid), 5);
+}
+
+#[test]
+fn create_poll_rejects_token_weighted_mode() {
+    let mut fixture = fixture(11);
+    let tx = create_poll_tx(&mut fixture, 2, None, false, false, true, [0u8; 32], None);
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn create_poll_rejects_nonzero_udt_type_hash() {
+    let mut fixture = fixture(12);
+    let tx = create_poll_tx(&mut fixture, 2, None, false, false, false, [0x55; 32], None);
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
 }
 
 #[test]
@@ -1449,6 +1681,23 @@ fn protocol_poll_lock_and_creator_close_auth_are_enforced() {
 
     let tx = close_poll_tx(&mut fixture, true, None);
     verify_ok(&mut fixture.context, tx);
+}
+
+#[test]
+fn poll_close_rejects_additional_same_type_output() {
+    let mut fixture = create_poll_fixture(21, 2, true);
+    let close_epoch = fixture.open_poll.deadline + 1;
+    set_fixture_epoch(&mut fixture, close_epoch);
+    let tx = close_poll_tx(&mut fixture, true, None);
+    let extra_output = tx.outputs().get(0).expect("closed poll output");
+    let extra_data = tx
+        .outputs_data()
+        .get(0)
+        .expect("closed poll data")
+        .raw_data();
+    let tx = append_output(tx, extra_output, extra_data);
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
 }
 
 #[test]
@@ -1481,7 +1730,61 @@ fn non_creator_force_close_after_grace_passes() {
 }
 
 #[test]
-fn vote_intent_creation_validates_scope_option_epoch_and_poll_dep() {
+fn creator_close_rejects_invalid_since_values_and_threshold_overflow() {
+    let mut fixture = create_poll_fixture(21, 2, true);
+    let deadline = fixture.open_poll.deadline;
+    for protocol_since in invalid_since_values(deadline) {
+        let tx = close_poll_tx_with_since(&mut fixture, true, None, protocol_since);
+        assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+    }
+
+    let valid =
+        close_poll_tx_with_since(&mut fixture, true, None, absolute_epoch_since(deadline + 1));
+    verify_ok(&mut fixture.context, valid);
+
+    let mut overflow = create_poll_fixture(22, 2, true);
+    overflow.open_poll.deadline = u64::MAX;
+    replace_fixture_poll_input(&mut overflow);
+    let tx = close_poll_tx_with_since(
+        &mut overflow,
+        true,
+        None,
+        absolute_epoch_since(MAX_DEADLINE_EPOCH + 1),
+    );
+    assert_exit_code(&verify_err(&mut overflow.context, tx), 5);
+}
+
+#[test]
+fn force_close_rejects_invalid_since_values_and_threshold_overflow() {
+    let mut fixture = create_poll_fixture(23, 2, true);
+    let force_threshold = fixture.open_poll.deadline + FORCE_CLOSE_GRACE_EPOCHS;
+    for protocol_since in invalid_since_values(force_threshold) {
+        let tx = close_poll_tx_with_since(&mut fixture, false, None, protocol_since);
+        assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+    }
+
+    let valid = close_poll_tx_with_since(
+        &mut fixture,
+        false,
+        None,
+        absolute_epoch_since(force_threshold + 1),
+    );
+    verify_ok(&mut fixture.context, valid);
+
+    let mut overflow = create_poll_fixture(24, 2, true);
+    overflow.open_poll.deadline = u64::MAX - FORCE_CLOSE_GRACE_EPOCHS + 1;
+    replace_fixture_poll_input(&mut overflow);
+    let tx = close_poll_tx_with_since(
+        &mut overflow,
+        false,
+        None,
+        absolute_epoch_since(MAX_DEADLINE_EPOCH + 1),
+    );
+    assert_exit_code(&verify_err(&mut overflow.context, tx), 5);
+}
+
+#[test]
+fn vote_intent_creation_validates_scope_option_and_poll_dep() {
     let mut fixture = create_poll_fixture(30, 2, false);
     let epoch = fixture.epoch;
     let voter_lock = fixture.always_success.clone();
@@ -1534,19 +1837,21 @@ fn vote_intent_creation_validates_scope_option_epoch_and_poll_dep() {
     );
     assert_exit_code(&verify_err(&mut fixture.context, bad_option), 5);
 
-    let bad_epoch = build_create_intent_tx(
+    let informational_epoch = build_create_intent_tx(
         &mut fixture,
         voter_op.clone(),
         voter_lock.clone(),
         voter_hash,
         voter_lock.clone(),
         1,
-        epoch + 1,
+        epoch + 100,
         None,
         None,
         None,
     );
-    assert_exit_code(&verify_err(&mut fixture.context, bad_epoch), 5);
+    // This legacy field is preserved for codec compatibility, but it is not a
+    // consensus timestamp and cannot authorize later aggregation.
+    verify_ok(&mut fixture.context, informational_epoch);
 
     let wrong_type_args = build_create_intent_tx(
         &mut fixture,
@@ -1561,6 +1866,227 @@ fn vote_intent_creation_validates_scope_option_epoch_and_poll_dep() {
         None,
     );
     assert_exit_code(&verify_err(&mut fixture.context, wrong_type_args), 5);
+}
+
+#[test]
+fn token_weighted_poll_dep_cannot_authorize_vote_intent_creation() {
+    let mut fixture = create_poll_fixture(33, 2, false);
+    fixture.open_poll.token_weighted = true;
+    let voter_lock = fixture.always_success.clone();
+    let voter_hash = script_hash(&voter_lock);
+    let voter_op = plain_cell(
+        &mut fixture.context,
+        voter_lock.clone(),
+        2_000 * SHANNONS_PER_CKB,
+    );
+    let tx = build_create_intent_tx(
+        &mut fixture,
+        voter_op,
+        voter_lock.clone(),
+        voter_hash,
+        voter_lock,
+        0,
+        0,
+        None,
+        None,
+        None,
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn vote_intent_creation_rejects_additional_same_script_output() {
+    let mut fixture = create_poll_fixture(31, 2, false);
+    let voter_lock = fixture.always_success.clone();
+    let voter_hash = script_hash(&voter_lock);
+    let voter_op = plain_cell(
+        &mut fixture.context,
+        voter_lock.clone(),
+        2_000 * SHANNONS_PER_CKB,
+    );
+    let tx = build_create_intent_tx(
+        &mut fixture,
+        voter_op,
+        voter_lock.clone(),
+        voter_hash,
+        voter_lock,
+        1,
+        0,
+        None,
+        None,
+        None,
+    );
+    verify_ok(&mut fixture.context, tx.clone());
+    let extra_output = tx.outputs().get(0).expect("intent output");
+    let extra_data = tx.outputs_data().get(0).expect("intent data").raw_data();
+    let tx = append_output(tx, extra_output, extra_data);
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn vote_intent_creation_rejects_unauthorized_appended_represented_voter() {
+    let mut fixture = create_poll_fixture(32, 2, false);
+    let voter_lock = fixture.always_success.clone();
+    let voter_hash = script_hash(&voter_lock);
+    let voter_op = plain_cell(
+        &mut fixture.context,
+        voter_lock.clone(),
+        2_000 * SHANNONS_PER_CKB,
+    );
+    let tx = build_create_intent_tx(
+        &mut fixture,
+        voter_op,
+        voter_lock.clone(),
+        voter_hash,
+        voter_lock,
+        0,
+        0,
+        None,
+        None,
+        None,
+    );
+    let unauthorized_lock = fixture
+        .context
+        .build_script(&fixture.always_success_op, Bytes::from(vec![0x91]))
+        .expect("unauthorized represented voter lock");
+    let unauthorized_intent = VoteIntentData {
+        poll_type_hash: fixture.poll_type_hash,
+        voter_lock_hash: script_hash(&unauthorized_lock),
+        option_index: 0,
+        voted_at_epoch: 0,
+        aggregated: false,
+        refund_lock: encode_script(&unauthorized_lock),
+    };
+    let extra_output = tx.outputs().get(0).expect("intent output");
+    let tx = append_output(tx, extra_output, encode_vote_intent(&unauthorized_intent));
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn poll_creator_cannot_submit_direct_or_delegated_vote_intents() {
+    let mut fixture = create_poll_fixture(32, 2, false);
+    let epoch = fixture.epoch;
+    let poll_type_hash = fixture.poll_type_hash;
+    let creator_hash = fixture.open_poll.creator;
+    let creator_lock = fixture.creator_lock.clone();
+    let creator_auth_op = fixture.creator_auth_op.clone();
+    let participant_lock = fixture.always_success.clone();
+    let participant_hash = script_hash(&participant_lock);
+    let participant_auth_op = plain_cell(
+        &mut fixture.context,
+        participant_lock.clone(),
+        2_000 * SHANNONS_PER_CKB,
+    );
+
+    let direct = build_create_intent_tx(
+        &mut fixture,
+        creator_auth_op.clone(),
+        creator_lock.clone(),
+        creator_hash,
+        creator_lock.clone(),
+        0,
+        epoch,
+        None,
+        None,
+        None,
+    );
+    assert_exit_code(&verify_err(&mut fixture.context, direct), 5);
+
+    let creator_delegation = DelegationData {
+        delegator_lock_hash: creator_hash,
+        delegate_lock_hash: participant_hash,
+        poll_type_hash,
+        expires_epoch: 0,
+    };
+    let creator_delegation_op = delegation_cell(
+        &mut fixture,
+        creator_lock.clone(),
+        creator_delegation,
+        DELEGATION_MIN_SHANNONS,
+    );
+    let represented_creator = build_create_intent_tx(
+        &mut fixture,
+        participant_auth_op,
+        participant_lock.clone(),
+        creator_hash,
+        creator_lock.clone(),
+        0,
+        epoch,
+        None,
+        None,
+        Some(creator_delegation_op),
+    );
+    assert_exit_code(&verify_err(&mut fixture.context, represented_creator), 5);
+
+    let creator_as_delegate = DelegationData {
+        delegator_lock_hash: participant_hash,
+        delegate_lock_hash: creator_hash,
+        poll_type_hash,
+        expires_epoch: 0,
+    };
+    let creator_as_delegate_op = delegation_cell(
+        &mut fixture,
+        participant_lock.clone(),
+        creator_as_delegate,
+        DELEGATION_MIN_SHANNONS,
+    );
+    let submitted_by_creator = build_create_intent_tx(
+        &mut fixture,
+        creator_auth_op,
+        creator_lock,
+        participant_hash,
+        participant_lock,
+        0,
+        epoch,
+        None,
+        None,
+        Some(creator_as_delegate_op),
+    );
+    assert_exit_code(&verify_err(&mut fixture.context, submitted_by_creator), 5);
+}
+
+#[test]
+fn caller_selected_header_dep_zero_is_not_a_current_time_authority() {
+    let mut fixture = create_poll_fixture(35, 2, false);
+    let stale_epoch = fixture.epoch;
+    let stale_header_hash = fixture.header_hash.clone();
+    let newer_epoch = fixture.open_poll.deadline + 1;
+    let newer_header = HeaderBuilder::default()
+        .parent_hash(stale_header_hash.clone())
+        .number(newer_epoch)
+        .epoch(EpochNumberWithFraction::new(newer_epoch, 0, 1).pack())
+        .build();
+    fixture.context.insert_header(newer_header);
+
+    let voter_lock = fixture.always_success.clone();
+    let voter_hash = script_hash(&voter_lock);
+    let voter_op = plain_cell(
+        &mut fixture.context,
+        voter_lock.clone(),
+        2_000 * SHANNONS_PER_CKB,
+    );
+    let tx = build_create_intent_tx(
+        &mut fixture,
+        voter_op,
+        voter_lock.clone(),
+        voter_hash,
+        voter_lock,
+        1,
+        stale_epoch,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(tx.header_deps().get(0), Some(stale_header_hash));
+    // Pre-fix, HeaderDep(0) returned `stale_epoch`, so the matching caller-set
+    // field passed even though a newer canonical descendant was present.
+    // Hardened intent creation treats the field as informational and defers
+    // the enforceable cutoff to the input-linked creation header.
+    verify_ok(&mut fixture.context, tx);
 }
 
 #[test]
@@ -1720,6 +2246,101 @@ fn post_close_omitted_intent_refund_accepts_pending_and_aggregated_markers() {
 }
 
 #[test]
+fn late_intent_refund_requires_authenticated_late_origin_and_exact_full_capacity() {
+    let mut fixture = create_poll_fixture(52, 2, false);
+    let poll_hash = fixture.poll_type_hash;
+    let refund_lock = fixture.always_success.clone();
+    let voter_hash = script_hash(&refund_lock);
+    let capacity = VOTER_DEPOSIT_SHANNONS + 4_321;
+    let (late_op, _, _) = live_intent_cell_with_capacity(
+        &mut fixture,
+        poll_hash,
+        poll_hash,
+        voter_hash,
+        0,
+        false,
+        refund_lock.clone(),
+        capacity,
+    );
+    let late_epoch = fixture.open_poll.deadline + 1;
+    let late_header = link_cell_to_epoch(&mut fixture.context, &late_op, late_epoch);
+    let open_poll_dep = poll_dep_from_fixture(&mut fixture, false);
+    let valid = refund_intent_with_origin_tx(
+        &mut fixture,
+        late_op.clone(),
+        open_poll_dep.clone(),
+        refund_lock.clone(),
+        capacity,
+        late_header.clone(),
+    );
+    verify_ok(&mut fixture.context, valid);
+
+    let underpaid = refund_intent_with_origin_tx(
+        &mut fixture,
+        late_op,
+        open_poll_dep,
+        refund_lock.clone(),
+        capacity - 1,
+        late_header,
+    );
+    assert_exit_code(&verify_err(&mut fixture.context, underpaid), 5);
+
+    let (timely_op, _, _) = live_intent_cell_with_capacity(
+        &mut fixture,
+        poll_hash,
+        poll_hash,
+        voter_hash,
+        1,
+        false,
+        refund_lock.clone(),
+        capacity,
+    );
+    let timely_header = link_cell_to_epoch(&mut fixture.context, &timely_op, fixture.epoch);
+    let open_poll_dep = poll_dep_from_fixture(&mut fixture, false);
+    let premature = refund_intent_with_origin_tx(
+        &mut fixture,
+        timely_op,
+        open_poll_dep,
+        refund_lock,
+        capacity,
+        timely_header,
+    );
+    assert_exit_code(&verify_err(&mut fixture.context, premature), 5);
+}
+
+#[test]
+fn open_poll_late_refund_rejects_aggregated_marker_with_exact_capacity() {
+    let mut fixture = create_poll_fixture(53, 2, false);
+    let poll_hash = fixture.poll_type_hash;
+    let refund_lock = fixture.always_success.clone();
+    let voter_hash = script_hash(&refund_lock);
+    let capacity = VOTER_DEPOSIT_SHANNONS + 5_432;
+    let (marker_op, _, _) = live_intent_cell_with_capacity(
+        &mut fixture,
+        poll_hash,
+        poll_hash,
+        voter_hash,
+        0,
+        true,
+        refund_lock.clone(),
+        capacity,
+    );
+    let late_epoch = fixture.open_poll.deadline + 1;
+    let marker_header = link_cell_to_epoch(&mut fixture.context, &marker_op, late_epoch);
+    let open_poll_dep = poll_dep_from_fixture(&mut fixture, false);
+    let tx = refund_intent_with_origin_tx(
+        &mut fixture,
+        marker_op,
+        open_poll_dep,
+        refund_lock,
+        capacity,
+        marker_header,
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
 fn same_index_bypass_rejects_close_lock_with_arbitrary_type_update() {
     let mut fixture = create_poll_fixture(300, 2, false);
     let input_lock = fixture.poll_lock.clone();
@@ -1824,7 +2445,7 @@ fn aggregation_fixture(
     OutPoint,
     TallyShardData,
     TallyShardData,
-    Vec<(OutPoint, VoteIntentData, Script, u64)>,
+    Vec<AggregationIntent>,
 ) {
     let mut fixture = create_poll_fixture(u64::from(seed) + 60, 4, false);
     let shard_id = 1;
@@ -1848,6 +2469,7 @@ fn aggregation_fixture(
         voter_lock,
         VOTER_DEPOSIT_SHANNONS,
     );
+    let intent_header = link_cell_to_epoch(&mut fixture.context, &intent_op, fixture.epoch);
     let refund_lock = fixture.always_success.clone();
     let (second_op, second_intent, second_script) = live_intent_cell_with_capacity(
         &mut fixture,
@@ -1859,6 +2481,7 @@ fn aggregation_fixture(
         refund_lock,
         VOTER_DEPOSIT_SHANNONS,
     );
+    let second_header = link_cell_to_epoch(&mut fixture.context, &second_op, fixture.epoch);
     let mut after_shard = before_shard.clone();
     after_shard.vote_counts = vec![1, 1];
     after_shard.total_voters = 2;
@@ -1870,12 +2493,19 @@ fn aggregation_fixture(
         before_shard,
         after_shard,
         vec![
-            (intent_op, intent, intent_script, VOTER_DEPOSIT_SHANNONS),
+            (
+                intent_op,
+                intent,
+                intent_script,
+                VOTER_DEPOSIT_SHANNONS,
+                intent_header,
+            ),
             (
                 second_op,
                 second_intent,
                 second_script,
                 VOTER_DEPOSIT_SHANNONS,
+                second_header,
             ),
         ],
     )
@@ -1894,7 +2524,170 @@ fn tally_shard_aggregation_happy_path_passes() {
         None,
     );
 
+    assert_eq!(
+        tx.header_deps().len(),
+        1,
+        "shared intent creation headers must be deduplicated"
+    );
     verify_ok(&mut fixture.context, tx);
+}
+
+#[test]
+fn token_weighted_poll_dep_cannot_authorize_tally_shard_aggregation() {
+    let (mut fixture, shard_op, before_shard, after_shard, intents) = aggregation_fixture(136);
+    let mut weighted_poll = fixture.open_poll.clone();
+    weighted_poll.token_weighted = true;
+    let weighted_poll_dep = poll_dep_from_data(&mut fixture, weighted_poll);
+    let tx = build_tally_shard_aggregation_tx(
+        &mut fixture,
+        shard_op,
+        before_shard,
+        after_shard,
+        intents,
+        Vec::new(),
+        Some(weighted_poll_dep),
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn equal_weight_aggregation_counts_oversized_intent_as_one() {
+    let mut fixture = create_poll_fixture(131, 4, false);
+    let shard_id = 1u32;
+    let before = fixture.shard_data[shard_id as usize].clone();
+    let shard_op = fixture.shard_ops[shard_id as usize].clone();
+    let (voter_lock, voter_hash) = voter_for_shard(&mut fixture, shard_id, 0x31);
+    let oversized_capacity = VOTER_DEPOSIT_SHANNONS * 5;
+    let poll_type_hash = fixture.poll_type_hash;
+    let (intent_op, intent, intent_script) = live_intent_cell_with_capacity(
+        &mut fixture,
+        poll_type_hash,
+        poll_type_hash,
+        voter_hash,
+        0,
+        false,
+        voter_lock,
+        oversized_capacity,
+    );
+    let creation_header = link_cell_to_epoch(&mut fixture.context, &intent_op, fixture.epoch);
+    let mut after = before.clone();
+    after.vote_counts[0] = 1;
+    after.total_voters = 1;
+    after.counted_voter_lock_hashes = vec![voter_hash];
+    let tx = build_tally_shard_aggregation_tx(
+        &mut fixture,
+        shard_op,
+        before,
+        after,
+        vec![(
+            intent_op,
+            intent,
+            intent_script,
+            oversized_capacity,
+            creation_header,
+        )],
+        Vec::new(),
+        None,
+    );
+
+    verify_ok(&mut fixture.context, tx);
+}
+
+#[test]
+fn weighted_poll_cells_retain_finalize_close_and_refund_recovery() {
+    let mut finalize = create_poll_fixture(132, 2, false);
+    let mut weighted_open = finalize.open_poll.clone();
+    weighted_open.token_weighted = true;
+    let weighted_poll_dep = poll_dep_from_data(&mut finalize, weighted_open);
+    let finalize_epoch = finalize.open_poll.deadline + 1;
+    set_fixture_epoch(&mut finalize, finalize_epoch);
+    let before_shard = finalize.shard_data[0].clone();
+    let shard_op = finalize.shard_ops[0].clone();
+    let mut after_shard = before_shard.clone();
+    after_shard.finalized = true;
+    let tx = build_tally_shard_finalization_tx(
+        &mut finalize,
+        shard_op,
+        before_shard,
+        after_shard,
+        Some(weighted_poll_dep),
+    );
+    verify_ok(&mut finalize.context, tx);
+
+    let mut close = create_poll_fixture(133, 2, true);
+    let close_epoch = close.open_poll.deadline + 1;
+    set_fixture_epoch(&mut close, close_epoch);
+    let mut weighted_before = close.open_poll.clone();
+    weighted_before.token_weighted = true;
+    let weighted_after = closed_poll_from_result(&weighted_before, vec![0, 0], 0);
+    let tally_inputs = close
+        .shard_ops
+        .iter()
+        .cloned()
+        .map(|op| (op, TALLY_SHARD_MIN_SHANNONS))
+        .collect();
+    let tally_return_locks = vec![close.creator_lock.clone(); close.shard_ops.len()];
+    let tx = close_poll_with_inputs_tx(
+        &mut close,
+        weighted_before,
+        weighted_after,
+        true,
+        tally_inputs,
+        tally_return_locks,
+        Vec::new(),
+        CREATOR_DEPOSIT_SHANNONS,
+    );
+    verify_ok(&mut close.context, tx);
+
+    let mut refund = create_poll_fixture(134, 2, false);
+    let refund_lock = refund.always_success.clone();
+    let voter_hash = script_hash(&refund_lock);
+    let poll_type_hash = refund.poll_type_hash;
+    let (intent_op, _, _) = live_intent_cell(
+        &mut refund,
+        poll_type_hash,
+        voter_hash,
+        0,
+        false,
+        refund_lock.clone(),
+    );
+    let mut weighted_closed = refund.open_poll.clone();
+    weighted_closed.token_weighted = true;
+    weighted_closed.is_closed = true;
+    let weighted_closed_dep = poll_dep_from_data(&mut refund, weighted_closed);
+    let tx = refund_omitted_intent_tx(&mut refund, intent_op, weighted_closed_dep, refund_lock);
+    verify_ok(&mut refund.context, tx);
+}
+
+#[test]
+fn tally_shard_aggregation_rejects_appended_intent_output() {
+    let (mut fixture, shard_op, before, after, intents) = aggregation_fixture(132);
+    let extra_intent = intents[0].1.clone();
+    let extra_script = intents[0].2.clone();
+    let funding_lock = fixture.always_success.clone();
+    let funding_op = plain_cell(&mut fixture.context, funding_lock, VOTER_DEPOSIT_SHANNONS);
+    let tx = build_tally_shard_aggregation_tx(
+        &mut fixture,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    )
+    .as_advanced_builder()
+    .input(input(funding_op))
+    .output(output(
+        VOTER_DEPOSIT_SHANNONS,
+        extra_script.clone(),
+        Some(extra_script),
+    ))
+    .output_data(encode_vote_intent(&extra_intent).pack())
+    .witness(blank_witness().pack())
+    .build();
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
 }
 
 #[test]
@@ -1910,7 +2703,13 @@ fn tally_shard_aggregation_rejects_bad_intents_and_markers() {
         poll_hash,
         VOTER_DEPOSIT_SHANNONS,
     );
-    intents[0] = (rebuilt.0, rebuilt.1, rebuilt.2, VOTER_DEPOSIT_SHANNONS);
+    intents[0] = (
+        rebuilt.0,
+        rebuilt.1,
+        rebuilt.2,
+        VOTER_DEPOSIT_SHANNONS,
+        rebuilt.3,
+    );
     let tx = build_tally_shard_aggregation_tx(
         &mut wrong_shard,
         shard_op,
@@ -1932,7 +2731,13 @@ fn tally_shard_aggregation_rejects_bad_intents_and_markers() {
         poll_hash,
         VOTER_DEPOSIT_SHANNONS,
     );
-    intents[0] = (rebuilt.0, rebuilt.1, rebuilt.2, VOTER_DEPOSIT_SHANNONS);
+    intents[0] = (
+        rebuilt.0,
+        rebuilt.1,
+        rebuilt.2,
+        VOTER_DEPOSIT_SHANNONS,
+        rebuilt.3,
+    );
     let tx = build_tally_shard_aggregation_tx(
         &mut wrong_poll,
         shard_op,
@@ -1954,7 +2759,13 @@ fn tally_shard_aggregation_rejects_bad_intents_and_markers() {
         poll_hash,
         VOTER_DEPOSIT_SHANNONS,
     );
-    intents[1] = (rebuilt.0, rebuilt.1, rebuilt.2, VOTER_DEPOSIT_SHANNONS);
+    intents[1] = (
+        rebuilt.0,
+        rebuilt.1,
+        rebuilt.2,
+        VOTER_DEPOSIT_SHANNONS,
+        rebuilt.3,
+    );
     let tx = build_tally_shard_aggregation_tx(
         &mut duplicate,
         shard_op,
@@ -1996,7 +2807,13 @@ fn tally_shard_aggregation_rejects_bad_intents_and_markers() {
         poll_hash,
         VOTER_DEPOSIT_SHANNONS,
     );
-    intents[0] = (rebuilt.0, rebuilt.1, rebuilt.2, VOTER_DEPOSIT_SHANNONS);
+    intents[0] = (
+        rebuilt.0,
+        rebuilt.1,
+        rebuilt.2,
+        VOTER_DEPOSIT_SHANNONS,
+        rebuilt.3,
+    );
     let tx = build_tally_shard_aggregation_tx(
         &mut bad_option,
         shard_op,
@@ -2031,12 +2848,12 @@ fn tally_shard_aggregation_rejects_bad_intents_and_markers() {
 }
 
 #[test]
-fn tally_shard_aggregation_rejects_deadline_finalized_and_mutated_shards() {
-    let (mut after_deadline, shard_op, before, after, intents) = aggregation_fixture(90);
-    let late_epoch = after_deadline.open_poll.deadline + 1;
-    set_fixture_epoch(&mut after_deadline, late_epoch);
+fn tally_shard_aggregation_uses_authenticated_intent_creation_epochs() {
+    let (mut timely, shard_op, before, after, intents) = aggregation_fixture(90);
+    let post_deadline_epoch = timely.open_poll.deadline + 1;
+    set_fixture_epoch(&mut timely, post_deadline_epoch);
     let tx = build_tally_shard_aggregation_tx(
-        &mut after_deadline,
+        &mut timely,
         shard_op,
         before,
         after,
@@ -2044,8 +2861,66 @@ fn tally_shard_aggregation_rejects_deadline_finalized_and_mutated_shards() {
         Vec::new(),
         None,
     );
-    assert_exit_code(&verify_err(&mut after_deadline.context, tx), 5);
+    assert_eq!(tx.header_deps().len(), 2);
+    verify_ok(&mut timely.context, tx);
 
+    let (mut late, shard_op, before, after, mut intents) = aggregation_fixture(93);
+    let late_epoch = late.open_poll.deadline + 1;
+    for intent in &mut intents {
+        // HeaderDep(0) remains the fixture's old pre-deadline header. The
+        // input-linked header is later, so caller-selected ordering cannot
+        // make these intents count.
+        intent.4 = link_cell_to_epoch(&mut late.context, &intent.0, late_epoch);
+    }
+    let tx = build_tally_shard_aggregation_tx(
+        &mut late,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    );
+    assert_exit_code(&verify_err(&mut late.context, tx), 5);
+
+    let (mut missing, shard_op, before, after, intents) = aggregation_fixture(94);
+    let post_deadline_epoch = missing.open_poll.deadline + 1;
+    set_fixture_epoch(&mut missing, post_deadline_epoch);
+    let tx = build_tally_shard_aggregation_tx(
+        &mut missing,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    )
+    .as_advanced_builder()
+    .set_header_deps(Vec::new())
+    .build();
+    let _ = verify_err(&mut missing.context, tx);
+
+    let (mut wrong, shard_op, before, after, intents) = aggregation_fixture(95);
+    let post_deadline_epoch = wrong.open_poll.deadline + 1;
+    set_fixture_epoch(&mut wrong, post_deadline_epoch);
+    let wrong_header = insert_epoch_header(&mut wrong.context, wrong.open_poll.deadline);
+    let tx = build_tally_shard_aggregation_tx(
+        &mut wrong,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    )
+    .as_advanced_builder()
+    .set_header_deps(vec![wrong_header])
+    .build();
+    let _ = verify_err(&mut wrong.context, tx);
+}
+
+#[test]
+fn tally_shard_aggregation_rejects_finalized_and_mutated_shards() {
     let (mut finalized, shard_op, mut before, mut after, intents) = aggregation_fixture(91);
     before.finalized = true;
     after.finalized = true;
@@ -2097,7 +2972,15 @@ fn tally_shard_finalization_validates_deadline_and_immutables() {
     let before = early.shard_data[0].clone();
     let mut after = before.clone();
     after.finalized = true;
-    let early_tx = build_tally_shard_finalization_tx(&mut early, shard_op, before, after, None);
+    let too_low_since = absolute_epoch_since(early.open_poll.deadline);
+    let early_tx = build_tally_shard_finalization_tx_with_since(
+        &mut early,
+        shard_op,
+        before,
+        after,
+        None,
+        too_low_since,
+    );
     assert_exit_code(&verify_err(&mut early.context, early_tx), 5);
 
     let mut mutated = create_poll_fixture(102, 3, false);
@@ -2124,6 +3007,44 @@ fn tally_shard_finalization_validates_deadline_and_immutables() {
     let wrong_dep_tx =
         build_tally_shard_finalization_tx(&mut wrong_dep, shard_op, before, after, Some(dep));
     assert_exit_code(&verify_err(&mut wrong_dep.context, wrong_dep_tx), 5);
+}
+
+#[test]
+fn tally_shard_finalization_rejects_invalid_since_values_and_threshold_overflow() {
+    let mut fixture = create_poll_fixture(106, 3, false);
+    let shard_op = fixture.shard_ops[0].clone();
+    let before = fixture.shard_data[0].clone();
+    let mut after = before.clone();
+    after.finalized = true;
+    let deadline = fixture.open_poll.deadline;
+
+    for protocol_since in invalid_since_values(deadline) {
+        let tx = build_tally_shard_finalization_tx_with_since(
+            &mut fixture,
+            shard_op.clone(),
+            before.clone(),
+            after.clone(),
+            None,
+            protocol_since,
+        );
+        assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+    }
+
+    let mut overflow = create_poll_fixture(107, 3, false);
+    overflow.open_poll.deadline = u64::MAX;
+    let shard_op = overflow.shard_ops[0].clone();
+    let before = overflow.shard_data[0].clone();
+    let mut after = before.clone();
+    after.finalized = true;
+    let tx = build_tally_shard_finalization_tx_with_since(
+        &mut overflow,
+        shard_op,
+        before,
+        after,
+        None,
+        absolute_epoch_since(MAX_DEADLINE_EPOCH + 1),
+    );
+    assert_exit_code(&verify_err(&mut overflow.context, tx), 5);
 }
 
 #[test]
@@ -2316,7 +3237,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
     }
     let before = no_auth.open_poll.clone();
     let after = closed_poll_from_result(&before, vec![1, 1], 2);
-    let tx = close_poll_with_inputs_tx(
+    let tx = close_poll_with_inputs_tx_at_since(
         &mut no_auth,
         before,
         after,
@@ -2325,6 +3246,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
         Vec::new(),
         Vec::new(),
         CREATOR_DEPOSIT_SHANNONS,
+        absolute_epoch_since(deadline + 1),
     );
     assert_exit_code(&verify_err(&mut no_auth.context, tx), 5);
 }
@@ -2912,7 +3834,16 @@ fn merge_tx_with_output_data(
 #[test]
 fn codec_canonicality_rejects_trailing_bytes_in_vm() {
     let mut poll_fixture = fixture(260);
-    let poll_tx = create_poll_tx(&mut poll_fixture, 1, None, false, false);
+    let poll_tx = create_poll_tx(
+        &mut poll_fixture,
+        1,
+        None,
+        false,
+        false,
+        false,
+        [0u8; 32],
+        None,
+    );
     verify_ok(&mut poll_fixture.context, poll_tx);
 
     let mut bad_poll = fixture(261);
@@ -3080,6 +4011,75 @@ fn delegation_cell(
 }
 
 #[test]
+fn delegation_creation_requires_revocation_only_zero_expiry() {
+    let mut fixture = create_poll_fixture(279, 2, false);
+    let delegator_hash = script_hash(&fixture.always_success);
+    let base = DelegationData {
+        delegator_lock_hash: delegator_hash,
+        delegate_lock_hash: [0xD0; 32],
+        poll_type_hash: fixture.poll_type_hash,
+        expires_epoch: 0,
+    };
+    let valid = create_delegation_tx_with_output_data(&mut fixture, encode_delegation(&base));
+    verify_ok(&mut fixture.context, valid);
+
+    let mut expiring = base;
+    expiring.expires_epoch = fixture.epoch + 10;
+    let tx = create_delegation_tx_with_output_data(&mut fixture, encode_delegation(&expiring));
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn delegation_creation_rejects_additional_same_or_different_scope_output() {
+    let mut same_scope = create_poll_fixture(279, 2, false);
+    let base = DelegationData {
+        delegator_lock_hash: script_hash(&same_scope.always_success),
+        delegate_lock_hash: [0xD1; 32],
+        poll_type_hash: same_scope.poll_type_hash,
+        expires_epoch: 0,
+    };
+    let tx = create_delegation_tx_with_output_data(&mut same_scope, encode_delegation(&base));
+    verify_ok(&mut same_scope.context, tx.clone());
+    let extra_output = tx.outputs().get(0).expect("delegation output");
+    let extra_data = tx
+        .outputs_data()
+        .get(0)
+        .expect("delegation data")
+        .raw_data();
+    let tx = append_output(tx, extra_output, extra_data);
+    assert_exit_code(&verify_err(&mut same_scope.context, tx), 5);
+
+    let mut different_scope = create_poll_fixture(279, 2, false);
+    let base = DelegationData {
+        delegator_lock_hash: script_hash(&different_scope.always_success),
+        delegate_lock_hash: [0xD2; 32],
+        poll_type_hash: different_scope.poll_type_hash,
+        expires_epoch: 0,
+    };
+    let tx = create_delegation_tx_with_output_data(&mut different_scope, encode_delegation(&base));
+    let other_scope = [0xAB; 32];
+    let other_type = delegate_script(
+        &mut different_scope.context,
+        &different_scope.governance_op,
+        &other_scope,
+    );
+    let other = DelegationData {
+        poll_type_hash: other_scope,
+        ..base
+    };
+    let tx = append_output(
+        tx,
+        output(
+            DELEGATION_MIN_SHANNONS,
+            different_scope.always_success.clone(),
+            Some(other_type),
+        ),
+        encode_delegation(&other),
+    );
+    assert_exit_code(&verify_err(&mut different_scope.context, tx), 5);
+}
+
+#[test]
 fn delegated_vote_requires_matching_live_delegation_dep() {
     let mut fixture = create_poll_fixture(280, 2, false);
     let epoch = fixture.epoch;
@@ -3100,7 +4100,7 @@ fn delegated_vote_requires_matching_live_delegation_dep() {
         delegator_lock_hash: delegator_hash,
         delegate_lock_hash: delegate_hash,
         poll_type_hash,
-        expires_epoch: epoch + 5,
+        expires_epoch: 0,
     };
     let delegation_op = delegation_cell(
         &mut fixture,
@@ -3137,19 +4137,22 @@ fn delegated_vote_requires_matching_live_delegation_dep() {
     );
     assert_exit_code(&verify_err(&mut fixture.context, without_dep), 5);
 
-    let expired_delegation = DelegationData {
+    let expiring_delegation = DelegationData {
         delegator_lock_hash: delegator_hash,
         delegate_lock_hash: delegate_hash,
         poll_type_hash,
-        expires_epoch: epoch - 1,
+        expires_epoch: epoch + 5,
     };
-    let expired_op = delegation_cell(
+    let expiring_op = delegation_cell(
         &mut fixture,
         delegator_lock.clone(),
-        expired_delegation,
+        expiring_delegation,
         DELEGATION_MIN_SHANNONS,
     );
-    let expired = build_create_intent_tx(
+    // Even with the old pre-deadline header still selected as HeaderDep(0), a
+    // nonzero legacy expiry cannot be used in the revocation-only v1 protocol.
+    insert_epoch_header(&mut fixture.context, fixture.open_poll.deadline + 1);
+    let expiring = build_create_intent_tx(
         &mut fixture,
         delegate_op.clone(),
         delegate_lock.clone(),
@@ -3159,9 +4162,9 @@ fn delegated_vote_requires_matching_live_delegation_dep() {
         epoch,
         None,
         None,
-        Some(expired_op),
+        Some(expiring_op),
     );
-    assert_exit_code(&verify_err(&mut fixture.context, expired), 5);
+    assert_exit_code(&verify_err(&mut fixture.context, expiring), 5);
 
     let wrong_delegate_delegation = DelegationData {
         delegator_lock_hash: delegator_hash,
@@ -3214,6 +4217,53 @@ fn delegated_vote_requires_matching_live_delegation_dep() {
         Some(wrong_scope_op),
     );
     assert_exit_code(&verify_err(&mut fixture.context, wrong_scope), 5);
+}
+
+#[test]
+fn delegated_vote_rejects_dep_lock_hash_mismatch() {
+    let mut fixture = create_poll_fixture(281, 2, false);
+    let actual_dep_lock = fixture.always_success.clone();
+    let claimed_delegator_lock = fixture
+        .context
+        .build_script(&fixture.always_success_op, Bytes::from(vec![0xE1]))
+        .expect("claimed delegator lock");
+    let delegate_lock = fixture
+        .context
+        .build_script(&fixture.always_success_op, Bytes::from(vec![0xE2]))
+        .expect("delegate lock");
+    let claimed_delegator_hash = script_hash(&claimed_delegator_lock);
+    let delegate_hash = script_hash(&delegate_lock);
+    let delegate_op = plain_cell(
+        &mut fixture.context,
+        delegate_lock.clone(),
+        2_000 * SHANNONS_PER_CKB,
+    );
+    let delegation = DelegationData {
+        delegator_lock_hash: claimed_delegator_hash,
+        delegate_lock_hash: delegate_hash,
+        poll_type_hash: fixture.poll_type_hash,
+        expires_epoch: 0,
+    };
+    let delegation_op = delegation_cell(
+        &mut fixture,
+        actual_dep_lock.clone(),
+        delegation,
+        DELEGATION_MIN_SHANNONS,
+    );
+    let tx = build_create_intent_tx(
+        &mut fixture,
+        delegate_op,
+        delegate_lock.clone(),
+        claimed_delegator_hash,
+        actual_dep_lock,
+        0,
+        0,
+        None,
+        None,
+        Some(delegation_op),
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
 }
 
 #[test]
@@ -3279,126 +4329,97 @@ fn revoke_delegation_preserves_lock_and_capacity() {
     assert_exit_code(&verify_err(&mut fixture.context, underpaid_tx), 5);
 }
 
-fn legacy_poll_fixture(epoch: u64) -> PollFixture {
-    let mut fixture = create_poll_fixture(epoch, 1, false);
-    fixture.open_poll.shard_count = 0;
-    fixture.open_poll.vote_counts = vec![0, 0];
-    fixture.open_poll.total_voters = 0;
-    fixture.open_poll.counted_voter_lock_hashes.clear();
-    fixture.poll_op = governance_cell(
-        &mut fixture.context,
-        POLL_CELL_SHANNONS,
-        fixture.poll_lock.clone(),
-        fixture.poll_type.clone(),
-        encode_poll(&fixture.open_poll),
+#[test]
+fn delegation_revocation_rejects_additional_same_group_input() {
+    let mut fixture = create_poll_fixture(286, 2, false);
+    let delegator_lock = fixture.always_success.clone();
+    let delegation = DelegationData {
+        delegator_lock_hash: script_hash(&delegator_lock),
+        delegate_lock_hash: [0x23; 32],
+        poll_type_hash: fixture.poll_type_hash,
+        expires_epoch: 0,
+    };
+    let first = delegation_cell(
+        &mut fixture,
+        delegator_lock.clone(),
+        delegation.clone(),
+        DELEGATION_MIN_SHANNONS,
     );
-    fixture.shard_ops.clear();
-    fixture.shard_data.clear();
-    fixture
-}
-
-fn aggregate_votes_tx(
-    fixture: &mut PollFixture,
-    before_poll: PollData,
-    after_poll: PollData,
-    intent_op: OutPoint,
-    before_intent: VoteIntentData,
-    capacity: u64,
-) -> ckb_testtool::ckb_types::core::TransactionView {
-    let poll_op = governance_cell(
-        &mut fixture.context,
-        POLL_CELL_SHANNONS,
-        fixture.poll_lock.clone(),
-        fixture.poll_type.clone(),
-        encode_poll(&before_poll),
+    let second = delegation_cell(
+        &mut fixture,
+        delegator_lock.clone(),
+        delegation,
+        DELEGATION_MIN_SHANNONS,
     );
-    let mut marker = before_intent.clone();
-    marker.aggregated = true;
-    let intent_type = vote_intent_script(
-        &mut fixture.context,
-        &fixture.governance_op,
-        &fixture.poll_type_hash,
-    );
-
-    tx_with_header(
+    let tx = tx_with_header(
         TransactionBuilder::default()
-            .input(input(poll_op))
-            .input(input(intent_op))
-            .output(output(
-                POLL_CELL_SHANNONS,
-                fixture.poll_lock.clone(),
-                Some(fixture.poll_type.clone()),
-            ))
-            .output_data(encode_poll(&after_poll).pack())
-            .output(output(capacity, intent_type.clone(), Some(intent_type)))
-            .output_data(encode_vote_intent(&marker).pack())
+            .input(input(first))
+            .input(input(second))
+            .output(output(DELEGATION_MIN_SHANNONS, delegator_lock, None))
+            .output_data(Bytes::new().pack())
             .cell_dep(cell_dep(fixture.governance_op.clone()))
             .cell_dep(cell_dep(fixture.always_success_op.clone()))
             .witness(blank_witness().pack())
             .witness(blank_witness().pack()),
         fixture.header_hash.clone(),
     )
-    .build()
+    .build();
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
 }
 
 #[test]
-fn legacy_aggregate_votes_rejected_for_sharded_polls_and_allowed_for_historical_non_sharded() {
-    let mut sharded = create_poll_fixture(290, 2, false);
-    let voter_hash = script_hash(&sharded.always_success);
-    let poll_hash = sharded.poll_type_hash;
-    let refund_lock = sharded.always_success.clone();
-    let (intent_op, intent, _) = live_intent_cell_with_capacity(
-        &mut sharded,
-        poll_hash,
-        poll_hash,
-        voter_hash,
-        0,
-        false,
-        refund_lock,
-        VOTER_DEPOSIT_SHANNONS,
+fn retired_aggregate_votes_opcode_is_rejected() {
+    let mut fixture = fixture(290);
+    let retired_type = governance_script(&mut fixture, OP_RETIRED_AGGREGATE_VOTES, &[0x03; 32]);
+    let seed_op = plain_cell(
+        &mut fixture.context,
+        fixture.always_success.clone(),
+        1_000 * SHANNONS_PER_CKB,
     );
-    let before = sharded.open_poll.clone();
-    let mut after = before.clone();
-    after.vote_counts = vec![1, 0];
-    after.total_voters = 1;
-    after.counted_voter_lock_hashes = vec![voter_hash];
-    let sharded_tx = aggregate_votes_tx(
-        &mut sharded,
-        before,
-        after,
-        intent_op,
-        intent,
-        VOTER_DEPOSIT_SHANNONS,
-    );
-    assert_exit_code(&verify_err(&mut sharded.context, sharded_tx), 5);
+    let tx = tx_with_header(
+        TransactionBuilder::default()
+            .input(input(seed_op))
+            .output(output(
+                1_000 * SHANNONS_PER_CKB,
+                fixture.always_success.clone(),
+                Some(retired_type),
+            ))
+            .output_data(Bytes::new().pack())
+            .cell_dep(cell_dep(fixture.governance_op.clone()))
+            .cell_dep(cell_dep(fixture.always_success_op.clone()))
+            .witness(blank_witness().pack()),
+        fixture.header_hash.clone(),
+    )
+    .build();
 
-    let mut legacy = legacy_poll_fixture(291);
-    let voter_hash = script_hash(&legacy.always_success);
-    let poll_hash = legacy.poll_type_hash;
-    let refund_lock = legacy.always_success.clone();
-    let (intent_op, intent, _) = live_intent_cell_with_capacity(
-        &mut legacy,
-        poll_hash,
-        poll_hash,
-        voter_hash,
-        1,
-        false,
-        refund_lock,
-        VOTER_DEPOSIT_SHANNONS,
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 6);
+}
+
+#[test]
+fn retired_revoke_delegation_opcode_is_rejected() {
+    let mut fixture = fixture(291);
+    let retired_type = governance_script(&mut fixture, OP_RETIRED_REVOKE_DELEGATION, &[0x06; 32]);
+    let seed_op = plain_cell(
+        &mut fixture.context,
+        fixture.always_success.clone(),
+        1_000 * SHANNONS_PER_CKB,
     );
-    let mut before = legacy.open_poll.clone();
-    before.shard_count = 0;
-    let mut after = before.clone();
-    after.vote_counts = vec![0, 1];
-    after.total_voters = 1;
-    after.counted_voter_lock_hashes = vec![voter_hash];
-    let legacy_tx = aggregate_votes_tx(
-        &mut legacy,
-        before,
-        after,
-        intent_op,
-        intent,
-        VOTER_DEPOSIT_SHANNONS,
-    );
-    verify_ok(&mut legacy.context, legacy_tx);
+    let tx = tx_with_header(
+        TransactionBuilder::default()
+            .input(input(seed_op))
+            .output(output(
+                1_000 * SHANNONS_PER_CKB,
+                fixture.always_success.clone(),
+                Some(retired_type),
+            ))
+            .output_data(Bytes::new().pack())
+            .cell_dep(cell_dep(fixture.governance_op.clone()))
+            .cell_dep(cell_dep(fixture.always_success_op.clone()))
+            .witness(blank_witness().pack()),
+        fixture.header_hash.clone(),
+    )
+    .build();
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 6);
 }

@@ -9,8 +9,18 @@ import { Provider } from "@ckb-ccc/connector-react";
 import { ccc } from "@ckb-ccc/core";
 import { useCKB } from "./hooks/useCKB";
 import { usePolls } from "./hooks/usePolls";
-import { CKB_RPC_URL, getTipEpoch, shannonsToCkb, validateRuntimeConfig } from "./lib/ckb";
-import { buildProtocolTimeline, getPollFilterCounts } from "./lib/protocolUi";
+import {
+  ChainTipStatus,
+  CKB_RPC_URL,
+  getChainTipStatus,
+  shannonsToCkb,
+  validateRuntimeConfig,
+} from "./lib/ckb";
+import {
+  buildProtocolTimeline,
+  formatApproxWallClockDuration,
+  getPollFilterCounts,
+} from "./lib/protocolUi";
 import { WalletConnect } from "./components/WalletConnect";
 
 const CreatePoll = lazy(() => import("./components/CreatePoll").then((module) => ({ default: module.CreatePoll })));
@@ -62,26 +72,28 @@ function InnerApp() {
     closePoll,
     forceClose,
     refundClosedIntent,
+    refundLateIntent,
     createDelegation,
     revokeDelegation,
-  } = usePolls(signer);
+  } = usePolls(signer, defaultClient);
 
-  const [currentEpoch, setCurrentEpoch] = useState<bigint>(0n);
+  const [chainTip, setChainTip] = useState<ChainTipStatus | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<number>(Date.now());
   const [secondsSinceSync, setSecondsSinceSync] = useState<number>(0);
   const [delegationScopePrefill, setDelegationScopePrefill] = useState<{ pollId: string; requestId: number } | null>(null);
 
   const syncDashboard = useCallback(async () => {
-    if (!signer) return;
-    await fetchPolls();
-    const epoch = await getTipEpoch(signer.client);
-    setCurrentEpoch(epoch);
+    const client = signer?.client ?? defaultClient;
+    if (!configError) {
+      await fetchPolls();
+    }
+    const nextChainTip = await getChainTipStatus(client);
+    setChainTip(nextChainTip);
     setLastSyncedAt(Date.now());
     setSecondsSinceSync(0);
-  }, [fetchPolls, signer]);
+  }, [configError, fetchPolls, signer]);
 
   useEffect(() => {
-    if (!signer) return;
     syncDashboard().catch(console.error);
 
     const id = setInterval(() => {
@@ -89,7 +101,7 @@ function InnerApp() {
     }, 30000);
 
     return () => clearInterval(id);
-  }, [signer, syncDashboard]);
+  }, [syncDashboard]);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -97,6 +109,28 @@ function InnerApp() {
     }, 1000);
     return () => clearInterval(id);
   }, [lastSyncedAt]);
+
+  const currentEpoch = chainTip?.epoch ?? 0n;
+  const bestKnownBlock = chainTip?.bestKnownBlockNumber ?? null;
+  const blocksBehind =
+    chainTip && bestKnownBlock !== null && bestKnownBlock > chainTip.blockNumber
+      ? bestKnownBlock - chainTip.blockNumber
+      : 0n;
+  const rpcSyncPercent =
+    chainTip && bestKnownBlock !== null && bestKnownBlock > 0n
+      ? Number(
+          ((chainTip.blockNumber < bestKnownBlock ? chainTip.blockNumber : bestKnownBlock) * 10000n) /
+            bestKnownBlock
+        ) / 100
+      : null;
+  const rpcChainTimeGap =
+    chainTip?.bestKnownBlockTimestamp !== null &&
+    chainTip?.bestKnownBlockTimestamp !== undefined &&
+    chainTip.bestKnownBlockTimestamp > chainTip.blockTimestamp
+      ? formatApproxWallClockDuration(
+          Number(chainTip.bestKnownBlockTimestamp - chainTip.blockTimestamp) / 3_600_000
+        )
+      : null;
 
   const protocolTimeline = useMemo(() => {
     return buildProtocolTimeline(polls, delegations, currentEpoch);
@@ -156,20 +190,20 @@ function InnerApp() {
             Votes are recorded as independent intent cells and counted later through aggregation.
             This reduces shared-cell contention and keeps governance state explicit on-chain.
           </p>
-          <p className="hero-desc" style={{ marginTop: 8 }}>
+          <p className="hero-desc hero-desc-secondary" style={{ marginTop: 8 }}>
             Deposits stay inside governance cells as capacity. Delegation controls authority, not
             ownership. Close paths return funds through verified spend rules.
           </p>
           <div className="hero-chips">
             <span className="chip">Testnet</span>
-            <span className="chip">6 operations</span>
+            <span className="chip">6 script families</span>
             <span className="chip">Shard aggregation</span>
             <span className="chip">Delegation cells</span>
             <span className="chip">Permissionless force-close</span>
           </div>
           <div className="hero-note">
             This protocol uses intent cells for voting. Aggregation is a separate on-chain step -
-            aggregate before deadline to keep tally state current.
+            aggregate authenticated timely intents before shard finalization.
           </div>
           <div style={{ marginTop: 12, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-3)" }}>
             Last synced {secondsSinceSync}s ago | auto-refresh every 30s
@@ -178,9 +212,33 @@ function InnerApp() {
 
         <div className="stats-row" style={{ padding: "0 0 40px" }}>
           <div className="status-metric">
-            <div className="metric-label">Current Epoch</div>
-            <div className="metric-value">{currentEpoch.toString()}</div>
-            <span className="status-pill status-pill-neutral" style={{ marginTop: 8 }}>Testnet</span>
+            <div className="metric-label">RPC Node Tip</div>
+            <div className="metric-value chain-tip-value">
+              {chainTip ? `#${chainTip.blockNumber.toLocaleString("en-US")}` : "-"}
+            </div>
+            <div className="hint" style={{ marginTop: 6 }}>
+              Epoch {currentEpoch.toString()}
+              {blocksBehind > 0n && bestKnownBlock !== null
+                ? ` | best known #${bestKnownBlock.toLocaleString("en-US")}`
+                : ""}
+            </div>
+            {blocksBehind > 0n && (
+              <div className="hint" style={{ marginTop: 4 }}>
+                {blocksBehind.toLocaleString("en-US")} blocks behind
+                {rpcChainTimeGap ? ` | ${rpcChainTimeGap} of chain time` : ""}
+              </div>
+            )}
+            <span
+              className={`status-pill ${blocksBehind > 0n ? "status-pill-warn" : "status-pill-neutral"}`}
+              style={{ marginTop: 8 }}
+              title="Synchronization status of the configured RPC node, not the connected wallet"
+            >
+              {rpcSyncPercent === null
+                ? "RPC tip available"
+                : blocksBehind > 0n
+                  ? `${rpcSyncPercent.toFixed(2)}% synced`
+                  : "Synced 100%"}
+            </span>
           </div>
           <div className="status-metric">
             <div className="metric-label">Indexed Polls</div>
@@ -191,9 +249,14 @@ function InnerApp() {
             <span className="status-pill status-pill-ok" style={{ marginTop: 8 }}>On-chain</span>
           </div>
           <div className="status-metric">
-            <div className="metric-label">Active Delegations</div>
-            <div className="metric-value">{delegations.length}</div>
-            <span className="status-pill status-pill-ok" style={{ marginTop: 8 }}>Cells</span>
+            <div className="metric-label">Your Delegations</div>
+            <div className="metric-value">{isConnected ? delegations.length : "-"}</div>
+            <span
+              className={`status-pill ${isConnected ? "status-pill-ok" : "status-pill-warn"}`}
+              style={{ marginTop: 8 }}
+            >
+              {isConnected ? "Wallet scoped" : "Disconnected"}
+            </span>
           </div>
           <div className="status-metric">
             <div className="metric-label">Available Balance</div>
@@ -264,13 +327,22 @@ function InnerApp() {
           <PollList
             polls={polls}
             loading={loading}
-            isConnected={isConnected}
-            voterAddress={address}
-            voterLockHash={lockScriptHash}
+            isConnected={isConnected && !configError}
+            voterAddress={configError ? null : address}
+            voterLockHash={configError ? null : lockScriptHash}
             txState={txState}
             currentEpoch={currentEpoch}
-            onVote={(poll, optionIndex, authorityId, weightUnits) =>
-              castVote({ poll, optionIndex, authorityId, weightUnits })
+            currentEpochPosition={
+              chainTip
+                ? {
+                    epoch: chainTip.epoch,
+                    index: chainTip.epochIndex,
+                    length: chainTip.epochLength,
+                  }
+                : undefined
+            }
+            onVote={(poll, optionIndex, authorityId) =>
+              castVote({ poll, optionIndex, authorityId })
             }
             onAggregate={aggregatePoll}
             onFinalizeShards={finalizeShards}
@@ -278,6 +350,7 @@ function InnerApp() {
             onClose={closePoll}
             onForceClose={forceClose}
             onRefundClosedIntent={refundClosedIntent}
+            onRefundLateIntent={refundLateIntent}
             onRefresh={() => {
               void syncDashboard();
             }}
@@ -286,7 +359,7 @@ function InnerApp() {
           />
         </Suspense>
 
-        {isConnected && (
+        {isConnected && !configError && (
           <div id="creator-tools" style={{ marginTop: 20 }}>
             <div className="kicker" style={{ marginBottom: 10 }}>Creator and Delegation Tools</div>
             <div className="action-grid">
@@ -300,13 +373,13 @@ function InnerApp() {
                 />
               </Suspense>
               <Suspense fallback={sectionFallback}>
-                <CreatePoll onSubmit={createPoll} txState={txState} />
+                <CreatePoll onSubmit={createPoll} txState={txState} currentEpoch={currentEpoch} />
               </Suspense>
             </div>
           </div>
         )}
 
-        <div className="card-shell ui-enter-delay-1" style={{ marginBottom: 20, overflow: "hidden", padding: 0 }}>
+        <div id="protocol-timeline" className="card-shell ui-enter-delay-1" style={{ marginBottom: 20, overflow: "hidden", padding: 0 }}>
           <div style={{ padding: "16px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div className="card-title">Protocol Timeline</div>
             <div className="card-sub">Live operation state</div>
@@ -314,13 +387,13 @@ function InnerApp() {
 
           <div className="protocol-strip">
             {protocolTimeline.map((step) => (
-              <div key={step.op} className={`protocol-cell ${step.state}`}>
+              <div key={`${step.op}:${step.label}`} className={`protocol-cell ${step.state}`}>
                 <div
                   style={{
                     fontFamily: "var(--font-mono)",
                     fontSize: 9,
                     textTransform: "uppercase",
-                    letterSpacing: "0.14em",
+                    letterSpacing: 0,
                     color:
                       step.state === "completed" ? "var(--teal)" : step.state === "live" ? "var(--amber)" : "var(--ink-3)",
                     marginBottom: 5,
