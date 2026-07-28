@@ -41,6 +41,11 @@ jobs:
           target: riscv64imac-unknown-none-elf
           components: rustfmt
 
+      # Keep contract builds on 1.81 for deployed ELF reproducibility while
+      # current ckb-testtool host dependencies require stable Rust 1.95+.
+      - name: Install VM test Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
       - name: Install RISC-V C compiler
         run: |
           sudo apt-get update
@@ -59,7 +64,7 @@ jobs:
         run: pnpm build:contract:rust
 
       - name: Run CKB-VM integration tests
-        run: cargo test --manifest-path backend/contracts-rust/Cargo.toml -p integration-tests
+        run: pnpm test:contract:vm
 
       - name: Run frontend tests
         run: pnpm test:frontend

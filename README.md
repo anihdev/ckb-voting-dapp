@@ -233,15 +233,34 @@ Prerequisites:
 
 - Node.js 20.19 or newer;
 - pnpm 10 or newer;
-- the repository Rust toolchain;
+- GNU Make for the recommended command wrappers;
+- the repository Rust `1.81.0` toolchain for reproducible contract builds;
+- stable Rust `1.95.0` or newer for host-side `ckb-testtool` integration tests;
 - `riscv64imac-unknown-none-elf` Rust target;
 - a RISC-V bare-metal C compiler providing `riscv64-unknown-elf-gcc`
   (`gcc-riscv64-unknown-elf` on Ubuntu/Debian).
 
+Recommended setup on Ubuntu/Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes gcc-riscv64-unknown-elf
+make setup
+```
+
+On other systems, install a compiler that provides `riscv64-unknown-elf-gcc`, then run:
+
+```bash
+make setup
+```
+
+Equivalent manual setup:
+
 ```bash
 corepack enable
 pnpm install
-rustup target add riscv64imac-unknown-none-elf
+rustup toolchain install 1.81.0 --profile minimal --component rustfmt --target riscv64imac-unknown-none-elf
+rustup toolchain install stable --profile minimal
 sudo apt-get update
 sudo apt-get install --yes gcc-riscv64-unknown-elf
 ```
@@ -264,13 +283,23 @@ pnpm --filter ckb-voting-deploy exec ts-node -P tsconfig.json role-balances.ts
 
 The `CKB_PRIVATE_KEY` row is the contract deployer. Fund only its `ckt1...` address for testnet deployment.
 
-Useful commands:
+Common commands:
+
+```bash
+make setup
+make check
+make test
+make build
+make validate
+```
+
+The Make targets delegate to these underlying commands:
 
 ```bash
 cargo fmt --manifest-path backend/contracts-rust/Cargo.toml --all --check
 pnpm check:contract:rust
 pnpm build:contract:rust
-cargo test --manifest-path backend/contracts-rust/Cargo.toml -p integration-tests
+pnpm test:contract:vm
 pnpm test:frontend
 pnpm build:frontend
 pnpm --filter ckb-voting-deploy exec tsc -p tsconfig.json --noEmit
