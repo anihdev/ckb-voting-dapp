@@ -16,6 +16,7 @@ import { utf8ByteLength } from "../lib/molecule";
 import {
   epochSpanInUnit,
   formatApproxEpochDuration,
+  formatPollDurationUnit,
   PollDurationUnit,
   pollDurationToEpochs,
 } from "../lib/protocolUi";
@@ -230,14 +231,14 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
                   onClick={() => changeDurationUnit(unit)}
                   disabled={isBusy}
                   aria-pressed={durationUnit === unit}
-                  className="min-h-10 px-3 text-xs font-semibold capitalize transition"
+                  className="min-h-10 px-3 text-xs font-semibold transition"
                   style={
                     durationUnit === unit
                       ? { background: "var(--teal-dim)", color: "var(--teal)" }
                       : { color: "var(--ink-2)" }
                   }
                 >
-                  {unit}
+                  {formatPollDurationUnit(unit)}
                 </button>
               ))}
             </div>
@@ -249,7 +250,7 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
             Estimated deadline: epoch {estimatedDeadline.toString()}. Close becomes valid after that epoch.
           </div>
           <div className="hint">
-            Hours and days use CKB's approximate four-hour epoch target and round up. The on-chain epoch deadline remains authoritative.
+            Hour(s) and Day(s) use CKB's approximate four-hour epoch target and round up. This deployment does not support minute-scale deadlines.
           </div>
         </div>
 

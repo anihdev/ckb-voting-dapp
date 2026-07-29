@@ -40,6 +40,9 @@ jobs:
           toolchain: 1.81.0
           target: riscv64imac-unknown-none-elf
           components: rustfmt
+          # The action otherwise exports `RUSTFLAGS=-D warnings`, which would
+          # override `.cargo/config.toml` and re-enable unsupported atomics.
+          rustflags: ""
 
       # Keep contract builds on 1.81 for deployed ELF reproducibility while
       # current ckb-testtool host dependencies require stable Rust 1.95+.
@@ -62,6 +65,15 @@ jobs:
 
       - name: Build Rust contract
         run: pnpm build:contract:rust
+
+      - name: Check CKB-VM instruction compatibility
+        shell: bash
+        run: |
+          contract=backend/contracts-rust/target/riscv64imac-unknown-none-elf/release/governance-contract
+          if riscv64-unknown-elf-objdump -d "$contract" | grep -E '\b(amo[a-z.]*|lr\.[a-z.]*|sc\.[a-z.]*)\b'; then
+            echo "Contract contains atomic instructions unsupported by CKB-VM" >&2
+            exit 1
+          fi
 
       - name: Run CKB-VM integration tests
         run: pnpm test:contract:vm

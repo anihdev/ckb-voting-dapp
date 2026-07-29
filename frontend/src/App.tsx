@@ -61,6 +61,7 @@ function InnerApp() {
     polls,
     delegations,
     loading,
+    refreshing,
     loadError,
     txState,
     fetchPolls,
@@ -97,7 +98,9 @@ function InnerApp() {
     syncDashboard().catch(console.error);
 
     const id = setInterval(() => {
-      syncDashboard().catch(console.error);
+      if (document.visibilityState === "visible") {
+        syncDashboard().catch(console.error);
+      }
     }, 30000);
 
     return () => clearInterval(id);
@@ -327,6 +330,7 @@ function InnerApp() {
           <PollList
             polls={polls}
             loading={loading}
+            refreshing={refreshing}
             isConnected={isConnected && !configError}
             voterAddress={configError ? null : address}
             voterLockHash={configError ? null : lockScriptHash}

@@ -30,6 +30,16 @@ export const CKB_EPOCH_TARGET_HOURS = 4;
 
 export type PollDurationUnit = "hours" | "days" | "epochs";
 
+const POLL_DURATION_UNIT_LABELS: Record<PollDurationUnit, string> = {
+  hours: "Hour(s)",
+  days: "Day(s)",
+  epochs: "Epoch(s)",
+};
+
+export function formatPollDurationUnit(unit: PollDurationUnit): string {
+  return POLL_DURATION_UNIT_LABELS[unit];
+}
+
 export interface EpochPosition {
   epoch: bigint;
   index: bigint;

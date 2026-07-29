@@ -22,6 +22,7 @@ import {
 interface Props {
   polls: Poll[];
   loading: boolean;
+  refreshing: boolean;
   isConnected: boolean;
   voterAddress: string | null;
   voterLockHash: string | null;
@@ -44,6 +45,7 @@ interface Props {
 export function PollList({
   polls,
   loading,
+  refreshing,
   isConnected,
   voterAddress,
   voterLockHash,
@@ -65,6 +67,7 @@ export function PollList({
   const [filter, setFilter] = useState<PollLifecycleFilter>("open");
   const [copiedPollId, setCopiedPollId] = useState<string | null>(null);
   const isInitialLoading = loading && polls.length === 0;
+  const isRefreshing = loading || refreshing;
   const hasNoPolls = polls.length === 0;
 
   const copyPollId = async (pollId: string) => {
@@ -151,11 +154,12 @@ export function PollList({
 
         <button
           onClick={onRefresh}
-          disabled={loading}
-          className="btn-quiet flex items-center gap-2 self-end text-xs uppercase sm:self-auto"
+          disabled={isRefreshing}
+          aria-label={isRefreshing ? "Refreshing poll registry" : "Refresh poll registry"}
+          className="btn-quiet flex min-w-[104px] items-center justify-center gap-2 self-end text-xs uppercase sm:self-auto"
         >
-          <span className={loading ? "animate-spin" : ""}>*</span>
-          {loading ? "Loading..." : "Refresh"}
+          <span className={isRefreshing ? "animate-spin" : ""} aria-hidden="true">*</span>
+          Refresh
         </button>
       </div>
 

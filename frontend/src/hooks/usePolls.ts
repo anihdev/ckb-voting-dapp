@@ -6,7 +6,7 @@
  * intent checks and delegated voting authority discovery.
  */
 
-import { useCallback, useRef, useState } from "react";
+import { startTransition, useCallback, useRef, useState } from "react";
 import { ccc } from "@ckb-ccc/core";
 import {
   buildAggregateTallyShardTx,
@@ -158,22 +158,33 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
   const [intents, setIntents] = useState<Record<string, VoteIntent[]>>({});
   const [delegations, setDelegations] = useState<DelegationRecord[]>([]);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [txState, setTxState] = useState<TxState>({ status: "idle", txHash: null, error: null });
   const trackedTxHashRef = useRef<string | null>(null);
+  const hasLoadedRef = useRef(false);
+  const fetchPromiseRef = useRef<Promise<void> | null>(null);
   const [pollCells, setPollCells] = useState<Record<string, any>>({});
   const [intentCells, setIntentCells] = useState<Record<string, any[]>>({});
   const [tallyShardCells, setTallyShardCells] = useState<Record<string, any[]>>({});
   const [tallyMergeResultCells, setTallyMergeResultCells] = useState<Record<string, any[]>>({});
   const [delegationCells, setDelegationCells] = useState<Record<string, any>>({});
 
-  const fetchPolls = useCallback(async () => {
+  const fetchPolls = useCallback((): Promise<void> => {
     const client = signer?.client ?? readClient;
-    if (!client) return;
+    if (!client) return Promise.resolve();
+    if (fetchPromiseRef.current) return fetchPromiseRef.current;
 
-    setLoading(true);
+    const isInitialLoad = !hasLoadedRef.current;
+    if (isInitialLoad) {
+      setLoading(true);
+    } else {
+      setRefreshing(true);
+    }
     setLoadError(null);
-    try {
+
+    const request = (async () => {
+      try {
       const pollScript = buildGovernanceTypeScript(OP.CREATE_POLL);
       const nextPolls: Poll[] = [];
       const nextIntents: Record<string, VoteIntent[]> = {};
@@ -498,19 +509,32 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         poll.refundableIntentCount = pollIntents.length;
       }
 
-      setPolls(nextPolls);
-      setIntents(nextIntents);
-      setPollCells(nextPollCells);
-      setIntentCells(nextIntentCells);
-      setTallyShardCells(nextTallyShardCells);
-      setTallyMergeResultCells(nextTallyMergeResultCells);
-      setDelegations(nextDelegations);
-      setDelegationCells(nextDelegationCells);
-    } catch (error: any) {
-      setLoadError(error?.message ?? String(error));
-    } finally {
-      setLoading(false);
-    }
+        startTransition(() => {
+          setPolls(nextPolls);
+          setIntents(nextIntents);
+          setPollCells(nextPollCells);
+          setIntentCells(nextIntentCells);
+          setTallyShardCells(nextTallyShardCells);
+          setTallyMergeResultCells(nextTallyMergeResultCells);
+          setDelegations(nextDelegations);
+          setDelegationCells(nextDelegationCells);
+        });
+      } catch (error: any) {
+        setLoadError(error?.message ?? String(error));
+      } finally {
+        hasLoadedRef.current = true;
+        setLoading(false);
+        setRefreshing(false);
+      }
+    })();
+
+    fetchPromiseRef.current = request;
+    void request.finally(() => {
+      if (fetchPromiseRef.current === request) {
+        fetchPromiseRef.current = null;
+      }
+    });
+    return request;
   }, [readClient, signer]);
 
   const trackSubmittedTransaction = useCallback(
@@ -1065,6 +1089,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
     intents,
     delegations,
     loading,
+    refreshing,
     loadError,
     txState,
     fetchPolls,

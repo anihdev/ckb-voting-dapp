@@ -12,6 +12,7 @@ import {
   FINALIZE_PENDING_INTENTS_WARNING,
   formatApproxEpochDuration,
   formatApproxWallClockDuration,
+  formatPollDurationUnit,
   getFinalizeShardConfirmationMessage,
   getPollFilterCounts,
   isPollVotingSupported,
@@ -118,6 +119,12 @@ describe("poll lifecycle UI", () => {
     expect(pollDurationToEpochs(0, "days")).toBe(0);
     expect(epochSpanInUnit(18, "days")).toBe(3);
     expect(epochSpanInUnit(18, "hours")).toBe(72);
+  });
+
+  test("uses stable bracketed duration unit labels", () => {
+    expect(formatPollDurationUnit("hours")).toBe("Hour(s)");
+    expect(formatPollDurationUnit("days")).toBe("Day(s)");
+    expect(formatPollDurationUnit("epochs")).toBe("Epoch(s)");
   });
 
   test("estimates the close window from the fractional tip epoch", () => {

@@ -76,7 +76,7 @@ export function DelegatePower({ delegations, txState, onDelegate, onRevoke, pref
           Delegation cells lock at least 61 CKB and may require more occupied capacity depending on script size.
         </p>
         <div className="alert alert-warn mt-3 text-sm">
-          Testnet v1 funding policy: the delegate funds a delegated intent, while its exact capacity refund returns to the delegator. Do not treat this as the final real-funds SDK delegation policy.
+          Governance Testnet v1 funding policy: the delegate funds a delegated intent, while its exact capacity refund returns to the delegator. Grant deliverables is scoped to adress this.
         </div>
         <p className="subtle mt-2 text-sm">
           Tip: use <strong>Copy Poll ID</strong> or <strong>Delegate for this poll</strong> from Poll Registry to prefill poll scope quickly.
