@@ -488,6 +488,63 @@
   color: #5dd9b0;
 }
 
+.governance-theme .poll-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.governance-theme .poll-card {
+  scroll-margin-top: 84px;
+}
+
+.governance-theme .poll-question-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.governance-theme .poll-question-label,
+.governance-theme .poll-details-heading,
+.governance-theme .poll-detail-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.governance-theme .poll-question {
+  margin-top: 4px;
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.governance-theme .poll-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  margin-top: 10px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.governance-theme .poll-meta > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.governance-theme .poll-options-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .governance-theme .poll-option {
   width: 100%;
   background: var(--surface-2);
@@ -505,6 +562,43 @@
   color: inherit;
   font: inherit;
   text-align: left;
+  min-height: 48px;
+}
+
+.governance-theme .poll-option-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  min-width: 0;
+}
+
+.governance-theme .poll-option-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.governance-theme .poll-option-label-text {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.governance-theme .poll-option-tally {
+  flex: 0 0 auto;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .governance-theme .poll-option.is-actionable {
@@ -554,6 +648,57 @@
 .governance-theme .poll-option.selected .poll-option-radio {
   border-color: var(--teal);
   background: var(--teal);
+}
+
+.governance-theme .poll-lifecycle-details {
+  border-top: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.governance-theme .poll-details-heading {
+  margin-bottom: 8px;
+  color: var(--ink-2);
+}
+
+.governance-theme .poll-detail-list {
+  border-top: 1px solid var(--line);
+}
+
+.governance-theme .poll-detail-row {
+  display: grid;
+  grid-template-columns: minmax(112px, 0.22fr) minmax(0, 1fr);
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.governance-theme .poll-detail-row:last-child {
+  border-bottom: 0;
+}
+
+.governance-theme .poll-detail-warning {
+  color: #c4873a;
+}
+
+.governance-theme .poll-tally-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 16px;
+}
+
+.governance-theme .poll-tally-summary strong {
+  color: var(--ink);
+}
+
+.governance-theme .poll-tally-summary span {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
 .governance-theme .table-shell {
@@ -944,6 +1089,31 @@
 }
 
 @media (max-width: 640px) {
+  .governance-theme .poll-card {
+    scroll-margin-top: 116px;
+  }
+
+  .governance-theme .poll-options-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .governance-theme .poll-title-row {
+    gap: 10px;
+  }
+
+  .governance-theme .poll-question {
+    font-size: 17px;
+  }
+
+  .governance-theme .poll-meta {
+    gap: 4px 10px;
+  }
+
+  .governance-theme .poll-detail-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
   .governance-theme .nav-inner {
     display: grid;
     grid-template-columns: 1fr;

@@ -6,6 +6,7 @@ import {
   buildProtocolTimeline,
   canFinalizeTallyShardFromUi,
   computeCanonicalTallyFrontier,
+  CREATOR_VOTING_DISABLED_MESSAGE,
   epochSpanInUnit,
   estimatePollCloseHours,
   filterPollsByLifecycle,
@@ -16,11 +17,13 @@ import {
   getFinalizeShardConfirmationMessage,
   getPollFilterCounts,
   isPollVotingSupported,
+  minimumPollDurationValue,
   pollDurationToEpochs,
   selectCloseTimeIntentRefunds,
   tallyMergeCoverageComplete,
   tallyMergeCoverageCount,
   UNSUPPORTED_WEIGHTED_POLL_LABEL,
+  validatePollDurationSelection,
 } from "../frontend/src/lib/protocolUi";
 import { bytesToHex } from "../frontend/src/lib/molecule";
 import { Poll, TallyMergeResult, TallyShard } from "../frontend/src/lib/types";
@@ -125,6 +128,21 @@ describe("poll lifecycle UI", () => {
     expect(formatPollDurationUnit("hours")).toBe("Hour(s)");
     expect(formatPollDurationUnit("days")).toBe("Day(s)");
     expect(formatPollDurationUnit("epochs")).toBe("Epoch(s)");
+  });
+
+  test("rejects misleading sub-epoch human duration selections", () => {
+    expect(minimumPollDurationValue("hours")).toBe(8);
+    expect(minimumPollDurationValue("days")).toBe(1);
+    expect(minimumPollDurationValue("epochs")).toBe(1);
+    expect(validatePollDurationSelection(1, "hours")).toContain("at least 8");
+    expect(validatePollDurationSelection(8, "hours")).toBeNull();
+    expect(validatePollDurationSelection(0.25, "days")).toContain("at least 1");
+  });
+
+  test("keeps creator voting feedback explicit", () => {
+    expect(CREATOR_VOTING_DISABLED_MESSAGE).toBe(
+      "Voting is not allowed for poll creator."
+    );
   });
 
   test("estimates the close window from the fractional tip epoch", () => {

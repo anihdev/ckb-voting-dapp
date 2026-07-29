@@ -16,6 +16,7 @@ import {
 } from "../lib/constants";
 import {
   canFinalizeTallyShardFromUi,
+  CREATOR_VOTING_DISABLED_MESSAGE,
   EpochPosition,
   estimatePollCloseHours,
   formatApproxEpochDuration,
@@ -79,15 +80,15 @@ function mapActionErrorToUserMessage(rawMessage: string): string {
 function tallySourceLabel(source: Poll["tallyFrontier"]["source"]): string {
   switch (source) {
     case "live-shards":
-      return "Tally source: live shard cells";
+      return "Current tally: live tally lanes";
     case "merge-frontier":
-      return "Tally source: partial merge frontier";
+      return "Current tally: partial merged tally";
     case "complete-merge":
-      return "Tally source: complete merge result";
+      return "Current tally: complete merged tally";
     case "closed-poll":
-      return "Tally source: closed poll result";
+      return "Final tally: closed poll result";
     default:
-      return "Tally source: live shard cells";
+      return "Current tally: live tally lanes";
   }
 }
 
@@ -140,8 +141,8 @@ export function VoteOnPoll({
   const canDescribeTallyAsFinal = poll.isClosed || closeStateReady;
   const tallyCoverageText =
     poll.tallyFrontier.shardCount > 0
-      ? `${poll.tallyFrontier.coveredShardCount.toString()}/${poll.tallyFrontier.shardCount.toString()} shards covered`
-      : "no shard coverage indexed";
+      ? `${poll.tallyFrontier.coveredShardCount.toString()}/${poll.tallyFrontier.shardCount.toString()} lanes indexed`
+      : "no tally-lane coverage indexed";
   const uncoveredPreview = poll.tallyFrontier.uncoveredShardIds.slice(0, 8).join(", ");
   const uncoveredSuffix =
     poll.tallyFrontier.uncoveredShardIds.length > 8
@@ -149,8 +150,6 @@ export function VoteOnPoll({
       : "";
   const hasCreatedEpoch = poll.createdEpoch !== null;
   const createdEpoch = poll.createdEpoch ?? 0n;
-  const plannedLiveEpochs =
-    hasCreatedEpoch && poll.deadline > createdEpoch ? poll.deadline - createdEpoch : 0n;
   const elapsedSinceCreated =
     hasCreatedEpoch && currentEpoch > createdEpoch ? currentEpoch - createdEpoch : 0n;
   const estimatedCloseHours = estimatePollCloseHours(
@@ -353,11 +352,30 @@ export function VoteOnPoll({
     !poll.isClosed &&
     poll.lateIntentCount > 0;
   const optionIsActionable = canVote && !isBusy;
+  const voteUnavailableMessage = isCreator
+    ? CREATOR_VOTING_DISABLED_MESSAGE
+    : selectedAuthorityRepresentsCreator
+      ? "Voting is not allowed because this delegated authority represents the poll creator."
+      : !selectedAuthority
+        ? "No voting authority is available for this poll."
+        : isExpired
+          ? "Voting has ended for this poll."
+          : selectedAuthority.hasIntent
+            ? "This represented voter already has a vote intent for this poll."
+            : "Voting is not available for the current poll state.";
+  const tallySourceDescription =
+    poll.tallyFrontier.source === "live-shards"
+      ? "Votes shown are totals currently stored in the live tally lanes. Pending intents are not included until aggregation."
+      : poll.tallyFrontier.source === "merge-frontier"
+        ? "Votes shown combine non-overlapping merge results with uncovered live tally lanes."
+        : poll.tallyFrontier.source === "complete-merge"
+          ? "Votes shown come from one complete merge result covering every tally lane."
+          : "Votes shown come from the result preserved when this poll closed.";
 
   const authorityDescription = !votingSupported
     ? "Weighted voting is disabled for this indexed poll. Only lifecycle recovery actions remain available."
     : isCreator
-    ? "You are viewing this poll as its creator. Vote intent submission is disabled in creator view."
+    ? CREATOR_VOTING_DISABLED_MESSAGE
     : selectedAuthorityRepresentsCreator
       ? "This delegated authority represents the poll creator. Consensus does not allow the creator to vote through a delegate."
     : selectedAuthority
@@ -377,12 +395,15 @@ export function VoteOnPoll({
   return (
     <div
       id={anchorId}
-      className={`card-shell overflow-hidden !p-0 ${poll.isClosed ? "opacity-75" : ""
+      className={`poll-card card-shell overflow-hidden !p-0 ${poll.isClosed ? "opacity-75" : ""
         }`}
     >
-      <div className="px-4 pb-3 pt-5 sm:px-5">
-        <div className="mb-1 flex items-start justify-between gap-3">
-          <h3 className="text-lg font-semibold leading-tight text-[var(--ink)]">{poll.question}</h3>
+      <div className="poll-card-header px-4 pb-3 pt-5 sm:px-5">
+        <div className="poll-title-row">
+          <div className="poll-question-wrap">
+            <div className="poll-question-label">Proposal question</div>
+            <h3 className="poll-question">{poll.question}</h3>
+          </div>
           <div className="flex-shrink-0">
             {poll.isClosed ? (
               <span className="status-pill status-closed">
@@ -400,140 +421,39 @@ export function VoteOnPoll({
           </div>
         </div>
 
-        <div className="space-x-3 text-xs subtle">
+        <div className="poll-meta" aria-label="Poll summary">
           <span>{poll.totalVoters.toString()} voters</span>
-          <span>|</span>
           <span>{poll.pendingIntentCount.toString()} indexed pending intents</span>
           {poll.isClosed && poll.refundableIntentCount > 0 && (
-            <>
-              <span>|</span>
-              <span>{poll.refundableIntentCount.toString()} omitted intent refunds indexed</span>
-            </>
+            <span>{poll.refundableIntentCount.toString()} omitted intent refunds indexed</span>
           )}
-          <span>|</span>
           <span>{isCreator ? "Creator view" : "Voter view"}</span>
-          <span>|</span>
           <span>{poll.tokenWeighted ? UNSUPPORTED_WEIGHTED_POLL_LABEL : "1 voter = 1 vote"}</span>
-          <span>|</span>
-          <span>{poll.shardCount.toString()} tally shards</span>
-          <span>|</span>
+          <span>{poll.shardCount.toString()} tally lanes</span>
           <span>Deadline: epoch {poll.deadline.toString()}</span>
-          <span>|</span>
           <span className="font-mono" style={{ color: "var(--ink-3)" }}>{poll.id.slice(0, 10)}...</span>
         </div>
-
-        <div className="mt-2 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "var(--line)", background: "var(--surface-2)", color: "var(--ink-2)" }}>
-          <div>
-            Created:{" "}
-            {hasCreatedEpoch ? (
-              <>epoch {createdEpoch.toString()}</>
-            ) : (
-              <>epoch unavailable from indexer</>
-            )}
-          </div>
-          {hasCreatedEpoch && (
-            <>
-              <div>Planned live window: {formatApproxEpochDuration(plannedLiveEpochs)}</div>
-              <div>Time passed since creation: {formatApproxEpochDuration(elapsedSinceCreated)}</div>
-            </>
-          )}
-          {!isExpired ? (
-            <div>
-              Estimated time until close window: {formatApproxWallClockDuration(estimatedCloseHours)}
-            </div>
-          ) : (
-            <div>Time passed since deadline: {formatApproxEpochDuration(epochsPastDeadline)}</div>
-          )}
-        </div>
-
-        {!poll.isClosed && (
-          <div className="mt-3 space-y-2 text-xs">
-            {poll.tokenWeighted && (
-              <div className="alert alert-error">
-                {UNSUPPORTED_WEIGHTED_POLL_MESSAGE}
-              </div>
-            )}
-            {votingSupported && (
-              <>
-                <div className="alert alert-info">
-                  Submitting intent records your choice now; tally updates after aggregation.
-                </div>
-                <div className="alert alert-warn">
-                  Intent finality: once your vote intent is recorded on-chain, it cannot be changed for this poll. Review authority and option before submit.
-                </div>
-              </>
-            )}
-            {isCreator && (
-              <div className="alert alert-info">
-                {votingSupported
-                  ? "Creator close is available after the deadline when tally state is ready. Shard aggregation, finalization, merge, force-close after grace, and omitted-intent refunds are maintenance actions any connected wallet can run with enough CKB."
-                  : "Creator close remains available after the deadline when recovery state is ready. Finalization, merge, force-close after grace, and omitted-intent refunds remain recovery actions; aggregation is disabled."}
-              </div>
-            )}
-            {!isExpired && (
-              <div className="alert alert-info">
-                Close becomes valid after deadline (epoch &gt; {poll.deadline.toString()}). Permissionless force-close opens once epoch &gt; {forceCloseGraceEndEpoch.toString()}.
-              </div>
-            )}
-            {isExpired && !forceCloseOpen && (
-              <div className="alert alert-warn">
-                Creator-auth close is active now. If creator does not close, anyone can force-close once epoch &gt; {forceCloseGraceEndEpoch.toString()}.
-              </div>
-            )}
-            {isExpired && forceCloseOpen && (
-              <div className="alert alert-error">
-                Grace period elapsed. Anyone can force-close now so deposits are not locked indefinitely.
-              </div>
-            )}
-            {poll.pendingIntentCount > 0n && (
-              <div className="alert" style={{ background: "var(--surface-2)", border: "1px solid var(--line)", color: "var(--ink-2)" }}>
-                {votingSupported
-                  ? "Timely pending intents detected. They may be aggregated after the deadline until their shard is finalized."
-                  : "Pending weighted intents cannot be aggregated by this deployment. Finalize and close the poll to make omitted intent capacity recoverable."}
-              </div>
-            )}
-            {!poll.isClosed && poll.lateIntentCount > 0 && (
-              <div className="alert alert-warn">
-                {poll.lateIntentCount.toString()} intent(s) were committed after the deadline. They cannot count and are eligible for full-capacity refund.
-              </div>
-            )}
-            {poll.shardCount > 0 && (
-              <div className="alert alert-info">
-                Shards indexed: {indexedShardCount.toString()}/{poll.shardCount.toString()}; finalized: {finalizedShardCount.toString()}/{poll.shardCount.toString()}.
-                {missingShardCount > 0 ? ` Missing shards: ${missingShardCount.toString()}.` : ""}
-                {mergeResultCount > 0 ? ` Merge results indexed: ${mergeResultCount.toString()}.` : ""}
-              </div>
-            )}
-            {isExpired && poll.shardCount > 0 && !directCloseTooLarge && !allShardsFinalized && (
-              <div className="alert alert-warn">
-                Close is disabled until every indexed tally shard is finalized. Finalization freezes shard tally state for close.
-              </div>
-            )}
-            {isExpired && poll.shardCount > 0 && poll.pendingIntentCount > 0n && (
-              <div className="alert alert-warn">
-                Pending intents are still indexed. Finalizing can leave them uncounted; they remain refundable after close.
-              </div>
-            )}
-            {isExpired && directCloseTooLarge && (
-              <div className={`alert ${hasCompleteMergeResult ? "alert-info" : "alert-warn"}`}>
-                Direct close is limited to {MAX_DIRECT_CLOSE_SHARDS.toString()} shards.
-                {hasCompleteMergeResult
-                  ? " A complete merge result is indexed, so close can use the merge/result path."
-                  : " This poll requires a complete merge result before close."}
-              </div>
-            )}
-          </div>
-        )}
-        {poll.isClosed && poll.refundableIntentCount > 0 && (
-          <div className="mt-3 space-y-2 text-xs">
-            <div className="alert alert-warn">
-              Omitted live intent cells are still indexed. Post-close refund is permissionless and sends capacity to each intent's encoded refund lock, but it does not change the final tally.
-            </div>
-          </div>
-        )}
       </div>
 
       <div className="space-y-2.5 px-4 pb-4 sm:px-5">
+        {!poll.isClosed && poll.tokenWeighted && (
+          <div className="alert alert-error">
+            {UNSUPPORTED_WEIGHTED_POLL_MESSAGE}
+          </div>
+        )}
+
+        {!poll.isClosed && votingSupported && isCreator && (
+          <div className="alert alert-warn">
+            {CREATOR_VOTING_DISABLED_MESSAGE}
+          </div>
+        )}
+
+        {!poll.isClosed && votingSupported && !isCreator && (
+          <div className="alert alert-warn">
+            Intent finality: once your vote intent is recorded on-chain, it cannot be changed for this poll. Review authority and option before submit.
+          </div>
+        )}
+
         {!isCreator && votingSupported && poll.authorityOptions.length > 0 && (
           <div className="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3.5 py-3">
             <label className="mb-1.5 block text-xs font-semibold uppercase subtle">
@@ -555,41 +475,7 @@ export function VoteOnPoll({
           </div>
         )}
 
-        <div
-          className="rounded-lg border px-3 py-2 text-xs"
-          style={{
-            borderColor: tallyCoverageComplete ? "var(--line)" : "rgba(245, 158, 11, 0.45)",
-            background: tallyCoverageComplete ? "var(--surface-2)" : "rgba(245, 158, 11, 0.08)",
-            color: "var(--ink-2)",
-          }}
-        >
-          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-            <div className="font-semibold" style={{ color: "var(--ink)" }}>
-              {tallySourceLabel(poll.tallyFrontier.source)}
-            </div>
-            <div className="font-mono" style={{ color: "var(--ink-3)" }}>
-              {tallyCoverageText}
-            </div>
-          </div>
-          {poll.tallyFrontier.source === "merge-frontier" && (
-            <div className="mt-1">
-              Merge results used: {poll.tallyFrontier.selectedMergeResultIds.length.toString()}; live shards used: {poll.tallyFrontier.selectedShardIds.length.toString()}.
-            </div>
-          )}
-          {poll.shardCount > 0 && !tallyCoverageComplete && (
-            <div className="mt-1" style={{ color: "var(--amber)" }}>
-              Displayed tally is partial because only {poll.tallyFrontier.coveredShardCount.toString()}/{poll.tallyFrontier.shardCount.toString()} shards are covered by indexed shard or merge cells.
-              {uncoveredPreview ? ` Uncovered shard ids: ${uncoveredPreview}${uncoveredSuffix}.` : ""}
-            </div>
-          )}
-          {!canDescribeTallyAsFinal && tallyCoverageComplete && (
-            <div className="mt-1 subtle">
-              Coverage is complete for currently indexed tally cells, but the poll is not closed yet.
-            </div>
-          )}
-        </div>
-
-        <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+        <div className="poll-options-grid" aria-label="Voting options">
           {poll.options.map((option, index) => {
             const votes = poll.voteCounts[index] ?? 0n;
             const percentage = poll.totalVotes > 0n ? Number((votes * 100n) / poll.totalVotes) : 0;
@@ -604,21 +490,21 @@ export function VoteOnPoll({
                 disabled={!optionIsActionable}
                 aria-pressed={isSelected}
                 className={`poll-option${isSelected ? " selected" : ""}${optionIsActionable ? " is-actionable" : " disabled"}`}
-                title={optionIsActionable ? "Select this option to submit vote intent" : "Voting is not available for this poll state/authority"}
+                title={optionIsActionable ? "Select this option to submit vote intent" : voteUnavailableMessage}
               >
                 <div
                   className={`poll-option-bar ${isWinner ? "winner" : ""}`}
                   style={{ width: `${percentage}%` }}
                 />
-                <div className="relative flex items-center justify-between">
-                  <div className="flex items-center gap-2.5">
+                <div className="poll-option-content">
+                  <div className="poll-option-label">
                     {canVote && (
                       <div className="poll-option-radio" />
                     )}
                     {isWinner && <span className="text-xs font-semibold uppercase" style={{ color: "#34d399" }}>Winner</span>}
-                    <span className="text-sm font-medium text-[var(--ink)]">{option}</span>
+                    <span className="poll-option-label-text">{option}</span>
                   </div>
-                  <div className="ml-3 flex-shrink-0 text-right text-xs subtle">
+                  <div className="poll-option-tally">
                     <span className="font-semibold" style={{ color: "var(--ink)" }}>{votes.toString()}</span>
                     <span className="ml-1" style={{ color: "var(--ink-3)" }}>({percentage}%)</span>
                   </div>
@@ -800,6 +686,142 @@ export function VoteOnPoll({
           )}
         </div>
       )}
+
+      <div className="poll-lifecycle-details px-4 py-4 sm:px-5">
+        <div className="poll-details-heading">Lifecycle and tally details</div>
+        <div className="poll-detail-list">
+          <div className="poll-detail-row">
+            <div className="poll-detail-label">Timing</div>
+            <div>
+              Created {hasCreatedEpoch ? `in epoch ${createdEpoch.toString()}` : "at an epoch unavailable from the indexer"}.
+              {hasCreatedEpoch ? ` Time passed: ${formatApproxEpochDuration(elapsedSinceCreated)}.` : ""}
+              {!isExpired
+                ? ` Estimated time until close can begin: ${formatApproxWallClockDuration(estimatedCloseHours)}.`
+                : ` Time passed since deadline: ${formatApproxEpochDuration(epochsPastDeadline)}.`}
+            </div>
+          </div>
+
+          {!poll.isClosed && votingSupported && (
+            <div className="poll-detail-row">
+              <div className="poll-detail-label">Vote recording</div>
+              <div>Submitting intent records your choice now; tally updates after aggregation.</div>
+            </div>
+          )}
+
+          {!poll.isClosed && isCreator && (
+            <div className="poll-detail-row">
+              <div className="poll-detail-label">Creator lifecycle</div>
+              <div>
+                {votingSupported
+                  ? "Creator close is available after the deadline when tally state is ready. Tally-lane aggregation, finalization, merge, force-close after grace, and omitted-intent refunds are maintenance actions any connected wallet can run with enough CKB."
+                  : "Creator close remains available after the deadline when recovery state is ready. Finalization, merge, force-close after grace, and omitted-intent refunds remain recovery actions; aggregation is disabled."}
+              </div>
+            </div>
+          )}
+
+          {!poll.isClosed && (
+            <div className="poll-detail-row">
+              <div className="poll-detail-label">Close window</div>
+              <div>
+                {!isExpired
+                  ? `Close becomes valid after deadline (epoch > ${poll.deadline.toString()}). Permissionless force-close opens once epoch > ${forceCloseGraceEndEpoch.toString()}.`
+                  : !forceCloseOpen
+                    ? `Creator-auth close is active now. Permissionless force-close opens once epoch > ${forceCloseGraceEndEpoch.toString()}.`
+                    : "The grace period has elapsed. Anyone can force-close now so deposits are not locked indefinitely."}
+              </div>
+            </div>
+          )}
+
+          {poll.shardCount > 0 && (
+            <div className="poll-detail-row">
+              <div className="poll-detail-label">Tally lanes</div>
+              <div>
+                Indexed: {indexedShardCount.toString()}/{poll.shardCount.toString()}; finalized: {finalizedShardCount.toString()}/{poll.shardCount.toString()}.
+                {missingShardCount > 0 ? ` Missing lanes: ${missingShardCount.toString()}.` : ""}
+                {mergeResultCount > 0 ? ` Merge results indexed: ${mergeResultCount.toString()}.` : ""}
+              </div>
+            </div>
+          )}
+
+          <div className="poll-detail-row">
+            <div className="poll-detail-label">Displayed tally</div>
+            <div>
+              <div className="poll-tally-summary">
+                <strong>{tallySourceLabel(poll.tallyFrontier.source)}</strong>
+                <span>{tallyCoverageText}</span>
+              </div>
+              <div className="mt-1">{tallySourceDescription}</div>
+              {poll.tallyFrontier.source === "merge-frontier" && (
+                <div className="mt-1">
+                  Merge results used: {poll.tallyFrontier.selectedMergeResultIds.length.toString()}; live tally lanes used: {poll.tallyFrontier.selectedShardIds.length.toString()}.
+                </div>
+              )}
+              {poll.shardCount > 0 && !tallyCoverageComplete && (
+                <div className="mt-1" style={{ color: "var(--amber)" }}>
+                  This display is partial: {poll.tallyFrontier.coveredShardCount.toString()}/{poll.tallyFrontier.shardCount.toString()} tally lanes are covered by indexed lane or merge cells.
+                  {uncoveredPreview ? ` Uncovered lane ids: ${uncoveredPreview}${uncoveredSuffix}.` : ""}
+                </div>
+              )}
+              {!canDescribeTallyAsFinal && tallyCoverageComplete && (
+                <div className="mt-1 subtle">
+                  Indexed tally coverage is complete, but the result is not final until lifecycle close readiness or poll closure.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {poll.pendingIntentCount > 0n && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Pending intents</div>
+              <div>
+                {votingSupported
+                  ? "Timely pending intents may be aggregated after the deadline until their tally lane is finalized."
+                  : "Pending weighted intents cannot be aggregated by this deployment. Finalize and close the poll to make omitted intent capacity recoverable."}
+              </div>
+            </div>
+          )}
+
+          {!poll.isClosed && poll.lateIntentCount > 0 && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Late intents</div>
+              <div>{poll.lateIntentCount.toString()} intent(s) were committed after the deadline. They cannot count and are eligible for full-capacity refund.</div>
+            </div>
+          )}
+
+          {isExpired && poll.shardCount > 0 && !directCloseTooLarge && !allShardsFinalized && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Close readiness</div>
+              <div>Close is disabled until every indexed tally lane is finalized. Finalization freezes its tally state for close.</div>
+            </div>
+          )}
+
+          {isExpired && poll.shardCount > 0 && poll.pendingIntentCount > 0n && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Completeness warning</div>
+              <div>Pending intents are still indexed. Finalizing can leave them uncounted; they remain refundable after close.</div>
+            </div>
+          )}
+
+          {isExpired && directCloseTooLarge && (
+            <div className={`poll-detail-row ${hasCompleteMergeResult ? "" : "poll-detail-warning"}`}>
+              <div className="poll-detail-label">Merge requirement</div>
+              <div>
+                Direct close is limited to {MAX_DIRECT_CLOSE_SHARDS.toString()} tally lanes.
+                {hasCompleteMergeResult
+                  ? " A complete merge result is indexed, so close can use the merge-result path."
+                  : " This poll requires a complete merge result before close."}
+              </div>
+            </div>
+          )}
+
+          {poll.isClosed && poll.refundableIntentCount > 0 && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Omitted refunds</div>
+              <div>Omitted live intent cells remain indexed. Post-close refund returns capacity to each encoded refund lock and does not change the final tally.</div>
+            </div>
+          )}
+        </div>
+      </div>
 
       {txState.status !== "idle" && (
         <div className="px-4 pb-4 sm:px-5">

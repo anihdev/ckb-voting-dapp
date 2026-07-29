@@ -377,7 +377,20 @@ function InnerApp() {
                 />
               </Suspense>
               <Suspense fallback={sectionFallback}>
-                <CreatePoll onSubmit={createPoll} txState={txState} currentEpoch={currentEpoch} />
+                <CreatePoll
+                  onSubmit={createPoll}
+                  txState={txState}
+                  currentEpoch={currentEpoch}
+                  currentEpochPosition={
+                    chainTip
+                      ? {
+                          epoch: chainTip.epoch,
+                          index: chainTip.epochIndex,
+                          length: chainTip.epochLength,
+                        }
+                      : undefined
+                  }
+                />
               </Suspense>
             </div>
           </div>

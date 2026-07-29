@@ -130,14 +130,14 @@ export function PollList({
             <button
               key={tab.key}
               onClick={() => setFilter(tab.key)}
-              className="inline-flex min-w-[96px] items-center justify-between rounded-lg px-4 py-1.5 text-sm font-medium transition-all"
+              className="inline-flex min-w-[144px] flex-none items-center justify-center gap-3 whitespace-nowrap rounded-lg px-4 py-1.5 text-sm font-medium transition-all"
               style={
                 filter === tab.key
                   ? { background: "var(--teal-dim)", color: "var(--teal)", boxShadow: "inset 0 0 0 1px rgba(0,200,151,0.2)" }
                   : { color: "var(--ink-2)" }
               }
             >
-              <span style={{ paddingRight: 8 }}>{tab.label}</span>
+              <span>{tab.label}</span>
               <span
                 className="rounded-full px-1.5 py-0.5 text-xs"
                 style={
@@ -242,6 +242,7 @@ export function PollList({
         <div className="space-y-4">
           <div className="alert alert-info">
             Shard aggregation processes timely vote intents before or after the deadline, until each shard is finalized.
+            {" "}
             Closed polls are archived by default but remain accessible from the Archived or All tabs.
           </div>
           <div className="table-shell">

@@ -25,6 +25,8 @@ export const FINALIZE_PENDING_INTENTS_WARNING =
 export const UNSUPPORTED_WEIGHTED_POLL_LABEL = "Weighted voting disabled; recovery only";
 export const UNSUPPORTED_WEIGHTED_POLL_MESSAGE =
   "Weighted voting is unsupported in this equal-weight deployment. New voting and aggregation are disabled; finalization, close, and exact-capacity recovery remain available.";
+export const CREATOR_VOTING_DISABLED_MESSAGE =
+  "Voting is not allowed for poll creator.";
 
 export const CKB_EPOCH_TARGET_HOURS = 4;
 
@@ -38,6 +40,28 @@ const POLL_DURATION_UNIT_LABELS: Record<PollDurationUnit, string> = {
 
 export function formatPollDurationUnit(unit: PollDurationUnit): string {
   return POLL_DURATION_UNIT_LABELS[unit];
+}
+
+export function minimumPollDurationValue(unit: PollDurationUnit): number {
+  return unit === "hours" ? 8 : 1;
+}
+
+export function validatePollDurationSelection(
+  value: number,
+  unit: PollDurationUnit
+): string | null {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "Enter a positive voting duration";
+  }
+
+  const minimum = minimumPollDurationValue(unit);
+  if (value < minimum) {
+    return unit === "hours"
+      ? "Hour(s) must be at least 8 because this deployment uses whole CKB epoch deadlines"
+      : `${formatPollDurationUnit(unit)} must be at least ${minimum.toString()}`;
+  }
+
+  return null;
 }
 
 export interface EpochPosition {

@@ -15,10 +15,15 @@ import {
 import { utf8ByteLength } from "../lib/molecule";
 import {
   epochSpanInUnit,
+  EpochPosition,
+  estimatePollCloseHours,
   formatApproxEpochDuration,
+  formatApproxWallClockDuration,
   formatPollDurationUnit,
+  minimumPollDurationValue,
   PollDurationUnit,
   pollDurationToEpochs,
+  validatePollDurationSelection,
 } from "../lib/protocolUi";
 import { isTransactionInFlight } from "../lib/txLifecycle";
 import { TxState } from "../lib/types";
@@ -28,12 +33,13 @@ interface Props {
   onSubmit: (params: CreatePollParams) => Promise<string>;
   txState: TxState;
   currentEpoch: bigint;
+  currentEpochPosition?: EpochPosition;
 }
 
 const DEFAULT_DURATION_VALUE = 1;
 const DEFAULT_DURATION_UNIT: PollDurationUnit = "days";
 
-export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
+export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPosition }: Props) {
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState(["", ""]);
   const [durationValue, setDurationValue] = useState(DEFAULT_DURATION_VALUE);
@@ -46,6 +52,11 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
   const questionBytes = utf8ByteLength(question);
   const durationEpochs = pollDurationToEpochs(durationValue, durationUnit);
   const estimatedDeadline = currentEpoch + BigInt(durationEpochs);
+  const estimatedCloseHours = estimatePollCloseHours(
+    estimatedDeadline,
+    currentEpochPosition ?? { epoch: currentEpoch, index: 0n, length: 1n }
+  );
+  const durationSelectionError = validatePollDurationSelection(durationValue, durationUnit);
 
   const addOption = () => {
     if (options.length < MAX_OPTIONS) setOptions([...options, ""]);
@@ -77,6 +88,7 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
       }
     }
 
+    if (durationSelectionError) return durationSelectionError;
     if (durationEpochs < 1 || durationEpochs > 1000) {
       return "Duration must convert to 1-1000 whole epochs";
     }
@@ -85,7 +97,12 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
 
   const changeDurationUnit = (nextUnit: PollDurationUnit) => {
     const preservedEpochs = Math.max(1, durationEpochs);
-    setDurationValue(epochSpanInUnit(preservedEpochs, nextUnit));
+    setDurationValue(
+      Math.max(
+        minimumPollDurationValue(nextUnit),
+        epochSpanInUnit(preservedEpochs, nextUnit)
+      )
+    );
     setDurationUnit(nextUnit);
   };
 
@@ -207,13 +224,13 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
         </div>
 
         <div>
-          <label className="label">Voting duration</label>
+          <label className="label">Approximate voting duration</label>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <input
               type="number"
               value={durationValue}
               onChange={(event) => setDurationValue(Number(event.target.value))}
-              min={durationUnit === "days" ? 0.25 : 1}
+              min={minimumPollDurationValue(durationUnit)}
               max={durationUnit === "days" ? 166.6667 : durationUnit === "hours" ? 4000 : 1000}
               step={durationUnit === "days" ? 0.25 : 1}
               className="input w-full sm:w-32"
@@ -244,14 +261,15 @@ export function CreatePoll({ onSubmit, txState, currentEpoch }: Props) {
             </div>
           </div>
           <div className="mt-2 text-sm subtle">
-            Protocol duration: {formatApproxEpochDuration(BigInt(Math.max(0, durationEpochs)))}
+            Deadline offset: {formatApproxEpochDuration(BigInt(Math.max(0, durationEpochs)))}
           </div>
           <div className="hint">
-            Estimated deadline: epoch {estimatedDeadline.toString()}. Close becomes valid after that epoch.
+            Estimated effective voting window: {formatApproxWallClockDuration(estimatedCloseHours)}. Close can begin after epoch {estimatedDeadline.toString()}.
           </div>
           <div className="hint">
-            Hour(s) and Day(s) use CKB's approximate four-hour epoch target and round up. This deployment does not support minute-scale deadlines.
+            Hour(s) and Day(s) map to whole CKB epochs. The shortest Hour(s) selection is 8; minute-scale deadlines are not supported by this deployment.
           </div>
+          {durationSelectionError && <div className="mt-2 text-sm" style={{ color: "var(--red)" }}>{durationSelectionError}.</div>}
         </div>
 
         <div className="alert alert-warn">
