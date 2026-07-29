@@ -193,10 +193,10 @@ Implemented:
 - frontend builders, indexing, lifecycle controls, and partial-tally disclosure;
 - committed-state transaction tracking: broadcast actions remain confirming until CKB commitment, while timeouts remain explicitly unconfirmed;
 - CKB-VM tests for lifecycle, timing, malformed data, authorization, capacity, and bypass attempts.
+- reproducible local and CI validation with separate contract-build and host-test Rust toolchains.
 
 Incomplete or operationally limited:
 
-- no proof of vote completeness;
 - no protocol-funded maintenance incentive;
 - lightweight RPC/indexer discovery rather than a dedicated production indexer;
 - smoke scripts do not yet rehearse the full post-deadline finalize/merge/close path;
@@ -293,17 +293,17 @@ make build
 make validate
 ```
 
-The Make targets delegate to these underlying commands:
+The five Make targets group these underlying checks and builds. `make validate` runs `check`, `test`, and `build`:
 
 ```bash
-cargo fmt --manifest-path backend/contracts-rust/Cargo.toml --all --check
+cargo +1.81.0 fmt --manifest-path backend/contracts-rust/Cargo.toml --all --check
 pnpm check:contract:rust
 pnpm build:contract:rust
 pnpm test:contract:vm
 pnpm test:frontend
 pnpm build:frontend
 pnpm --filter ckb-voting-deploy exec tsc -p tsconfig.json --noEmit
-pnpm audit --prod
+git diff --check
 ```
 
 ## Deployment Status
@@ -337,11 +337,11 @@ The frontend discovers cells with scoped type-script queries:
 - merge results by exact `MERGE_TALLY_SHARDS || poll_type_hash`;
 - delegations by the `DELEGATE` prefix.
 
-The UI distinguishes aggregated tally state, timely pending intents, late refundable intents, active revocation-based delegations, finalized shard coverage, merge progress, close readiness, and refund actions. A complete indexed shard frontier is not described as vote-complete.
+The UI distinguishes aggregated tally state, timely pending intents, late refundable intents, active revocation-based delegations, finalized shard coverage, merge progress, close readiness, and refund actions.
 
 ## Testing
 
-The VM suite executes the release RISC-V binary and covers, among other cases:
+The tests suite executes the release RISC-V binary and covers, among other cases:
 
 - stale caller-selected header dep regression;
 - intent creation-header authentication with `Context::link_cell_with_block`;
@@ -352,8 +352,8 @@ The VM suite executes the release RISC-V binary and covers, among other cases:
 - valid shard finalization, creator close, and force-close `since`;
 - direct rejection of retired opcode `0x03`;
 - delegation creation/use with zero expiry;
+- rejection of nonzero UDT configuration and disabled weighted-voting creation/aggregation paths, while preserving historical-cell recovery;
 - direct and merged close, capacity returns, malformed codecs, and same-index bypass attempts.
-
 
 ## License
 

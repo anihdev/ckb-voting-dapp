@@ -563,7 +563,7 @@ export function buildProtocolTimeline(
     {
       op: "DELEGATE",
       label: "Delegate authority",
-      detail: "Issue delegation cells globally or per poll.",
+      detail: "Issue poll-scoped delegation cells for one represented voter.",
       state: hasDelegation ? "completed" : hasPolls ? "live" : "pending",
     },
     {

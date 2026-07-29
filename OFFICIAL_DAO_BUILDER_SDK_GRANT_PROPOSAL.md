@@ -10,8 +10,8 @@ The protocol finalizes auditable tallies over the vote intents actually aggregat
 
 ### Deliverables
 
-- SDK architecture spec and public module boundary for the DAO Builder SDK.
-- Core TypeScript governance builders for proposal creation, vote intent submission, delegation, tally-lane aggregation, finalization, merge/close, force-close, and refund recovery.
+- SDK architecture spec and public module boundary, including represented-principal authority, delegation funding, and eligibility-policy boundaries.
+- Core TypeScript governance builders for proposal creation, strict-mode one-shot direct/delegated vote authority, clearly labeled advisory-mode behavior, vote intent submission, tally-lane aggregation, finalization, merge/close, force-close, and refund recovery.
 - React hooks and reusable UI components for proposals, voting, delegation, maintenance queues, and results.
 - Generic eligibility adapter interface, a CKBoost-compatible reference adapter, a reference membership-cell adapter, and one on-chain-enforced reference eligibility policy.
 - Reference SubDAO dashboard using the current governance protocol as the live demo app.
@@ -127,7 +127,7 @@ Already implemented:
 - Delegation and revocation cells.
 - Post-close omitted-intent refund path.
 - Frontend reference app with create, vote, aggregate, finalize, merge, close, force-close, delegate, revoke, and refund surfaces.
-- CKB-VM/testtool coverage for the core lifecycle.
+- A reproducible `make validate` workflow and GitHub Actions validation path.
 - Verified Vercel deployment of the reference frontend configured for the current testnet.
 
 Still missing:
@@ -154,8 +154,11 @@ The Rust contract and codec remain authoritative for protocol behavior. Active s
 - Version 1 delegation is revocation-based; the retained expiry field must be zero.
 - Poll creators cannot submit vote intents directly, delegate their own vote, or submit as another voter's delegate. This is enforced by lock hash and is not a personhood claim.
 - `VoteIntentData.voted_at_epoch` is retained as non-consensus codec metadata.
+- New polls are equal-weight only and require a zero `udt_type_hash`; weighted historical cells are recovery-only under the current deployment.
 
 Deposits are recoverable through validated close and refund paths. Final tallies are correct over intents actually aggregated into finalized shards, but the protocol does not prove that every valid timely intent was included. Sharding reduces contention across tally lanes, although updates to the same lane still serialize. Permissionless maintenance authorizes any valid operator transaction; it does not create a built-in operator reward.
+
+Current v1 enforces one validated intent output per creation transaction and one counted vote per represented voter, but it does not yet enforce only one confirmable intent across separate transactions, resolving this limitation is an explicit grant deliverable: Milestone 1 will finalize the canonical-principal and singleton-authority design, and Milestone 2 will implement and CKB-VM-test the reviewed strict reference path before the public SDK voting API is frozen.
 
 ---
 
@@ -171,7 +174,7 @@ A consuming CKB app's flow through the SDK:
 
 3. **Create a proposal.** The SDK builds the proposal transaction using the governance protocol's `CREATE_POLL` flow. The proposal creates a poll cell and its tally-lane set.
 
-4. **Submit votes.** Eligible participants create `CREATE_VOTE_INTENT` cells. When a poll requires protocol-enforced eligibility, its committed policy and eligibility evidence must validate on chain. A delegate may vote when both delegated authority and the configured eligibility policy are satisfied.
+4. **Submit votes.** Eligible participants will use one poll-scoped. Milestone 2 will implement a poll-scoped, one-shot authority for each canonical represented principal. The principal may exercise it directly or assign it exclusively to a delegate; both paths consume the same authority, ensuring that only one valid intent can be created. For protocol-enforced eligibility policies, the poll will commit to the policy and the governance contract will validate the corresponding eligibility evidence on chain.
 
 5. **Maintain the proposal.** Any party can aggregate pending intents into tally lanes, finalize after deadline, merge larger results, close the proposal, or recover omitted deposits.
 
@@ -209,6 +212,9 @@ The package names below are illustrative until namespace ownership is verified.
 
 - Adapter boundary:
   - `EligibilityAdapter`
+  - `VoteAuthorityPolicy`
+  - `DelegationPolicy`
+  - `FundingPolicy`
 
 For every package deliverable, I will provide:
 
@@ -381,6 +387,10 @@ Deliverables:
 - Adapter interface definitions for eligibility, membership, DID, and reputation.
 - CKBoost evidence mapping review covering public campaign, participant, verification, points, and achievement surfaces without assuming CKBoost-side changes.
 - On-chain eligibility design covering poll policy commitment, eligibility evidence-cell transaction composition, replay and scope binding, advisory versus enforced status, and contract/frontend failure behavior.
+- Versioned represented-principal authority design proving at most one strict poll authority per eligible principal, with direct and delegated voting consuming the same one-shot authority.
+- Principal-owned funding/refund design in which a delegate selects and submits the vote but cannot supply voting weight, redirect the deposit, or receive the principal's refund.
+- Contention analysis proving that unrelated voters do not consume a shared poll-wide, community-wide, issuer-wide, or global mutable cell.
+- Explicit deferral of reusable global funded delegation until a bounded allowance and concurrency model is separately reviewed.
 - Clear v1 versus future-scope list.
 - Public design review update posted to the proposal thread.
 
@@ -388,6 +398,8 @@ Acceptance:
 
 - Every package lists its public exports and excluded private internals.
 - The eligibility specification defines every field, validation rule, scope/replay rule, represented principal, status rule, and expiry rule.
+- The authority specification defines singleton issuance, direct/delegated exclusivity, assignment/revocation, exact capacity preservation, fee-input isolation, refund ownership, and migration/version boundaries.
+- The selected authority topology introduces no mandatory shared mutable input between unrelated voters; any serialization is bounded to one represented principal or one tally lane.
 - Codec fixtures and deterministic policy-hash vectors are checked into the repository.
 - A clean specification-validation command passes.
 - Public review notes identify resolved and still-open decisions.
@@ -404,15 +416,16 @@ Deliverables:
 - Builders for:
   - proposal creation
   - vote intent creation
-  - delegation and revocation
+  - strict poll authority issuance and recovery
+  - poll-scoped delegation assignment/revocation and direct/delegated permit exercise
   - tally-lane aggregation
   - finalization
   - merge
   - close and force-close
   - post-close omitted-intent refund
 - Shared constants and codecs moved into the SDK boundary.
-- Rust contract and codec extension for one reviewed, on-chain-enforced reference eligibility policy selected in Milestone 1.
-- CKB-VM tests for valid evidence, missing evidence, wrong subject, wrong governance scope, policy mismatch, expired/inactive evidence, replay attempts, and frontend-bypass transactions.
+- Rust contract and codec extension for the reviewed strict vote-authority path and one on-chain-enforced reference eligibility policy selected in Milestone 1.
+- CKB-VM tests for valid evidence, missing evidence, wrong subject, wrong governance scope, policy mismatch, expired/inactive evidence, replay attempts, conflicting direct/delegated intents, duplicate authority issuance, deposit/refund ownership, and frontend-bypass transactions.
 - Tests for builder input validation, protocol layout assumptions, and fixed input ordering.
 - Current reference app updated to consume the SDK layer.
 
@@ -423,6 +436,8 @@ Acceptance:
 - No external consumer import reaches into `frontend/src` or another package's private path.
 - API, codec-vector, fixed-input-order, authenticated-origin-header, and compatibility tests pass.
 - CKB-VM tests cover valid evidence, missing evidence, wrong principal, wrong scope, policy mismatch, inactive status, nonzero expiry, replay mismatch, delegated principal handling, and manual frontend bypass.
+- Direct and delegated voting for one represented principal cannot both confirm for the same poll, while unrelated voters retain independent mutable inputs.
+- Permit/intent capacity is preserved exactly for the represented principal and wallet-added fee/change inputs cannot increase voting weight or redirect refunds.
 - A semantic version, repository tag, and changelog entry are present.
 
 ### Milestone 3: React Integration Layer And Eligibility Adapters
@@ -487,7 +502,7 @@ The $9,000 USD equivalent funds 12 weeks of solo development to productize the e
 
 ### Development Costs: $7,600
 
-- Core protocol and TypeScript SDK extraction and tests: ~$2,200.
+- Core protocol, represented-principal authority, and TypeScript SDK extraction/tests: ~$2,200.
 - React hooks/components and dashboard refactor: ~$1,500.
 - Eligibility adapter boundary, CKBoost-compatible reference, membership-cell reference, on-chain policy extension, and policy tests: ~$2,200.
 - Runtime validation, Pudge testnet rehearsal, demo flows, and integration cleanup: ~$1,700.
@@ -532,6 +547,9 @@ The following are deliberately out of scope for this grant:
 - ZK vote-completeness circuit work or `groth16-ckb` verifier integration/composition.
 - Private voting.
 - Reputation-weighted voting.
+- Token- or capacity-weighted voting; the first SDK policy remains equal-weight.
+- Reusable global funded delegation or an unbounded cross-poll delegation allowance.
+- Proof of personhood or a claim that one canonical credential necessarily equals one human.
 - Automatic treasury execution.
 - xUDT or NFT membership as the default eligibility model.
 - Marketplace or membership resale.
@@ -581,6 +599,12 @@ Different apps represent eligibility differently: contribution history, campaign
 An SDK or UI decision can be bypassed if the Rust contract does not verify the same eligibility rule.
 
 **Mitigation:** I will require every decision to declare `advisory` or `on_chain` enforcement. I will commit the reference policy to poll state, validate its evidence during vote-intent creation, and cover manually constructed frontend-bypass attempts in CKB-VM tests. I will describe an external adapter as protocol-enforced only after its exact evidence rule is implemented and tested on chain.
+
+### Voting Authority And Delegation Funding Risk
+
+Current testnet v1 prevents double counting during aggregation but does not prevent conflicting live intents at creation, and its delegated path separates the capacity payer from the refund owner.
+
+**Mitigation:** I will not freeze those v1 semantics as the public SDK policy. For the enforced reference policy, I will specify and implement one versioned, poll-scoped authority per canonical represented principal so direct and delegated submission consume the same authority, committed capacity and refunds remain principal-owned, fee inputs cannot alter weight, and unrelated voters do not share a mutable authority cell. Any advisory wallet-only mode will disclose that it cannot prove singleton authority.
 
 ### Runtime / Indexer Risk
 

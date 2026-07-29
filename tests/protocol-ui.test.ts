@@ -154,6 +154,8 @@ describe("poll lifecycle UI", () => {
     const timeline = buildProtocolTimeline([makePoll({ pendingIntentCount: 1n })], [], 50n);
     expect(timeline.map((step) => step.op)).toContain("CREATE_TALLY_SHARD");
     expect(timeline.map((step) => step.op)).not.toContain("AGGREGATE_VOTES");
+    expect(timeline.find((step) => step.label === "Delegate authority")?.detail).toContain("poll-scoped");
+    expect(timeline.find((step) => step.label === "Delegate authority")?.detail).not.toContain("globally");
   });
 
   test("marks weighted polls unsupported while retaining recovery finalization", () => {

@@ -1,10 +1,10 @@
 # ZK Aggregation MVP Plan
 
-Status: superseded for immediate implementation by `CONTENTION_FIRST_MVP_PLAN.md`.
+Status: frozen historical research. It is not a current implementation brief and is outside the DAO Builder SDK grant scope. Do not resume it without an explicit maintainer decision.
 
 For the current post-sharding ZK completeness research track, use `ZK_COMPLETENESS_DESIGN.md`. This file is historical context for the older poll-cell aggregation idea.
 
-Do not start Groth16, Cecilia verifier integration, or proof-circuit work until the non-ZK sharded aggregation and shard finalization/close lifecycle are stable. The notes below are retained as post-shard verifier research context only.
+Do not start Groth16, Cecilia verifier integration, or proof-circuit work from this file. The notes below are retained as research context only; current work is the non-ZK DAO Builder SDK, represented-principal authority design, eligibility policy, and controlled testnet rehearsal.
 
 This document records an earlier plan for adding ZK-assisted aggregation to the CKB governance protocol. It is intentionally scoped as an MVP/testnet plan, not a mainnet privacy claim.
 

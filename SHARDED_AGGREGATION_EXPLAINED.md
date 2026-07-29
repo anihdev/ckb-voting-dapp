@@ -50,7 +50,7 @@ Correctness/completeness problem:
   How do I prove the tally is correct and complete?
 ```
 
-Shards solve the first problem. ZK may later help with the second problem.
+Shards solve the first problem. ZK may later help with the second problem, but ZK/Groth16 work is deferred and outside the current DAO Builder SDK grant scope.
 
 ## The Design Decision
 
@@ -345,6 +345,12 @@ Final tally correctness is therefore over the intents actually aggregated. Compl
 It does not provide privacy. Current vote intent data still exposes the option choice and voting authority information.
 
 It does not give aggregators a protocol reward yet. Permissionless means anyone is authorized, not that anyone is paid. The testnet demo funds operator roles. Creator-funded maintenance budgets, managed operators, Fiber reimbursement, or protocol bounty cells are future work.
+
+It does not prevent conflicting live intents at creation in testnet v1. All choices for one represented voter map to the same shard, so aggregation prevents double counting, but the first valid choice aggregated becomes canonical. A reviewed one-shot represented-principal authority is required before freezing the public SDK voting API.
+
+It does not yet provide the intended real-funds delegation policy. In testnet v1, the delegate funds the intent capacity and the represented delegator receives the exact refund. The planned poll-scoped authority design keeps voting authority, committed capacity, and refund ownership with the represented principal.
+
+It does not provide token- or capacity-weighted voting in the current deployment. New polls are equal-weight only; retained weighted fields exist for codec compatibility and historical-cell recovery.
 
 It does not remove all contention. Same-shard aggregation still serializes on that shard cell. Finalization, merge, and close also have their own lifecycle dependencies.
 
