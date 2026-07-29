@@ -125,7 +125,7 @@ export function PollList({
   return (
     <div>
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex w-full gap-1 overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--surface)] p-1 sm:w-auto">
+        <div className="horizontal-scroll-surface flex w-full gap-1 overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--surface)] p-1 sm:w-auto">
           {tabs.map((tab) => (
             <button
               key={tab.key}

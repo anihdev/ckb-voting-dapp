@@ -398,7 +398,7 @@ export function VoteOnPoll({
       className={`poll-card card-shell overflow-hidden !p-0 ${poll.isClosed ? "opacity-75" : ""
         }`}
     >
-      <div className="poll-card-header px-4 pb-3 pt-5 sm:px-5">
+      <div className="poll-card-header">
         <div className="poll-title-row">
           <div className="poll-question-wrap">
             <div className="poll-question-label">Proposal question</div>
@@ -435,7 +435,7 @@ export function VoteOnPoll({
         </div>
       </div>
 
-      <div className="space-y-2.5 px-4 pb-4 sm:px-5">
+      <div className="poll-card-body space-y-2.5">
         {!poll.isClosed && poll.tokenWeighted && (
           <div className="alert alert-error">
             {UNSUPPORTED_WEIGHTED_POLL_MESSAGE}
@@ -522,7 +522,7 @@ export function VoteOnPoll({
       </div>
 
       {(canVote || canAggregate || canFinalizeShards || canMergeShards || canClose || canForceClose || canRefundClosedIntent || canRefundLateIntent) && (
-        <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:flex-wrap sm:items-center sm:px-5" style={{ borderTop: "1px solid var(--line)" }}>
+        <div className="poll-action-row flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
           {confirmingForceClose ? (
             <div className="w-full">
               <div className="mb-2 text-sm" style={{ color: "var(--ink-2)" }}>
@@ -687,7 +687,7 @@ export function VoteOnPoll({
         </div>
       )}
 
-      <div className="poll-lifecycle-details px-4 py-4 sm:px-5">
+      <div className="poll-lifecycle-details">
         <div className="poll-details-heading">Lifecycle and tally details</div>
         <div className="poll-detail-list">
           <div className="poll-detail-row">

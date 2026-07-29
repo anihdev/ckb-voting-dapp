@@ -59,8 +59,6 @@
 .governance-theme *::after,
 .governance-theme * {
   box-sizing: border-box;
-  margin: 0;
-  padding: 0;
 }
 
 .governance-theme .app-shell {
@@ -209,6 +207,8 @@
 }
 
 .governance-theme .status-metric {
+  min-width: 0;
+  overflow: hidden;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -229,12 +229,14 @@
 }
 
 .governance-theme .metric-value {
+  max-width: 100%;
   font-family: var(--font-display);
   font-size: 28px;
   font-weight: 700;
   color: var(--ink);
   margin-top: 6px;
   letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
 .governance-theme .metric-value.mono {
@@ -248,7 +250,14 @@
 .governance-theme .chain-tip-value {
   font-family: var(--font-mono);
   font-size: 22px;
-  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.governance-theme .status-metric .hint {
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .governance-theme .action-grid {
@@ -499,6 +508,23 @@
   scroll-margin-top: 84px;
 }
 
+.governance-theme .poll-card-header {
+  padding: 20px 22px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.governance-theme .poll-card-body {
+  min-width: 0;
+  padding: 16px 22px 18px;
+}
+
+.governance-theme .poll-action-row {
+  min-width: 0;
+  padding: 14px 22px;
+  border-top: 1px solid var(--line);
+}
+
 .governance-theme .poll-question-wrap {
   flex: 1 1 auto;
   min-width: 0;
@@ -514,13 +540,31 @@
   letter-spacing: 0;
 }
 
+.governance-theme .poll-question-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--teal);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.governance-theme .poll-question-label::before {
+  content: '';
+  width: 16px;
+  height: 2px;
+  flex: 0 0 auto;
+  border-radius: var(--r-full);
+  background: var(--teal);
+}
+
 .governance-theme .poll-question {
-  margin-top: 4px;
+  margin-top: 8px;
   color: var(--ink);
   font-family: var(--font-display);
-  font-size: 19px;
+  font-size: 22px;
   font-weight: 700;
-  line-height: 1.35;
+  line-height: 1.3;
   overflow-wrap: anywhere;
 }
 
@@ -536,6 +580,19 @@
 
 .governance-theme .poll-meta > span {
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.governance-theme .poll-card .alert,
+.governance-theme .poll-card p,
+.governance-theme .poll-card select,
+.governance-theme .poll-card button {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.governance-theme .poll-card .alert,
+.governance-theme .poll-card p {
   overflow-wrap: anywhere;
 }
 
@@ -651,13 +708,17 @@
 }
 
 .governance-theme .poll-lifecycle-details {
+  min-width: 0;
+  padding: 18px 22px 20px;
   border-top: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.012);
 }
 
 .governance-theme .poll-details-heading {
-  margin-bottom: 8px;
+  margin-bottom: 10px;
   color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .governance-theme .poll-detail-list {
@@ -668,11 +729,17 @@
   display: grid;
   grid-template-columns: minmax(112px, 0.22fr) minmax(0, 1fr);
   gap: 14px;
-  padding: 9px 0;
+  min-width: 0;
+  padding: 11px 0;
   border-bottom: 1px solid var(--line);
   color: var(--ink-2);
   font-size: 12px;
   line-height: 1.55;
+}
+
+.governance-theme .poll-detail-row > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .governance-theme .poll-detail-row:last-child {
@@ -708,6 +775,13 @@
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
+}
+
+.governance-theme .horizontal-scroll-surface,
+.governance-theme .table-shell {
+  scrollbar-color: rgba(0, 223, 168, 0.72) rgba(0, 200, 151, 0.08);
+  scrollbar-width: thin;
+  overscroll-behavior-inline: contain;
 }
 
 .governance-theme .table-grid {
@@ -1036,21 +1110,26 @@
 }
 
 .governance-theme ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 
 .governance-theme ::-webkit-scrollbar-track {
-  background: var(--bg);
+  background: rgba(0, 200, 151, 0.07);
+  border-radius: var(--r-full);
 }
 
 .governance-theme ::-webkit-scrollbar-thumb {
-  background: var(--surface-3);
-  border-radius: 3px;
+  background: rgba(0, 223, 168, 0.48);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: var(--r-full);
 }
 
 .governance-theme ::-webkit-scrollbar-thumb:hover {
-  background: var(--ink-3);
+  background: rgba(0, 223, 168, 0.9);
+  background-clip: padding-box;
+  border-width: 1px;
 }
 
 @media (max-width: 900px) {
@@ -1069,6 +1148,7 @@
 
   .governance-theme .stats-row {
     padding: 0 20px 32px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .governance-theme .dashboard-main {
@@ -1086,6 +1166,19 @@
   .governance-theme .protocol-cell {
     border-bottom: 1px solid var(--line);
   }
+
+  .governance-theme .poll-options-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .governance-theme .poll-detail-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+
+  .governance-theme .poll-question {
+    font-size: 20px;
+  }
 }
 
 @media (max-width: 640px) {
@@ -1102,7 +1195,7 @@
   }
 
   .governance-theme .poll-question {
-    font-size: 17px;
+    font-size: 19px;
   }
 
   .governance-theme .poll-meta {
@@ -1223,4 +1316,18 @@
     letter-spacing: 0;
   }
 
+  .governance-theme .poll-card-header,
+  .governance-theme .poll-card-body,
+  .governance-theme .poll-action-row,
+  .governance-theme .poll-lifecycle-details {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+}
+
+@media (max-width: 360px) {
+  .governance-theme .stats-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
