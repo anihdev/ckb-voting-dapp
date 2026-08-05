@@ -5,6 +5,12 @@
  * serialize exactly the same poll, intent, and delegation layouts.
  */
 
+import {
+  MAX_TALLY_AGGREGATION_PROOF_BYTES,
+  TALLY_AGGREGATION_PROOF_VERSION,
+  TALLY_SHARD_CODEC_VERSION,
+} from "./constants.js";
+
 export interface PollData {
   question: string;
   options: string[];
@@ -42,13 +48,19 @@ export interface DelegationData {
 }
 
 export interface TallyShardData {
+  version: number;
   poll_type_hash: Uint8Array;
   shard_id: number;
   shard_count: number;
   vote_counts: bigint[];
   total_voters: bigint;
-  counted_voter_lock_hashes: Uint8Array[];
+  counted_voter_root: Uint8Array;
   finalized: boolean;
+}
+
+export interface TallyAggregationProof {
+  version: number;
+  compiled_proof: Uint8Array;
 }
 
 export interface TallyMergeResultData {
@@ -395,26 +407,37 @@ export function decodeDelegationData(bytes: Uint8Array): DelegationData {
 }
 
 export function encodeTallyShardData(shard: TallyShardData): Uint8Array {
+  // The leading version makes the fixed-root lane layout impossible to
+  // confuse with historical variable-length voter registries.
+  assertCodec(shard.version === TALLY_SHARD_CODEC_VERSION, "unsupported TallyShardData version");
   assertCodec(shard.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+  assertCodec(shard.counted_voter_root.length === 32, "counted_voter_root must be 32 bytes");
   assertCodec(shard.shard_count > 0, "shard_count must be positive");
   assertCodec(shard.shard_count <= 256, "shard_count exceeds protocol maximum");
   assertCodec(shard.shard_id >= 0 && shard.shard_id < shard.shard_count, "shard_id must be inside shard_count");
 
   return concat([
+    new Uint8Array([shard.version]),
     shard.poll_type_hash,
     encodeUint32(shard.shard_id),
     encodeUint32(shard.shard_count),
     encodeUint64Vec(shard.vote_counts),
     encodeUint64(shard.total_voters),
-    encodeBytes32Vec(shard.counted_voter_lock_hashes),
+    shard.counted_voter_root,
     new Uint8Array([shard.finalized ? 1 : 0]),
   ]);
 }
 
 export function decodeTallyShardData(bytes: Uint8Array): TallyShardData {
-  assertCodec(bytes.length >= 53, `TallyShardData too short: ${bytes.length}`);
+  assertCodec(bytes.length >= 86, `TallyShardData too short: ${bytes.length}`);
 
   let offset = 0;
+  const version = bytes[offset];
+  offset += 1;
+  assertCodec(
+    version === TALLY_SHARD_CODEC_VERSION,
+    `unsupported TallyShardData version: ${version}`
+  );
   const poll_type_hash = bytes.slice(offset, offset + 32);
   offset += 32;
   const shard_id = decodeUint32(bytes, offset);
@@ -425,8 +448,8 @@ export function decodeTallyShardData(bytes: Uint8Array): TallyShardData {
   offset = nextCountsOffset;
   const total_voters = decodeUint64(bytes, offset);
   offset += 8;
-  const [counted_voter_lock_hashes, nextRegistryOffset] = decodeBytes32Vec(bytes, offset);
-  offset = nextRegistryOffset;
+  const counted_voter_root = bytes.slice(offset, offset + 32);
+  offset += 32;
   assertCodec(bytes.length > offset, "finalized decode out of bounds");
   const finalized = decodeBool(bytes, offset, "finalized");
   offset += 1;
@@ -436,14 +459,45 @@ export function decodeTallyShardData(bytes: Uint8Array): TallyShardData {
   assertCodec(offset === bytes.length, "TallyShardData has trailing bytes");
 
   return {
+    version,
     poll_type_hash,
     shard_id,
     shard_count,
     vote_counts,
     total_voters,
-    counted_voter_lock_hashes,
+    counted_voter_root,
     finalized,
   };
+}
+
+export function encodeTallyAggregationProof(proof: TallyAggregationProof): Uint8Array {
+  assertCodec(
+    proof.version === TALLY_AGGREGATION_PROOF_VERSION,
+    "unsupported tally aggregation proof version"
+  );
+  assertCodec(proof.compiled_proof.length > 0, "compiled tally proof must not be empty");
+  assertCodec(
+    proof.compiled_proof.length <= MAX_TALLY_AGGREGATION_PROOF_BYTES,
+    "compiled tally proof is too large"
+  );
+  return concat([new Uint8Array([proof.version]), encodeBytes(proof.compiled_proof)]);
+}
+
+export function decodeTallyAggregationProof(bytes: Uint8Array): TallyAggregationProof {
+  assertCodec(bytes.length >= 6, `TallyAggregationProof too short: ${bytes.length}`);
+  const version = bytes[0];
+  assertCodec(
+    version === TALLY_AGGREGATION_PROOF_VERSION,
+    `unsupported tally aggregation proof version: ${version}`
+  );
+  const [compiled_proof, offset] = decodeBytes(bytes, 1);
+  assertCodec(compiled_proof.length > 0, "compiled tally proof must not be empty");
+  assertCodec(
+    compiled_proof.length <= MAX_TALLY_AGGREGATION_PROOF_BYTES,
+    "compiled tally proof is too large"
+  );
+  assertCodec(offset === bytes.length, "TallyAggregationProof has trailing bytes");
+  return { version, compiled_proof };
 }
 
 export function encodeTallyMergeResultData(result: TallyMergeResultData): Uint8Array {

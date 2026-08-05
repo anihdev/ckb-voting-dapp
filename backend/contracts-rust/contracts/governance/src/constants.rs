@@ -23,8 +23,13 @@ pub const MAX_QUESTION_LEN: usize = 256;
 pub const MAX_OPTION_LEN: usize = 64;
 pub const MAX_INTENTS_PER_AGG: usize = 50;
 pub const MAX_TALLY_SHARDS: u32 = 256;
+pub const MAX_SHARDS_PER_FINALIZE: usize = 8;
 pub const MERGE_COVERAGE_BYTES: usize = 32;
 pub const MAX_SHARDS_PER_MERGE: usize = 8;
+pub const TALLY_SHARD_CODEC_VERSION: u8 = 2;
+pub const TALLY_AGGREGATION_PROOF_VERSION: u8 = 1;
+pub const MAX_TALLY_AGGREGATION_PROOF_BYTES: usize = 64 * 1024;
+pub const COUNTED_VOTER_PRESENT_VALUE: [u8; 32] = [1u8; 32];
 // Direct close consumes every finalized shard in one transaction and is only
 // acceptable for small polls. Larger shard sets must use MERGE_TALLY_SHARDS.
 pub const MAX_DIRECT_CLOSE_SHARDS: u32 = 8;

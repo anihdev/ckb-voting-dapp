@@ -5,7 +5,7 @@
  * actions that match the indexed protocol state.
  */
 
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Poll, TxState } from "../lib/types";
 import { TxStatus } from "./TxStatus";
 import { ActionConfirmDialog } from "./ActionConfirmDialog";
@@ -13,21 +13,25 @@ import {
   FORCE_CLOSE_GRACE_EPOCHS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_DIRECT_CLOSE_SHARDS,
+  MAX_SHARDS_PER_FINALIZE,
 } from "../lib/constants";
 import {
+  canDelegateForPoll,
   canFinalizeTallyShardFromUi,
   CREATOR_VOTING_DISABLED_MESSAGE,
+  derivePollOutcome,
   EpochPosition,
   estimatePollCloseHours,
   formatApproxEpochDuration,
   formatApproxWallClockDuration,
   getFinalizeShardConfirmationMessage,
+  getPollTallyProgress,
+  isLeadingOption,
   isPollVotingSupported,
-  tallyMergeCoverageComplete,
   UNSUPPORTED_WEIGHTED_POLL_LABEL,
   UNSUPPORTED_WEIGHTED_POLL_MESSAGE,
 } from "../lib/protocolUi";
-import { isTransactionInFlight } from "../lib/txLifecycle";
+import { areTransactionControlsLocked } from "../lib/txLifecycle";
 
 interface Props {
   anchorId?: string;
@@ -35,14 +39,20 @@ interface Props {
   voterAddress: string | null;
   voterLockHash: string | null;
   txState: TxState;
+  actionInFlight: boolean;
+  /** Optional initial-state override; poll cards are collapsed by default. */
+  defaultExpanded?: boolean;
   onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
   onFinalizeShards: (poll: Poll) => Promise<string>;
+  onFinalizeAllShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
   onRefundClosedIntent: (poll: Poll) => Promise<string>;
   onRefundLateIntent: (poll: Poll) => Promise<string>;
+  /** Prefills the delegation form with this poll's scope; omitted when disconnected. */
+  onDelegateForPoll?: (pollId: string) => void;
   currentEpoch: bigint;
   currentEpochPosition?: EpochPosition;
 }
@@ -98,18 +108,25 @@ export function VoteOnPoll({
   voterAddress,
   voterLockHash,
   txState,
+  actionInFlight,
+  defaultExpanded,
   onVote,
   onAggregate,
   onFinalizeShards,
+  onFinalizeAllShards,
   onMergeShards,
   onClose,
   onForceClose,
   onRefundClosedIntent,
   onRefundLateIntent,
+  onDelegateForPoll,
   currentEpoch,
   currentEpochPosition,
 }: Props) {
+  const cardRef = useRef<HTMLDivElement>(null);
   const [selected, setSelected] = useState<number | null>(null);
+  const [expanded, setExpanded] = useState(defaultExpanded ?? false);
+  const [copiedPollId, setCopiedPollId] = useState(false);
   const [authorityId, setAuthorityId] = useState<string>("self");
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -120,23 +137,36 @@ export function VoteOnPoll({
     Boolean(voterLockHash) &&
     poll.creator.toLowerCase() === (voterLockHash ?? "").toLowerCase();
 
-  const isBusy = submitting || isTransactionInFlight(txState.status);
+  // Status renders only for this card's own transactions, but controls lock
+  // globally: the hook allows one state-changing action at a time, so a foreign
+  // transaction must disable this card's actions even though its status is
+  // hidden here.
+  const ownsTxState = txState.scope?.kind === "poll" && txState.scope.pollId === poll.id;
+  const scopedTxState = ownsTxState ? txState : null;
+  const isBusy = submitting || areTransactionControlsLocked(txState, actionInFlight);
   const votingSupported = isPollVotingSupported(poll);
   const isExpired = currentEpoch > poll.deadline;
+  // Offered only where the hook would accept a new delegation: connected
+  // wallet, poll open before its deadline, and the viewer is not the creator.
+  // Shown on neither a needs-close nor a closed poll, and never while
+  // disconnected, so the button cannot advertise a rejected action.
+  const canDelegate = canDelegateForPoll(poll, voterLockHash, currentEpoch);
   const forceCloseGraceEndEpoch = poll.deadline + FORCE_CLOSE_GRACE_EPOCHS;
   const forceCloseOpen = currentEpoch > forceCloseGraceEndEpoch;
   const indexedShardCount = poll.tallyShards.length;
   const finalizedShardCount = poll.tallyShards.filter((shard) => shard.finalized).length;
   const missingShardCount = poll.shardCount > indexedShardCount ? poll.shardCount - indexedShardCount : 0;
   const mergeResultCount = poll.tallyMergeResults.length;
-  const directCloseTooLarge = poll.shardCount > MAX_DIRECT_CLOSE_SHARDS;
-  const allShardsFinalized = poll.shardCount > 0 && indexedShardCount === poll.shardCount && finalizedShardCount === poll.shardCount;
-  const hasCompleteMergeResult =
-    directCloseTooLarge &&
-    poll.tallyMergeResults.some((result) => tallyMergeCoverageComplete(result.coverage, poll.shardCount));
-  const closeStateReady =
-    (!directCloseTooLarge && allShardsFinalized) ||
-    (directCloseTooLarge && hasCompleteMergeResult);
+  const tallyProgress = getPollTallyProgress(poll);
+  const directCloseTooLarge = tallyProgress.requiresMerge;
+  const allShardsFinalized = tallyProgress.allShardsFinalized;
+  const hasCompleteMergeResult = tallyProgress.hasCompleteMergeResult;
+  const closeStateReady = tallyProgress.closeStateReady;
+  const remainingShardCount = tallyProgress.unfinalizedShardCount;
+  const finalizeTransactionCount = Math.ceil(remainingShardCount / MAX_SHARDS_PER_FINALIZE);
+  const finalizeApprovalLabel = finalizeTransactionCount === 1
+    ? "1 wallet approval"
+    : `${finalizeTransactionCount.toString()} wallet approvals`;
   const tallyCoverageComplete = poll.tallyFrontier.coverageComplete;
   const canDescribeTallyAsFinal = poll.isClosed || closeStateReady;
   const tallyCoverageText =
@@ -187,6 +217,37 @@ export function VoteOnPoll({
     setConfirmingForceClose(false);
   }, [poll.id, poll.pendingIntentCount, poll.totalVotes]);
 
+  useEffect(() => {
+    if (!expanded || pendingConfirmAction) return;
+
+    // Expanded cards behave as disclosures: a pointer action elsewhere folds
+    // this card, while all selections remain intact for a later reopen.
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || cardRef.current?.contains(target)) return;
+      setExpanded(false);
+    };
+
+    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
+    };
+  }, [expanded, pendingConfirmAction]);
+
+  const handleCopyPollId = async () => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(poll.id);
+      } else {
+        throw new Error("Clipboard not available");
+      }
+      setCopiedPollId(true);
+      setTimeout(() => setCopiedPollId(false), 1800);
+    } catch {
+      setCopiedPollId(false);
+    }
+  };
+
   const handleVote = async () => {
     if (selected === null) return;
     setSubmitting(true);
@@ -235,6 +296,18 @@ export function VoteOnPoll({
       await onFinalizeShards(poll);
     } catch (caughtError: any) {
       setLocalError(mapActionErrorToUserMessage(toErrorMessage(caughtError, "Finalize shard failed")));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleFinalizeAllShards = async () => {
+    setSubmitting(true);
+    setLocalError(null);
+    try {
+      await onFinalizeAllShards(poll);
+    } catch (caughtError: any) {
+      setLocalError(mapActionErrorToUserMessage(toErrorMessage(caughtError, "Finalize lanes failed")));
     } finally {
       setSubmitting(false);
     }
@@ -351,6 +424,18 @@ export function VoteOnPoll({
     hasWallet &&
     !poll.isClosed &&
     poll.lateIntentCount > 0;
+  const shortcutVotingAuthority = poll.authorityOptions.find(
+    (authority) =>
+      !authority.hasIntent &&
+      authority.voterLockHash.toLowerCase() !== poll.creator.toLowerCase()
+  );
+  const canOpenVotingDetails =
+    hasWallet &&
+    votingSupported &&
+    !isCreator &&
+    !poll.isClosed &&
+    !isExpired &&
+    Boolean(shortcutVotingAuthority);
   const optionIsActionable = canVote && !isBusy;
   const voteUnavailableMessage = isCreator
     ? CREATOR_VOTING_DISABLED_MESSAGE
@@ -392,8 +477,46 @@ export function VoteOnPoll({
           : "This delegate can create an intent for the delegator using the live delegation cell as a read-only cell dep. In testnet v1, the delegate funds the intent capacity and the exact refund returns to the delegator."
       : "No voting authority is available for this poll.";
 
+  // Derived from raw counts rather than stored on the poll, so the card cannot
+  // present an outcome the tally does not support. The contract defines no
+  // winner or tie-break, so a tie is reported as a tie.
+  const outcome = useMemo(() => derivePollOutcome(poll.voteCounts), [poll.voteCounts]);
+  const outcomeLabel =
+    outcome.kind === "tie" ? "Tied finalized tally" : "Finalized tally leader";
+  const outcomeOptions =
+    outcome.kind === "leader"
+      ? [poll.options[outcome.optionIndex] ?? `Option ${(outcome.optionIndex + 1).toString()}`]
+      : outcome.kind === "tie"
+        ? outcome.optionIndices.map(
+            (index) => poll.options[index] ?? `Option ${(index + 1).toString()}`
+          )
+        : [];
+  const outcomeVotes =
+    outcome.kind === "leader"
+      ? outcome.votes
+      : outcome.kind === "tie"
+        ? outcome.votesEach
+        : 0n;
+  const pollDetailsId = `${anchorId ?? poll.id}-details`;
+
+  const openVotingDetails = () => {
+    if (!shortcutVotingAuthority) return;
+    setAuthorityId(shortcutVotingAuthority.id);
+    setExpanded(true);
+
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => {
+        document.getElementById(pollDetailsId)?.scrollIntoView({
+          behavior: "smooth",
+          block: "nearest",
+        });
+      });
+    }
+  };
+
   return (
     <div
+      ref={cardRef}
       id={anchorId}
       className={`poll-card card-shell overflow-hidden !p-0 ${poll.isClosed ? "opacity-75" : ""
         }`}
@@ -404,7 +527,7 @@ export function VoteOnPoll({
             <div className="poll-question-label">Proposal question</div>
             <h3 className="poll-question">{poll.question}</h3>
           </div>
-          <div className="flex-shrink-0">
+          <div className="poll-title-actions flex flex-shrink-0 items-center gap-2">
             {poll.isClosed ? (
               <span className="status-pill status-closed">
                 Closed
@@ -418,6 +541,15 @@ export function VoteOnPoll({
                 Active
               </span>
             )}
+            <button
+              type="button"
+              onClick={() => setExpanded((open) => !open)}
+              aria-expanded={expanded}
+              aria-controls={pollDetailsId}
+              className="btn-quiet px-3 py-1.5 text-xs uppercase"
+            >
+              {expanded ? "Hide details" : "View details"}
+            </button>
           </div>
         </div>
 
@@ -433,8 +565,62 @@ export function VoteOnPoll({
           <span>Deadline: epoch {poll.deadline.toString()}</span>
           <span className="font-mono" style={{ color: "var(--ink-3)" }}>{poll.id.slice(0, 10)}...</span>
         </div>
+
+        <div className="poll-quick-actions">
+          <button
+            type="button"
+            onClick={() => {
+              void handleCopyPollId();
+            }}
+            className="btn-quiet px-3 py-1.5 text-xs"
+          >
+            {copiedPollId ? "Poll ID copied" : "Copy Poll ID"}
+          </button>
+          {onDelegateForPoll && canDelegate && (
+            <button
+              type="button"
+              onClick={() => onDelegateForPoll(poll.id)}
+              className="btn-quiet px-3 py-1.5 text-xs"
+            >
+              Delegate for this poll
+            </button>
+          )}
+          {canOpenVotingDetails && (
+            <button
+              type="button"
+              onClick={openVotingDetails}
+              aria-expanded={expanded}
+              aria-controls={pollDetailsId}
+              className="btn-primary px-3 py-1.5 text-xs"
+            >
+              Vote now
+            </button>
+          )}
+        </div>
+
+        {poll.isClosed && (
+          <div className="poll-result-summary" aria-label="Final result">
+            {outcome.kind === "no-votes" ? (
+              <span className="poll-result-empty">
+                No counted votes.
+              </span>
+            ) : (
+              <>
+                <span className="poll-result-label">{outcomeLabel}</span>
+                <span className="poll-result-value">{outcomeOptions.join(" / ")}</span>
+                <span className="poll-result-votes">
+                  {outcome.kind === "tie"
+                    ? `${outcomeVotes.toString()} votes each of ${poll.totalVotes.toString()} counted`
+                    : `${outcomeVotes.toString()} of ${poll.totalVotes.toString()} counted votes`}
+                </span>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
+      {expanded && (
+      <div id={pollDetailsId}>
       <div className="poll-card-body space-y-2.5">
         {!poll.isClosed && poll.tokenWeighted && (
           <div className="alert alert-error">
@@ -479,7 +665,7 @@ export function VoteOnPoll({
           {poll.options.map((option, index) => {
             const votes = poll.voteCounts[index] ?? 0n;
             const percentage = poll.totalVotes > 0n ? Number((votes * 100n) / poll.totalVotes) : 0;
-            const isWinner = poll.isClosed && poll.winnerIndex === index;
+            const isLeading = poll.isClosed && isLeadingOption(outcome, index);
             const isSelected = selected === index;
 
             return (
@@ -493,7 +679,7 @@ export function VoteOnPoll({
                 title={optionIsActionable ? "Select this option to submit vote intent" : voteUnavailableMessage}
               >
                 <div
-                  className={`poll-option-bar ${isWinner ? "winner" : ""}`}
+                  className={`poll-option-bar ${isLeading ? "winner" : ""}`}
                   style={{ width: `${percentage}%` }}
                 />
                 <div className="poll-option-content">
@@ -501,7 +687,11 @@ export function VoteOnPoll({
                     {canVote && (
                       <div className="poll-option-radio" />
                     )}
-                    {isWinner && <span className="text-xs font-semibold uppercase" style={{ color: "#34d399" }}>Winner</span>}
+                    {isLeading && (
+                      <span className="text-xs font-semibold uppercase" style={{ color: "#34d399" }}>
+                        {outcome.kind === "tie" ? "Tied lead" : "Leader"}
+                      </span>
+                    )}
                     <span className="poll-option-label-text">{option}</span>
                   </div>
                   <div className="poll-option-tally">
@@ -588,20 +778,39 @@ export function VoteOnPoll({
                 </button>
               )}
 
-              {canFinalizeShards && (
+              {/* Flow: one remaining lane uses the single-lane builder; larger
+                  sets use explicitly signed batches of at most eight lanes. */}
+              {canFinalizeShards && remainingShardCount === 1 && (
                 <button
                   onClick={() => {
                     requestConfirmation({
                       title: "Confirm Shard Finalization",
                       message: getFinalizeShardConfirmationMessage(poll),
-                      confirmLabel: "Finalize Next Shard",
+                      confirmLabel: "Finalize Last Lane",
                       execute: handleFinalizeShards,
                     });
                   }}
                   disabled={isBusy}
                   className="btn-quiet w-full sm:w-auto"
                 >
-                  Finalize Next Shard
+                  Finalize Last Lane
+                </button>
+              )}
+
+              {canFinalizeShards && remainingShardCount > 1 && (
+                <button
+                  onClick={() => {
+                    requestConfirmation({
+                      title: `Finalize ${remainingShardCount.toString()} Remaining Lanes`,
+                      message: `${getFinalizeShardConfirmationMessage(poll)}\n\nThe contract finalizes up to ${MAX_SHARDS_PER_FINALIZE.toString()} ordered lanes in one transaction. This poll needs ${finalizeApprovalLabel}. You approve each batch separately; if a later batch fails, earlier lanes stay finalized and you can rerun to continue.`,
+                      confirmLabel: `Finalize ${remainingShardCount.toString()} Lanes`,
+                      execute: handleFinalizeAllShards,
+                    });
+                  }}
+                  disabled={isBusy}
+                  className="btn-primary w-full sm:w-auto"
+                >
+                  Finalize {remainingShardCount.toString()} Remaining Lanes
                 </button>
               )}
 
@@ -736,9 +945,18 @@ export function VoteOnPoll({
             <div className="poll-detail-row">
               <div className="poll-detail-label">Tally lanes</div>
               <div>
-                Indexed: {indexedShardCount.toString()}/{poll.shardCount.toString()}; finalized: {finalizedShardCount.toString()}/{poll.shardCount.toString()}.
-                {missingShardCount > 0 ? ` Missing lanes: ${missingShardCount.toString()}.` : ""}
-                {mergeResultCount > 0 ? ` Merge results indexed: ${mergeResultCount.toString()}.` : ""}
+                {poll.isClosed ? (
+                  <>
+                    Closed over {poll.shardCount.toString()} lanes. The close transaction consumed the
+                    lane cells, so none remain indexed.
+                  </>
+                ) : (
+                  <>
+                    Indexed: {indexedShardCount.toString()}/{poll.shardCount.toString()}; finalized: {finalizedShardCount.toString()}/{poll.shardCount.toString()}.
+                    {missingShardCount > 0 ? ` Missing lanes: ${missingShardCount.toString()}.` : ""}
+                    {mergeResultCount > 0 ? ` Merge results indexed: ${mergeResultCount.toString()}.` : ""}
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -822,10 +1040,18 @@ export function VoteOnPoll({
           )}
         </div>
       </div>
+      </div>
+      )}
 
-      {txState.status !== "idle" && (
+      {scopedTxState && scopedTxState.status !== "idle" && (
         <div className="px-4 pb-4 sm:px-5">
-          <TxStatus txState={txState} />
+          {scopedTxState.batch && (
+            <div className="mb-2 text-xs subtle">
+              {scopedTxState.batch.label}: {scopedTxState.batch.completed.toString()} of{" "}
+              {scopedTxState.batch.total.toString()} lanes confirmed. Each batch of up to {MAX_SHARDS_PER_FINALIZE.toString()} lanes is signed once.
+            </div>
+          )}
+          <TxStatus txState={scopedTxState} />
         </div>
       )}
 

@@ -7,13 +7,14 @@
     "pnpm": ">=10.0.0"
   },
   "scripts": {
-    "build": "pnpm build:contract:rust && pnpm build:frontend",
-    "build:contract:rust": "cd backend/contracts-rust && cargo build --release --locked -p governance-contract",
+    "build": "pnpm build:tally-smt-wasm && pnpm build:contract:rust && pnpm build:frontend",
+    "build:contract:rust": "cd backend/contracts-rust && CLANG=clang cargo build --release --locked -p governance-contract",
+    "build:tally-smt-wasm": "scripts/build-tally-smt-wasm.sh",
     "build:frontend": "pnpm --filter ckb-voting-frontend build",
     "test": "pnpm test:frontend",
-    "test:contract:vm": "pnpm build:contract:rust && cargo +stable test --locked --manifest-path backend/contracts-rust/Cargo.toml -p integration-tests",
+    "test:contract:vm": "pnpm build:contract:rust && cargo +${HOST_RUST_TOOLCHAIN:-1.95.0} test --locked --manifest-path backend/contracts-rust/Cargo.toml -p integration-tests",
     "test:frontend": "pnpm --filter ckb-voting-frontend test",
-    "check:contract:rust": "cd backend/contracts-rust && cargo check --locked -p governance-contract",
+    "check:contract:rust": "cd backend/contracts-rust && CLANG=clang cargo check --locked -p governance-contract",
     "dev:frontend": "pnpm --filter ckb-voting-frontend dev",
     "deploy:contract": "pnpm build:contract:rust && pnpm --filter ckb-voting-deploy run deploy",
     "deploy:vercel": "pnpm exec vercel deploy",

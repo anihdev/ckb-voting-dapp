@@ -4,6 +4,13 @@ This note explains why I moved the voting protocol from poll-cell aggregation to
 
 It is written as a design explanation for reviewers, contributors, and future implementation sessions. It is not a new protocol spec. For the full current protocol spec, see `README.md` and the contract code.
 
+The current worktree uses a v2 fixed-root tally-lane codec. Each lane stores a
+constant-size sparse-Merkle root that records represented voters already counted,
+instead of growing one 32-byte hash per voter. That binary is deployed on CKB
+testnet under code hash
+`0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`.
+The complete multi-actor lifecycle rehearsal remains pending.
+
 ## Where The Problem Started
 
 The earlier voting flow used one poll cell as the live tally state.
@@ -81,12 +88,12 @@ PollCell
 TallyShardCell 0
   vote_counts for shard 0
   total_voters for shard 0
-  counted voters for shard 0
+  fixed root committing counted voters for shard 0
 
 TallyShardCell 1
   vote_counts for shard 1
   total_voters for shard 1
-  counted voters for shard 1
+  fixed root committing counted voters for shard 1
 
 ...
 ```
@@ -109,7 +116,10 @@ Poll tally
   -> ...
 ```
 
-Each shard stores only the voters and vote counts assigned to that bucket. So a shard is just an independent tally lane for one poll.
+Each shard stores the vote counts assigned to that bucket plus one fixed
+32-byte sparse-Merkle root committing its counted represented-voter keys. So a
+shard is an independent tally lane for one poll without a growing voter list in
+cell data.
 
 I chose the term because it matches the engineering purpose: split one hot aggregation state into several smaller state cells. It should not be presented to normal voters as a complicated concept. In the UI, it is better to say "aggregation lane", "tally lane", or simply hide the detail unless the user is looking at protocol status.
 
@@ -181,13 +191,16 @@ CREATE_TALLY_SHARD aggregation
   -> each intent input proves its creation epoch through Source::Input
   -> intent must have been created at or before the deadline
   -> aggregator updates only that shard cell
+  -> a compiled sparse-Merkle proof verifies selected voters were absent under
+     the old lane root and present under the new root
   -> consumed pending intents become aggregated marker cells
   -> poll cell is not consumed
   -> timely intents can aggregate after the deadline until shard finalization
 
 CREATE_TALLY_SHARD finalization
-  -> shard input carries absolute epoch since strictly after deadline
-  -> finalization freezes that shard tally
+  -> consumes 1..8 ordered same-poll lanes per transaction
+  -> every lane input carries absolute epoch since strictly after deadline
+  -> finalization freezes those lane tallies without changing roots or counts
 
 Small poll close
   -> if shard_count <= MAX_DIRECT_CLOSE_SHARDS
@@ -218,7 +231,8 @@ Local implementation references:
 - Merge validator: `backend/contracts-rust/contracts/governance/src/entry.rs` (`validate_merge_tally_shards`)
 - Close validator: `backend/contracts-rust/contracts/governance/src/entry.rs` (`validate_close_poll`)
 - Frontend aggregation builder: `frontend/src/lib/ckb.ts` (`buildAggregateTallyShardTx`)
-- Frontend finalization builder: `frontend/src/lib/ckb.ts` (`buildFinalizeTallyShardTx`)
+- Frontend finalization builders: `frontend/src/lib/ckb.ts`
+  (`buildFinalizeTallyShardTx`, `buildFinalizeTallyShardsTx`)
 - Frontend merge builder: `frontend/src/lib/ckb.ts` (`buildMergeTallyShardsTx`)
 - Frontend close builders: `frontend/src/lib/ckb.ts` (`buildClosePollTx`, `buildForceCloseTx`)
 - Tally display frontier: `frontend/src/lib/protocolUi.ts` (`computeCanonicalTallyFrontier`)
@@ -270,6 +284,8 @@ The contract checks:
 - each intent maps to that shard
 - option index is valid
 - voter has not already been counted in that shard
+- the versioned compiled proof verifies every selected key is absent under the
+  input root and present under the output root
 - intent capacity is preserved in the marker
 - shard capacity is preserved
 
@@ -389,6 +405,7 @@ Official CKB resources:
 Repository documents:
 
 - [README.md](README.md)
+- [Nervos sparse-merkle-tree](https://github.com/nervosnetwork/sparse-merkle-tree)
 
 Timing references:
 

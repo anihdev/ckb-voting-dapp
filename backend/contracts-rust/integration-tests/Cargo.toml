@@ -11,3 +11,4 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 ckb-testtool = "1.1"
+sparse-merkle-tree = { workspace = true, features = ["std"] }

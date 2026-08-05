@@ -47,7 +47,6 @@ export interface Poll {
   tallyMergeResults: TallyMergeResult[];
   tallyFrontier: TallyFrontierMetadata;
   totalVotes: bigint;
-  winnerIndex: number | null;
   authorityOptions: VoteAuthorityOption[];
   outstandingIntentCount: number;
   lateIntentCount: number;
@@ -76,6 +75,7 @@ export interface TallyShard {
   shardCount: number;
   voteCounts: bigint[];
   totalVoters: bigint;
+  countedVoterRoot: string;
   finalized: boolean;
   capacity: bigint;
 }
@@ -103,6 +103,21 @@ export interface VoteAuthorityOption {
   hasAggregatedIntent: boolean;
 }
 
+/**
+ * Presentation-only reading of a finalized tally.
+ *
+ * The governance contract defines no winner, quorum, pass/fail policy, or
+ * tie-break, so this is deliberately not called a protocol result. It reports
+ * the leader among counted finalized votes and reports ties as ties instead of
+ * collapsing them into a single index. Derived from raw vote counts by
+ * `derivePollOutcome`, never stored on `Poll`, so no caller can assert an
+ * outcome the counts do not support.
+ */
+export type PollOutcome =
+  | { kind: "no-votes" }
+  | { kind: "leader"; optionIndex: number; votes: bigint }
+  | { kind: "tie"; optionIndices: number[]; votesEach: bigint };
+
 export interface DelegationRecord {
   id: string;
   outPoint: CellRef;
@@ -116,7 +131,7 @@ export interface DelegationRecord {
 
 export interface DelegateParams {
   delegateLockHash: string;
-  pollId?: string;
+  pollId: string;
 }
 
 export type TxStatus =
@@ -129,10 +144,28 @@ export type TxStatus =
   | "success"
   | "error";
 
+/**
+ * Identifies which UI surface started the tracked transaction so a poll card,
+ * the delegation panel, and the poll builder never render each other's status.
+ */
+export type TxScope =
+  | { kind: "poll"; pollId: string }
+  | { kind: "delegation" }
+  | { kind: "createPoll" };
+
 export interface TxState {
   status: TxStatus;
   txHash: string | null;
   error: string | null;
+  scope: TxScope | null;
+  /** Progress for multi-transaction runs such as finalizing every tally lane. */
+  batch: TxBatchProgress | null;
+}
+
+export interface TxBatchProgress {
+  label: string;
+  completed: number;
+  total: number;
 }
 
 export interface SeedPollConfig {

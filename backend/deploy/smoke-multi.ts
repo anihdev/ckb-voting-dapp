@@ -14,6 +14,7 @@
 
 import { randomBytes } from "crypto";
 import { ccc } from "@ckb-ccc/core";
+import { encodeTallyAggregationProof } from "../../frontend/src/lib/molecule";
 import {
   RPC_URL,
   assertHex32,
@@ -21,6 +22,7 @@ import {
   requireGovernanceHashes,
 } from "./config";
 import { epochNumber, epochParts } from "./epoch";
+import { buildNodeTallySmtTransition } from "./tally-smt";
 
 const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
 const SCRIPT_HASH_TYPE = "data1";
@@ -56,12 +58,13 @@ type PollData = {
 };
 
 type TallyShardData = {
+  version: number;
   poll_type_hash: Uint8Array;
   shard_id: number;
   shard_count: number;
   vote_counts: bigint[];
   total_voters: bigint;
-  counted_voter_lock_hashes: Uint8Array[];
+  counted_voter_root: Uint8Array;
   finalized: boolean;
 };
 
@@ -251,16 +254,19 @@ function encodePollData(poll: PollData): Uint8Array {
 }
 
 function encodeTallyShardData(shard: TallyShardData): Uint8Array {
+  assertCodec(shard.version === 2, "unsupported tally shard version");
   assertCodec(shard.poll_type_hash.length === 32, "poll_type_hash must be 32 bytes");
+  assertCodec(shard.counted_voter_root.length === 32, "counted_voter_root must be 32 bytes");
   assertCodec(shard.shard_count > 0 && shard.shard_count <= 256, "shard_count out of range");
   assertCodec(shard.shard_id >= 0 && shard.shard_id < shard.shard_count, "shard_id out of range");
   return concat([
+    new Uint8Array([shard.version]),
     shard.poll_type_hash,
     encodeUint32(shard.shard_id),
     encodeUint32(shard.shard_count),
     encodeUint64Vec(shard.vote_counts),
     encodeUint64(shard.total_voters),
-    encodeBytes32Vec(shard.counted_voter_lock_hashes),
+    shard.counted_voter_root,
     new Uint8Array([shard.finalized ? 1 : 0]),
   ]);
 }
@@ -838,12 +844,13 @@ async function main(): Promise<void> {
   const shardOutputs = Array.from({ length: shardCount }, (_, shardId) => {
     const shardScript = tallyShardScript(pollTypeHash, shardId);
     const shardData = encodeTallyShardData({
+      version: 2,
       poll_type_hash: hexToBytes(pollTypeHash),
       shard_id: shardId,
       shard_count: shardCount,
       vote_counts: pollData.options.map(() => 0n),
       total_voters: 0n,
-      counted_voter_lock_hashes: [],
+      counted_voter_root: new Uint8Array(32),
       finalized: false,
     });
     const capacity = [
@@ -975,13 +982,21 @@ async function main(): Promise<void> {
       const countedVoters = voterIntentCells.map((cell) =>
         decodeVoteIntentData(hexToBytes(cell.outputData)).voter_lock_hash
       );
+      // Flow: prove every represented voter absent from the empty lane, then
+      // commit the exact same set as present in the updated fixed-size root.
+      const transition = buildNodeTallySmtTransition({
+        expectedBeforeRoot: new Uint8Array(32),
+        existingVoterKeys: [],
+        pendingVoterKeys: countedVoters,
+      });
       const updatedShardBytes = encodeTallyShardData({
+        version: 2,
         poll_type_hash: hexToBytes(pollTypeHash),
         shard_id: 0,
         shard_count: shardCount,
         vote_counts: expectedVoteCounts,
         total_voters: BigInt(voterIntentCells.length),
-        counted_voter_lock_hashes: countedVoters,
+        counted_voter_root: transition.afterRoot,
         finalized: false,
       });
       const aggregateOutputsData = voterIntentCells.map((intentCell) => {
@@ -1033,7 +1048,15 @@ async function main(): Promise<void> {
           })),
         ],
         outputsData: [bytesToHex(updatedShardBytes), ...aggregateOutputsData],
-        witnesses: Array.from({ length: voterIntentCells.length + 2 }).map(() => "0x"),
+        witnesses: [
+          (ccc as any).WitnessArgs.from({
+            inputType: encodeTallyAggregationProof({
+              version: 1,
+              compiled_proof: transition.compiledProof,
+            }),
+          }).toBytes(),
+          ...Array.from({ length: voterIntentCells.length + 1 }).map(() => "0x"),
+        ],
       });
 
       await aggregateTx.completeFeeBy(aggregatorSigner, TX_FEE_SHANNONS);

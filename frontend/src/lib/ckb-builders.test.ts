@@ -16,6 +16,7 @@ import {
   buildCreateVoteIntentTx,
   buildDelegateTx,
   buildFinalizeTallyShardTx,
+  buildFinalizeTallyShardsTx,
   buildForceCloseTx,
   buildGovernanceTypeScript,
   buildIntentLockScript,
@@ -40,6 +41,14 @@ import {
   TALLY_SHARD_MIN_SHANNONS,
   VOTER_DEPOSIT_SHANNONS,
 } from "./constants";
+
+vi.mock("./tallySmt", () => ({
+  buildTallySmtTransition: vi.fn(async ({ expectedBeforeRoot }: any) => ({
+    beforeRoot: expectedBeforeRoot,
+    afterRoot: new Uint8Array(32).fill(0x7a),
+    compiledProof: new Uint8Array([0x4c, 0x01]),
+  })),
+}));
 
 const DEADLINE = 100n;
 const ORIGIN_HASH = `0x${"ef".repeat(32)}`;
@@ -110,12 +119,13 @@ function fixture(tokenWeighted = false) {
   );
 
   const shardData = (finalized: boolean) => encodeTallyShardData({
+    version: 2,
     poll_type_hash: ccc.bytesFrom(pollTypeHash),
     shard_id: 0,
     shard_count: 1,
     vote_counts: [0n, 0n],
     total_voters: 0n,
-    counted_voter_lock_hashes: [],
+    counted_voter_root: new Uint8Array(32),
     finalized,
   });
   const shardCell = (finalized: boolean) => liveCell(
@@ -265,6 +275,24 @@ describe("timing-sensitive CCC builders", () => {
     })).rejects.toThrow("Delegator and delegate must be different wallets");
   });
 
+  test("delegation builder rejects missing, malformed, and zero poll scopes", async () => {
+    const built = fixture();
+    const delegateLockHash = txHash(0x77);
+
+    await expect(buildDelegateTx(built.signer, {
+      delegateLockHash,
+      pollTypeHash: "",
+    })).rejects.toThrow("32-byte type hash");
+    await expect(buildDelegateTx(built.signer, {
+      delegateLockHash,
+      pollTypeHash: "0x1234",
+    })).rejects.toThrow("32-byte type hash");
+    await expect(buildDelegateTx(built.signer, {
+      delegateLockHash,
+      pollTypeHash: `0x${"00".repeat(32)}`,
+    })).rejects.toThrow("global delegations are disabled");
+  });
+
   test("poll builder rejects weighted creation requests", async () => {
     await expect(buildCreatePollTx(null, {
       question: "Unsupported weighted poll",
@@ -379,6 +407,88 @@ describe("timing-sensitive CCC builders", () => {
       `${txHash(0x33)}:0`,
     ]);
     expect(BigInt(forceTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 11n));
+  });
+
+  test("batch finalization sorts lanes and pins one since-bearing protocol prefix", async () => {
+    const built = fixture();
+    const poll = decodePollData(ccc.bytesFrom(built.pollCell.outputData));
+    built.pollCell.outputData = ccc.hexFrom(encodePollData({ ...poll, shard_count: 2 }));
+
+    const lane = (shardId: number, byte: number) => {
+      const script = buildTallyShardTypeScript(built.pollTypeHash, shardId);
+      const data = encodeTallyShardData({
+        version: 2,
+        poll_type_hash: ccc.bytesFrom(built.pollTypeHash),
+        shard_id: shardId,
+        shard_count: 2,
+        vote_counts: [0n, 0n],
+        total_voters: 0n,
+        counted_voter_root: new Uint8Array(32),
+        finalized: false,
+      });
+      return liveCell(byte, script, script, TALLY_SHARD_MIN_SHANNONS, ccc.hexFrom(data));
+    };
+
+    const tx = await buildFinalizeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: [lane(1, 0x36), lane(0, 0x35)],
+    });
+
+    expect(tx.inputs.slice(0, 2).map(outPointKey)).toEqual([
+      `${txHash(0x35)}:0`,
+      `${txHash(0x36)}:0`,
+    ]);
+    expect(tx.inputs.slice(0, 2).map((input: any) => BigInt(input.since))).toEqual([
+      absoluteEpochSince(DEADLINE + 1n),
+      absoluteEpochSince(DEADLINE + 1n),
+    ]);
+    expect(tx.outputsData.slice(0, 2).map((data: string) =>
+      decodeTallyShardData(ccc.bytesFrom(data)).finalized
+    )).toEqual([true, true]);
+  });
+
+  test("batch finalization rejects more than eight lane cells", async () => {
+    const built = fixture();
+    await expect(buildFinalizeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: Array.from({ length: 9 }, () => ({})),
+    })).rejects.toThrow("at most 8 lanes");
+  });
+
+  test("batch finalization rejects fee completion that tampers with a later lane since", async () => {
+    vi.mocked(ccc.Transaction.prototype.completeFeeBy).mockImplementationOnce(
+      async function () {
+        this.inputs[1].since = 0n;
+        return [0, false];
+      }
+    );
+    const built = fixture();
+    const poll = decodePollData(ccc.bytesFrom(built.pollCell.outputData));
+    built.pollCell.outputData = ccc.hexFrom(encodePollData({ ...poll, shard_count: 2 }));
+    const lanes = [0, 1].map((shardId, index) => {
+      const script = buildTallyShardTypeScript(built.pollTypeHash, shardId);
+      return liveCell(
+        0x38 + index,
+        script,
+        script,
+        TALLY_SHARD_MIN_SHANNONS,
+        ccc.hexFrom(encodeTallyShardData({
+          version: 2,
+          poll_type_hash: ccc.bytesFrom(built.pollTypeHash),
+          shard_id: shardId,
+          shard_count: 2,
+          vote_counts: [0n, 0n],
+          total_voters: 0n,
+          counted_voter_root: new Uint8Array(32),
+          finalized: false,
+        }))
+      );
+    });
+
+    await expect(buildFinalizeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: lanes,
+    })).rejects.toThrow("protocol input since changed");
   });
 
   test("large close builders reject stale shard arguments before merge-result close", async () => {

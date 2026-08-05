@@ -938,6 +938,7 @@ version = "0.1.0"
 dependencies = [
  "ckb-hash 0.119.0",
  "ckb-std",
+ "sparse-merkle-tree",
 ]
 
 [[package]]
@@ -1038,6 +1039,7 @@ name = "integration-tests"
 version = "0.1.0"
 dependencies = [
  "ckb-testtool",
+ "sparse-merkle-tree",
 ]
 
 [[package]]
@@ -1711,6 +1713,16 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "sparse-merkle-tree"
+version = "0.6.2"
+source = "git+https://github.com/nervosnetwork/sparse-merkle-tree?rev=725cd69d95e3e34cd302e83d86178e959fc53687#725cd69d95e3e34cd302e83d86178e959fc53687"
+dependencies = [
+ "blake2b-ref",
+ "cc",
+ "cfg-if",
+]
 
 [[package]]
 name = "ssri"

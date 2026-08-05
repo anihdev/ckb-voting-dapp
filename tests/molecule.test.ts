@@ -13,7 +13,9 @@ import {
   encodeDelegationData,
   encodePollData,
   decodeTallyMergeResultData,
+  decodeTallyAggregationProof,
   decodeTallyShardData,
+  encodeTallyAggregationProof,
   encodeTallyMergeResultData,
   encodeTallyShardData,
   encodeVoteIntentData,
@@ -81,15 +83,13 @@ function makeDelegation(overrides: Partial<DelegationData> = {}): DelegationData
 
 function makeShard(overrides: Partial<TallyShardData> = {}): TallyShardData {
   return {
+    version: 2,
     poll_type_hash: new Uint8Array(32).fill(0xa1),
     shard_id: 2,
     shard_count: 8,
     vote_counts: [3n, 0n, 7n],
     total_voters: 10n,
-    counted_voter_lock_hashes: [
-      new Uint8Array(32).fill(0x61),
-      new Uint8Array(32).fill(0x62),
-    ],
+    counted_voter_root: new Uint8Array(32).fill(0x61),
     finalized: false,
     ...overrides,
   };
@@ -229,21 +229,25 @@ describe("tally shard codec", () => {
     expect(decodeTallyShardData(encoded)).toEqual(shard);
   });
 
-  test("uses the proposed field order", () => {
+  test("uses the versioned fixed-root field order", () => {
     const shard = makeShard({
       shard_id: 5,
       shard_count: 16,
       vote_counts: [1n, 2n],
       total_voters: 3n,
-      counted_voter_lock_hashes: [],
+      counted_voter_root: new Uint8Array(32).fill(0x7a),
       finalized: true,
     });
     const encoded = encodeTallyShardData(shard);
 
-    expect(Array.from(encoded.slice(0, 32))).toEqual(Array.from(shard.poll_type_hash));
-    expect(Array.from(encoded.slice(32, 36))).toEqual([5, 0, 0, 0]);
-    expect(Array.from(encoded.slice(36, 40))).toEqual([16, 0, 0, 0]);
-    expect(Array.from(encoded.slice(40, 44))).toEqual([2, 0, 0, 0]);
+    expect(encoded[0]).toBe(2);
+    expect(Array.from(encoded.slice(1, 33))).toEqual(Array.from(shard.poll_type_hash));
+    expect(Array.from(encoded.slice(33, 37))).toEqual([5, 0, 0, 0]);
+    expect(Array.from(encoded.slice(37, 41))).toEqual([16, 0, 0, 0]);
+    expect(Array.from(encoded.slice(41, 45))).toEqual([2, 0, 0, 0]);
+    expect(Array.from(encoded.slice(encoded.length - 33, encoded.length - 1))).toEqual(
+      Array.from(shard.counted_voter_root)
+    );
     expect(encoded.at(-1)).toBe(1);
   });
 
@@ -252,10 +256,10 @@ describe("tally shard codec", () => {
     expect(() => encodeTallyShardData(makeShard({ shard_count: 257 }))).toThrow("shard_count");
 
     const encoded = encodeTallyShardData(makeShard({ shard_id: 0, shard_count: 1 }));
-    encoded[36] = 0;
     encoded[37] = 0;
     encoded[38] = 0;
     encoded[39] = 0;
+    encoded[40] = 0;
     expect(() => decodeTallyShardData(encoded)).toThrow("shard_count");
   });
 
@@ -263,7 +267,7 @@ describe("tally shard codec", () => {
     expect(() => encodeTallyShardData(makeShard({ shard_id: 8, shard_count: 8 }))).toThrow("shard_id");
 
     const encoded = encodeTallyShardData(makeShard({ shard_id: 0, shard_count: 8 }));
-    encoded[32] = 8;
+    encoded[33] = 8;
     expect(() => decodeTallyShardData(encoded)).toThrow("shard_id");
   });
 
@@ -274,6 +278,17 @@ describe("tally shard codec", () => {
     expect(() => decodeTallyShardData(encoded)).toThrow("finalized");
   });
 
+  test("rejects an unknown layout version and malformed root", () => {
+    expect(() => encodeTallyShardData(makeShard({ version: 1 }))).toThrow("version");
+    expect(() =>
+      encodeTallyShardData(makeShard({ counted_voter_root: new Uint8Array(31) }))
+    ).toThrow("counted_voter_root");
+
+    const encoded = encodeTallyShardData(makeShard());
+    encoded[0] = 3;
+    expect(() => decodeTallyShardData(encoded)).toThrow("version");
+  });
+
   test("rejects trailing bytes", () => {
     const encoded = encodeTallyShardData(makeShard());
     const withTrailing = new Uint8Array(encoded.length + 1);
@@ -281,6 +296,32 @@ describe("tally shard codec", () => {
     withTrailing[withTrailing.length - 1] = 0xff;
 
     expect(() => decodeTallyShardData(withTrailing)).toThrow("trailing");
+  });
+});
+
+describe("tally aggregation proof codec", () => {
+  test("round-trips a versioned compiled sparse-Merkle proof", () => {
+    const proof = { version: 1, compiled_proof: new Uint8Array([0x4c, 0x4f, 0x50]) };
+    expect(decodeTallyAggregationProof(encodeTallyAggregationProof(proof))).toEqual(proof);
+  });
+
+  test("rejects empty, unknown-version, truncated, and trailing proof bytes", () => {
+    expect(() => encodeTallyAggregationProof({ version: 1, compiled_proof: new Uint8Array() })).toThrow(
+      "empty"
+    );
+    expect(() =>
+      encodeTallyAggregationProof({ version: 2, compiled_proof: new Uint8Array([1]) })
+    ).toThrow("version");
+    expect(() => decodeTallyAggregationProof(new Uint8Array([1, 3, 0, 0, 0, 1]))).toThrow();
+
+    const encoded = encodeTallyAggregationProof({
+      version: 1,
+      compiled_proof: new Uint8Array([1, 2]),
+    });
+    const withTrailing = new Uint8Array(encoded.length + 1);
+    withTrailing.set(encoded);
+    withTrailing[withTrailing.length - 1] = 0xff;
+    expect(() => decodeTallyAggregationProof(withTrailing)).toThrow("trailing");
   });
 });
 

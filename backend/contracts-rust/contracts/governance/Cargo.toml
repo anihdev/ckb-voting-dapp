@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ckb-hash = { workspace = true }
 ckb-std = { workspace = true }
+sparse-merkle-tree = { workspace = true, features = ["smtc"] }
 
 [features]
 default = []

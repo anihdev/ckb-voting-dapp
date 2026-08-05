@@ -583,6 +583,48 @@
   overflow-wrap: anywhere;
 }
 
+.governance-theme .poll-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* Collapsed-card result line: the archive's only tally readout. */
+.governance-theme .poll-result-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface-soft);
+}
+
+.governance-theme .poll-result-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  color: var(--teal);
+}
+
+.governance-theme .poll-result-value {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.governance-theme .poll-result-votes,
+.governance-theme .poll-result-empty {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
 .governance-theme .poll-card .alert,
 .governance-theme .poll-card p,
 .governance-theme .poll-card select,
@@ -938,9 +980,37 @@
   color: var(--ink-3);
 }
 
+.governance-theme .protocol-strip-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 24px 0;
+}
+
+.governance-theme .protocol-strip-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 260px;
+  max-width: 420px;
+  font-size: 12px;
+}
+
+.governance-theme .protocol-strip-picker > span {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+/* auto-fit because the timeline emits 5 or 6 stages depending on merge need. */
 .governance-theme .protocol-strip {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   border-top: 1px solid var(--line);
   margin-top: 14px;
 }
@@ -948,6 +1018,14 @@
 .governance-theme .protocol-cell {
   padding: 14px 16px;
   min-width: 0;
+}
+
+.governance-theme .protocol-detail {
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .governance-theme .protocol-op {
@@ -976,6 +1054,17 @@
 
 .governance-theme .protocol-cell.pending {
   border-left: 3px solid transparent;
+}
+
+.governance-theme .protocol-cell.ended {
+  border-left: 3px solid var(--amber);
+  background: rgba(217, 143, 35, 0.07);
+}
+
+/* Terminal, not waiting: this stage will never run for the selected poll. */
+.governance-theme .protocol-cell.skipped {
+  border-left: 3px solid var(--line);
+  opacity: 0.72;
 }
 
 .governance-theme .tx-track {
@@ -1191,7 +1280,14 @@
   }
 
   .governance-theme .poll-title-row {
-    gap: 10px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .governance-theme .poll-title-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .governance-theme .poll-question {

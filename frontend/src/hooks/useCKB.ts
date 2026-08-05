@@ -39,20 +39,39 @@ export function useCKB(): CKBState {
 
   // Resolve address whenever signer changes
   useEffect(() => {
+    let cancelled = false;
+
     if (!signer) {
       setAddress(null);
       setLockScriptHash(null);
       setBalance(0n);
+      setLoading(false);
       return;
     }
+
+    // Never expose the previous account's role while the new signer identity
+    // is resolving. Its authority and balance belong to a different lock.
+    setAddress(null);
+    setLockScriptHash(null);
+    setBalance(0n);
+    setError(null);
     setLoading(true);
     getSignerAddressObj(signer as any)
       .then((addr) => {
+        if (cancelled) return;
         setAddress(addr.toString());
         setLockScriptHash(hashScript(addr.script));
       })
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [signer]);
 
   const refreshBalance = useCallback(async () => {

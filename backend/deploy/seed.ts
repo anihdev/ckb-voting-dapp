@@ -210,12 +210,13 @@ async function main(): Promise<void> {
     const shardOutputs = Array.from({ length: shardCount }, (_, shardId) => {
       const shardScript = tallyShardScript(pollTypeHash, shardId);
       const shardData = encodeTallyShardData({
+        version: 2,
         poll_type_hash: (ccc as any).bytesFrom(pollTypeHash),
         shard_id: shardId,
         shard_count: shardCount,
         vote_counts: poll.options.map(() => 0n),
         total_voters: 0n,
-        counted_voter_lock_hashes: [],
+        counted_voter_root: new Uint8Array(32),
         finalized: false,
       });
       const capacity = [

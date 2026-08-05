@@ -1,5 +1,8 @@
 [workspace]
-members = ["contracts/governance", "integration-tests"]
+members = [
+  "contracts/governance",
+  "integration-tests",
+]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +13,7 @@ authors = ["anihdev"]
 [workspace.dependencies]
 ckb-std = { version = "0.16.4", default-features = false, features = ["allocator", "calc-hash", "ckb-types", "dummy-atomic", "libc", "type-id"] }
 ckb-hash = { version = "0.119.0", default-features = false, features = ["ckb-contract"] }
+sparse-merkle-tree = { git = "https://github.com/nervosnetwork/sparse-merkle-tree", rev = "725cd69d95e3e34cd302e83d86178e959fc53687", default-features = false, features = ["with-blake2b-ref"] }
 
 [profile.release]
 panic = "abort"

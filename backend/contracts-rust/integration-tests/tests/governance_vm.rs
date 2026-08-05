@@ -14,8 +14,16 @@ use ckb_testtool::ckb_types::{
     prelude::*,
 };
 use ckb_testtool::context::Context;
+use sparse_merkle_tree::{
+    blake2b::{Blake2b, Blake2bBuilder},
+    default_store::DefaultStore,
+    traits::Hasher,
+    SparseMerkleTree, H256,
+};
 
 const MAX_CYCLES: u64 = 100_000_000;
+const MAX_AGGREGATION_CYCLES: u64 = 50_000_000;
+const MAX_SHARDS_PER_FINALIZE: usize = 8;
 
 const OP_CREATE_POLL: u8 = 0x01;
 const OP_CREATE_VOTE_INTENT: u8 = 0x02;
@@ -42,6 +50,9 @@ const SINCE_EPOCH_METRIC: u64 = 0x2000_0000_0000_0000;
 const SINCE_TIMESTAMP_METRIC: u64 = 0x4000_0000_0000_0000;
 const SINCE_RESERVED_FLAG: u64 = 0x0100_0000_0000_0000;
 const MAX_DEADLINE_EPOCH: u64 = (1u64 << 24) - FORCE_CLOSE_GRACE_EPOCHS - 2;
+const TALLY_SHARD_CODEC_VERSION: u8 = 2;
+const TALLY_AGGREGATION_PROOF_VERSION: u8 = 1;
+const COUNTED_VOTER_PRESENT_VALUE: [u8; 32] = [1u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EncodedScript {
@@ -96,6 +107,38 @@ struct TallyShardData {
     counted_voter_lock_hashes: Vec<[u8; 32]>,
     finalized: bool,
 }
+
+// The fixture retains source voter hashes so host-side Rust can reconstruct
+// the committed tree and generate proofs. Only the derived root is serialized.
+struct CkbSmtHasher(Blake2b);
+
+impl Default for CkbSmtHasher {
+    fn default() -> Self {
+        Self(
+            Blake2bBuilder::new(32)
+                .personal(b"ckb-default-hash")
+                .build(),
+        )
+    }
+}
+
+impl Hasher for CkbSmtHasher {
+    fn write_h256(&mut self, value: &H256) {
+        self.0.update(value.as_slice());
+    }
+
+    fn write_byte(&mut self, value: u8) {
+        self.0.update(&[value]);
+    }
+
+    fn finish(self) -> H256 {
+        let mut output = [0u8; 32];
+        self.0.finalize(&mut output);
+        output.into()
+    }
+}
+
+type CountedVoterSmt = SparseMerkleTree<CkbSmtHasher, H256, DefaultStore<H256>>;
 
 #[derive(Clone, Debug)]
 struct TallyMergeResultData {
@@ -485,14 +528,62 @@ fn encode_delegation(data: &DelegationData) -> Bytes {
 
 fn encode_tally_shard(data: &TallyShardData) -> Bytes {
     let mut output = Vec::new();
+    output.push(TALLY_SHARD_CODEC_VERSION);
     output.extend_from_slice(&data.poll_type_hash);
     encode_u32(&mut output, data.shard_id);
     encode_u32(&mut output, data.shard_count);
     encode_u64_vec(&mut output, &data.vote_counts);
     encode_u64(&mut output, data.total_voters);
-    encode_bytes32_vec(&mut output, &data.counted_voter_lock_hashes);
+    output.extend_from_slice(&counted_voter_root(&data.counted_voter_lock_hashes));
     encode_bool(&mut output, data.finalized);
     Bytes::from(output)
+}
+
+fn counted_voter_tree(voters: &[[u8; 32]]) -> CountedVoterSmt {
+    let mut tree = CountedVoterSmt::default();
+    let present = H256::from(COUNTED_VOTER_PRESENT_VALUE);
+    tree.update_all(
+        voters
+            .iter()
+            .copied()
+            .map(|voter| (H256::from(voter), present))
+            .collect(),
+    )
+    .expect("build counted-voter tree");
+    tree
+}
+
+fn counted_voter_root(voters: &[[u8; 32]]) -> [u8; 32] {
+    counted_voter_tree(voters)
+        .root()
+        .as_slice()
+        .try_into()
+        .expect("SMT root")
+}
+
+fn encode_tally_aggregation_proof(
+    existing_voters: &[[u8; 32]],
+    batch_voters: &[[u8; 32]],
+) -> Bytes {
+    let tree = counted_voter_tree(existing_voters);
+    let mut unique_keys: Vec<H256> = Vec::new();
+    for voter in batch_voters {
+        let key = H256::from(*voter);
+        if !unique_keys.iter().any(|existing| existing == &key) {
+            unique_keys.push(key);
+        }
+    }
+    let proof: Vec<u8> = tree
+        .merkle_proof(unique_keys.clone())
+        .expect("build aggregation proof")
+        .compile(unique_keys)
+        .expect("compile aggregation proof")
+        .into();
+    let mut payload = Vec::with_capacity(5 + proof.len());
+    payload.push(TALLY_AGGREGATION_PROOF_VERSION);
+    encode_u32(&mut payload, proof.len() as u32);
+    payload.extend_from_slice(&proof);
+    Bytes::from(payload)
 }
 
 fn encode_tally_merge_result(data: &TallyMergeResultData) -> Bytes {
@@ -517,6 +608,19 @@ fn mutate_byte(bytes: Bytes, offset: usize, value: u8) -> Bytes {
     let mut data = bytes.to_vec();
     data[offset] = value;
     Bytes::from(data)
+}
+
+fn replace_first_witness_input_type(
+    tx: ckb_testtool::ckb_types::core::TransactionView,
+    input_type: Bytes,
+) -> ckb_testtool::ckb_types::core::TransactionView {
+    let mut witnesses: Vec<_> = tx.witnesses().into_iter().collect();
+    witnesses[0] = WitnessArgs::new_builder()
+        .input_type(Some(input_type).pack())
+        .build()
+        .as_bytes()
+        .pack();
+    tx.as_advanced_builder().set_witnesses(witnesses).build()
 }
 
 fn append_output(
@@ -599,7 +703,7 @@ fn vote_intent_aggregated_offset() -> usize {
 }
 
 fn shard_finalized_offset(data: &TallyShardData) -> usize {
-    32 + 4 + 4 + 4 + data.vote_counts.len() * 8 + 8 + 4 + data.counted_voter_lock_hashes.len() * 32
+    1 + 32 + 4 + 4 + 4 + data.vote_counts.len() * 8 + 8 + 32
 }
 
 fn create_poll_tx(
@@ -1039,6 +1143,19 @@ fn build_tally_shard_aggregation_tx(
     poll_dep: Option<OutPoint>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
     let shard_script = shard_script_for_fixture(fixture, before_shard.shard_id);
+    let batch_voters: Vec<[u8; 32]> = intents
+        .iter()
+        .map(|(_, intent, _, _, _)| intent.voter_lock_hash)
+        .collect();
+    let proof_witness = WitnessArgs::new_builder()
+        .input_type(
+            Some(encode_tally_aggregation_proof(
+                &before_shard.counted_voter_lock_hashes,
+                &batch_voters,
+            ))
+            .pack(),
+        )
+        .build();
     let mut builder = TransactionBuilder::default()
         .input(input(shard_op))
         .output(output(
@@ -1052,7 +1169,7 @@ fn build_tally_shard_aggregation_tx(
         .cell_dep(cell_dep(
             poll_dep.unwrap_or_else(|| poll_dep_from_fixture(fixture, false)),
         ))
-        .witness(blank_witness().pack());
+        .witness(proof_witness.as_bytes().pack());
 
     let mut header_hashes = vec![fixture.header_hash.clone()];
     for (index, (intent_op, intent, intent_script, capacity, creation_header)) in
@@ -1127,6 +1244,41 @@ fn build_tally_shard_finalization_tx_with_since(
         fixture.header_hash.clone(),
     )
     .build()
+}
+
+fn build_tally_shard_batch_finalization_tx(
+    fixture: &mut PollFixture,
+    lanes: Vec<(OutPoint, TallyShardData, TallyShardData, u64)>,
+    poll_dep: Option<OutPoint>,
+) -> ckb_testtool::ckb_types::core::TransactionView {
+    let mut builder = TransactionBuilder::default()
+        .cell_dep(cell_dep(fixture.governance_op.clone()))
+        .cell_dep(cell_dep(fixture.always_success_op.clone()))
+        .cell_dep(cell_dep(
+            poll_dep.unwrap_or_else(|| poll_dep_from_fixture(fixture, false)),
+        ));
+
+    // Flow: every selected lane occupies the same input/output index. Distinct
+    // lane type groups each validate the complete ordered protocol prefix.
+    for (shard_op, before, after, protocol_since) in lanes {
+        let shard_script = tally_shard_script_from_parts(
+            &mut fixture.context,
+            &fixture.governance_op,
+            &before.poll_type_hash,
+            before.shard_id,
+        );
+        builder = builder
+            .input(input_with_since(shard_op, protocol_since))
+            .output(output(
+                TALLY_SHARD_MIN_SHANNONS,
+                shard_script.clone(),
+                Some(shard_script),
+            ))
+            .output_data(encode_tally_shard(&after).pack())
+            .witness(blank_witness().pack());
+    }
+
+    tx_with_header(builder, fixture.header_hash.clone()).build()
 }
 
 fn close_poll_with_inputs_tx(
@@ -2533,6 +2685,147 @@ fn tally_shard_aggregation_happy_path_passes() {
 }
 
 #[test]
+fn tally_shard_aggregation_stays_bounded_through_50_intents() {
+    for batch_size in [1u8, 10, 25, 50] {
+        let mut fixture = create_poll_fixture(137 + u64::from(batch_size), 1, false);
+        let before = fixture.shard_data[0].clone();
+        let shard_op = fixture.shard_ops[0].clone();
+        let poll_type_hash = fixture.poll_type_hash;
+        let mut after = before.clone();
+        let mut intents: Vec<AggregationIntent> = Vec::new();
+
+        for seed in 0u8..batch_size {
+            let voter_lock = fixture
+                .context
+                .build_script(&fixture.always_success_op, Bytes::from(vec![seed]))
+                .expect("voter lock");
+            let voter_hash = script_hash(&voter_lock);
+            let option_index = seed % 2;
+            let (intent_op, intent, intent_script) = live_intent_cell_with_capacity(
+                &mut fixture,
+                poll_type_hash,
+                poll_type_hash,
+                voter_hash,
+                option_index,
+                false,
+                voter_lock,
+                VOTER_DEPOSIT_SHANNONS,
+            );
+            let creation_header =
+                link_cell_to_epoch(&mut fixture.context, &intent_op, fixture.epoch);
+            intents.push((
+                intent_op,
+                intent,
+                intent_script,
+                VOTER_DEPOSIT_SHANNONS,
+                creation_header,
+            ));
+            after.vote_counts[usize::from(option_index)] += 1;
+            after.total_voters += 1;
+            after.counted_voter_lock_hashes.push(voter_hash);
+        }
+
+        let tx = build_tally_shard_aggregation_tx(
+            &mut fixture,
+            shard_op,
+            before,
+            after,
+            intents,
+            Vec::new(),
+            None,
+        );
+        let tx_bytes = tx.data().serialized_size_in_block();
+        let cycles = verify_ok(&mut fixture.context, tx);
+        assert!(
+            cycles <= MAX_AGGREGATION_CYCLES,
+            "batch {batch_size} used {cycles} cycles, above the {MAX_AGGREGATION_CYCLES} project ceiling"
+        );
+        println!(
+            "V2_SMT_AGG batch={batch_size} tx_bytes={tx_bytes} cycles={cycles} ceiling={MAX_AGGREGATION_CYCLES}"
+        );
+    }
+}
+
+#[test]
+fn tally_shard_aggregation_stays_bounded_with_1024_existing_voters() {
+    let mut fixture = create_poll_fixture(190, 1, false);
+    let mut before = fixture.shard_data[0].clone();
+    before.counted_voter_lock_hashes = (0..1_024u64)
+        .map(|index| {
+            let mut input = b"mature-tally-lane".to_vec();
+            input.extend_from_slice(&index.to_le_bytes());
+            blake2b_256(&input)
+        })
+        .collect();
+    before.vote_counts = vec![512, 512];
+    before.total_voters = 1_024;
+    let shard_script = shard_script_for_fixture(&mut fixture, 0);
+    let shard_op = governance_cell(
+        &mut fixture.context,
+        TALLY_SHARD_MIN_SHANNONS,
+        shard_script.clone(),
+        shard_script,
+        encode_tally_shard(&before),
+    );
+    let poll_type_hash = fixture.poll_type_hash;
+    let mut after = before.clone();
+    let mut intents: Vec<AggregationIntent> = Vec::new();
+
+    for seed in 0u8..50 {
+        let voter_lock = fixture
+            .context
+            .build_script(&fixture.always_success_op, Bytes::from(vec![0x80, seed]))
+            .expect("mature-lane voter lock");
+        let voter_hash = script_hash(&voter_lock);
+        assert!(!before.counted_voter_lock_hashes.contains(&voter_hash));
+        let option_index = seed % 2;
+        let (intent_op, intent, intent_script) = live_intent_cell_with_capacity(
+            &mut fixture,
+            poll_type_hash,
+            poll_type_hash,
+            voter_hash,
+            option_index,
+            false,
+            voter_lock,
+            VOTER_DEPOSIT_SHANNONS,
+        );
+        let creation_header = link_cell_to_epoch(&mut fixture.context, &intent_op, fixture.epoch);
+        intents.push((
+            intent_op,
+            intent,
+            intent_script,
+            VOTER_DEPOSIT_SHANNONS,
+            creation_header,
+        ));
+        after.vote_counts[usize::from(option_index)] += 1;
+        after.total_voters += 1;
+        after.counted_voter_lock_hashes.push(voter_hash);
+    }
+
+    let batch_voters: Vec<[u8; 32]> = after.counted_voter_lock_hashes[1_024..].to_vec();
+    let proof_bytes =
+        encode_tally_aggregation_proof(&before.counted_voter_lock_hashes, &batch_voters).len();
+    let tx = build_tally_shard_aggregation_tx(
+        &mut fixture,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    );
+    let tx_bytes = tx.data().serialized_size_in_block();
+    let cycles = verify_ok(&mut fixture.context, tx);
+    assert!(
+        cycles <= MAX_AGGREGATION_CYCLES,
+        "mature 50-intent batch used {cycles} cycles, above the project ceiling"
+    );
+    println!(
+        "V2_SMT_AGG_MATURE existing=1024 batch=50 proof_bytes={proof_bytes} tx_bytes={tx_bytes} cycles={cycles} ceiling={MAX_AGGREGATION_CYCLES}"
+    );
+}
+
+#[test]
 fn token_weighted_poll_dep_cannot_authorize_tally_shard_aggregation() {
     let (mut fixture, shard_op, before_shard, after_shard, intents) = aggregation_fixture(136);
     let mut weighted_poll = fixture.open_poll.clone();
@@ -2848,6 +3141,63 @@ fn tally_shard_aggregation_rejects_bad_intents_and_markers() {
 }
 
 #[test]
+fn tally_shard_aggregation_rejects_malformed_proofs_and_wrong_roots() {
+    let (mut fixture, shard_op, before, after, intents) = aggregation_fixture(86);
+    let batch_voters: Vec<[u8; 32]> = intents
+        .iter()
+        .map(|(_, intent, _, _, _)| intent.voter_lock_hash)
+        .collect();
+    let valid_payload =
+        encode_tally_aggregation_proof(&before.counted_voter_lock_hashes, &batch_voters);
+    let valid_tx = build_tally_shard_aggregation_tx(
+        &mut fixture,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    );
+
+    let mut unknown_version = valid_payload.to_vec();
+    unknown_version[0] = 2;
+    let tx = replace_first_witness_input_type(valid_tx.clone(), Bytes::from(unknown_version));
+    let _ = verify_err(&mut fixture.context, tx);
+
+    let mut truncated = valid_payload.to_vec();
+    truncated.pop();
+    let tx = replace_first_witness_input_type(valid_tx.clone(), Bytes::from(truncated));
+    let _ = verify_err(&mut fixture.context, tx);
+
+    let tx = replace_first_witness_input_type(
+        valid_tx.clone(),
+        with_trailing_byte(valid_payload.clone()),
+    );
+    let _ = verify_err(&mut fixture.context, tx);
+
+    let mut corrupted = valid_payload.to_vec();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 1;
+    let tx = replace_first_witness_input_type(valid_tx, Bytes::from(corrupted));
+    let _ = verify_err(&mut fixture.context, tx);
+
+    let (mut wrong_root, shard_op, before, mut after, intents) = aggregation_fixture(87);
+    // The proof covers only the consumed intent keys; adding another committed
+    // leaf changes the output root and must fail the same proof.
+    after.counted_voter_lock_hashes.push([0xEE; 32]);
+    let tx = build_tally_shard_aggregation_tx(
+        &mut wrong_root,
+        shard_op,
+        before,
+        after,
+        intents,
+        Vec::new(),
+        None,
+    );
+    assert_exit_code(&verify_err(&mut wrong_root.context, tx), 5);
+}
+
+#[test]
 fn tally_shard_aggregation_uses_authenticated_intent_creation_epochs() {
     let (mut timely, shard_op, before, after, intents) = aggregation_fixture(90);
     let post_deadline_epoch = timely.open_poll.deadline + 1;
@@ -3045,6 +3395,191 @@ fn tally_shard_finalization_rejects_invalid_since_values_and_threshold_overflow(
         absolute_epoch_since(MAX_DEADLINE_EPOCH + 1),
     );
     assert_exit_code(&verify_err(&mut overflow.context, tx), 5);
+}
+
+#[test]
+fn tally_shard_batch_finalization_accepts_eight_ordered_lanes_in_one_transaction() {
+    let mut fixture = create_poll_fixture(108, MAX_SHARDS_PER_FINALIZE as u32, false);
+    let deadline = fixture.open_poll.deadline;
+    set_fixture_epoch(&mut fixture, deadline + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = fixture.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                fixture.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut fixture, lanes, None);
+    assert_eq!(tx.inputs().len(), MAX_SHARDS_PER_FINALIZE);
+    let tx_bytes = tx.data().serialized_size_in_block();
+    let cycles = verify_ok(&mut fixture.context, tx);
+    assert!(
+        cycles <= MAX_AGGREGATION_CYCLES,
+        "eight-lane finalization used {cycles} cycles, above the project ceiling"
+    );
+    println!("V2_BATCH_FINALIZE lanes=8 tx_bytes={tx_bytes} cycles={cycles}");
+}
+
+#[test]
+fn tally_shard_batch_finalization_rejects_order_scope_and_batch_violations() {
+    let mut wrong_order = create_poll_fixture(109, 3, false);
+    let deadline = wrong_order.open_poll.deadline;
+    set_fixture_epoch(&mut wrong_order, deadline + 1);
+    let lanes = [1usize, 0]
+        .into_iter()
+        .map(|index| {
+            let before = wrong_order.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                wrong_order.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut wrong_order, lanes, None);
+    assert_exit_code(&verify_err(&mut wrong_order.context, tx), 5);
+
+    let mut too_many = create_poll_fixture(110, (MAX_SHARDS_PER_FINALIZE + 1) as u32, false);
+    let deadline = too_many.open_poll.deadline;
+    set_fixture_epoch(&mut too_many, deadline + 1);
+    let lanes = (0..=MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = too_many.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                too_many.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut too_many, lanes, None);
+    assert_exit_code(&verify_err(&mut too_many.context, tx), 5);
+
+    let mut mixed_poll = create_poll_fixture(111, 2, false);
+    let deadline = mixed_poll.open_poll.deadline;
+    set_fixture_epoch(&mut mixed_poll, deadline + 1);
+    let normal_before = mixed_poll.shard_data[0].clone();
+    let mut normal_after = normal_before.clone();
+    normal_after.finalized = true;
+    let foreign_hash = [0xFA; 32];
+    let foreign_before = TallyShardData {
+        poll_type_hash: foreign_hash,
+        shard_id: 1,
+        shard_count: 2,
+        vote_counts: vec![0, 0],
+        total_voters: 0,
+        counted_voter_lock_hashes: Vec::new(),
+        finalized: false,
+    };
+    let mut foreign_after = foreign_before.clone();
+    foreign_after.finalized = true;
+    let foreign_script = tally_shard_script_from_parts(
+        &mut mixed_poll.context,
+        &mixed_poll.governance_op,
+        &foreign_hash,
+        1,
+    );
+    let foreign_op = governance_cell(
+        &mut mixed_poll.context,
+        TALLY_SHARD_MIN_SHANNONS,
+        foreign_script.clone(),
+        foreign_script,
+        encode_tally_shard(&foreign_before),
+    );
+    let lanes = vec![
+        (
+            mixed_poll.shard_ops[0].clone(),
+            normal_before,
+            normal_after,
+            absolute_epoch_since(deadline + 1),
+        ),
+        (
+            foreign_op,
+            foreign_before,
+            foreign_after,
+            absolute_epoch_since(deadline + 1),
+        ),
+    ];
+    let tx = build_tally_shard_batch_finalization_tx(&mut mixed_poll, lanes, None);
+    assert_exit_code(&verify_err(&mut mixed_poll.context, tx), 5);
+}
+
+#[test]
+fn tally_shard_batch_finalization_rejects_bad_since_root_and_extra_lane_output() {
+    let mut bad_since = create_poll_fixture(112, 2, false);
+    let deadline = bad_since.open_poll.deadline;
+    set_fixture_epoch(&mut bad_since, deadline + 1);
+    let lanes = (0..2usize)
+        .map(|index| {
+            let before = bad_since.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            let since_epoch = if index == 0 { deadline + 1 } else { deadline };
+            (
+                bad_since.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(since_epoch),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut bad_since, lanes, None);
+    assert_exit_code(&verify_err(&mut bad_since.context, tx), 5);
+
+    let mut bad_root = create_poll_fixture(113, 1, false);
+    let deadline = bad_root.open_poll.deadline;
+    set_fixture_epoch(&mut bad_root, deadline + 1);
+    let before = bad_root.shard_data[0].clone();
+    let mut after = before.clone();
+    after.finalized = true;
+    after.counted_voter_lock_hashes.push([0xBB; 32]);
+    let lanes = vec![(
+        bad_root.shard_ops[0].clone(),
+        before,
+        after,
+        absolute_epoch_since(deadline + 1),
+    )];
+    let tx = build_tally_shard_batch_finalization_tx(&mut bad_root, lanes, None);
+    assert_exit_code(&verify_err(&mut bad_root.context, tx), 5);
+
+    let mut extra_output = create_poll_fixture(114, 2, false);
+    let deadline = extra_output.open_poll.deadline;
+    set_fixture_epoch(&mut extra_output, deadline + 1);
+    let before = extra_output.shard_data[0].clone();
+    let mut after = before.clone();
+    after.finalized = true;
+    let lanes = vec![(
+        extra_output.shard_ops[0].clone(),
+        before,
+        after.clone(),
+        absolute_epoch_since(deadline + 1),
+    )];
+    let tx = build_tally_shard_batch_finalization_tx(&mut extra_output, lanes, None);
+    let hidden_script = shard_script_for_fixture(&mut extra_output, 1);
+    let mut hidden_after = extra_output.shard_data[1].clone();
+    hidden_after.finalized = true;
+    let tx = append_output(
+        tx,
+        output(
+            TALLY_SHARD_MIN_SHANNONS,
+            hidden_script.clone(),
+            Some(hidden_script),
+        ),
+        encode_tally_shard(&hidden_after),
+    );
+    assert_exit_code(&verify_err(&mut extra_output.context, tx), 5);
 }
 
 #[test]

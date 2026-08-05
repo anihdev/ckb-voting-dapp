@@ -7,6 +7,7 @@
 
 import {
   MAX_CLOSE_INTENT_REFUNDS,
+  MAX_DIRECT_CLOSE_SHARDS,
   MAX_TALLY_SHARDS,
   MERGE_COVERAGE_BYTES,
 } from "./constants";
@@ -14,9 +15,12 @@ import { hexToBytes } from "./molecule";
 import {
   DelegationRecord,
   Poll,
+  PollOutcome,
   TallyFrontierSource,
   TallyMergeResult,
   TallyShard,
+  VoteAuthorityOption,
+  VoteIntent,
 } from "./types";
 
 export const FINALIZE_PENDING_INTENTS_WARNING =
@@ -154,6 +158,73 @@ export function isPollVotingSupported(
   return !poll.tokenWeighted;
 }
 
+/**
+ * Derives the connected wallet's usable voting identities from indexed cells.
+ *
+ * This is intentionally pure: a wallet connection should update poll actions
+ * from already-indexed intents immediately, without waiting for another RPC
+ * scan. The contract and transaction builder remain the authority at submit
+ * time; this helper only keeps the UI's role state current.
+ */
+export function deriveVoteAuthorityOptions(input: {
+  poll: Pick<Poll, "id" | "creator">;
+  intents: VoteIntent[];
+  delegations: DelegationRecord[];
+  viewerLockHash: string | null;
+}): VoteAuthorityOption[] {
+  if (!input.viewerLockHash) return [];
+
+  const viewerLockHash = input.viewerLockHash.toLowerCase();
+  const pollId = input.poll.id.toLowerCase();
+  const intentState = (representedVoterLockHash: string) => {
+    const normalizedVoterLockHash = representedVoterLockHash.toLowerCase();
+    const representedIntents = input.intents.filter(
+      (intent) =>
+        intent.pollId.toLowerCase() === pollId &&
+        intent.voterLockHash.toLowerCase() === normalizedVoterLockHash
+    );
+
+    return {
+      hasIntent: representedIntents.length > 0,
+      hasPendingIntent: representedIntents.some((intent) => !intent.aggregated),
+      hasAggregatedIntent: representedIntents.some((intent) => intent.aggregated),
+    };
+  };
+
+  const authorityOptions: VoteAuthorityOption[] = [
+    {
+      id: "self",
+      mode: "self",
+      label: "Vote as connected wallet",
+      voterLockHash: input.viewerLockHash,
+      delegationId: null,
+      ...intentState(input.viewerLockHash),
+    },
+  ];
+
+  for (const delegation of input.delegations) {
+    if (
+      delegation.delegateLockHash.toLowerCase() !== viewerLockHash ||
+      delegation.pollId?.toLowerCase() !== pollId ||
+      delegation.delegatorLockHash.toLowerCase() === input.poll.creator.toLowerCase() ||
+      delegation.expiresEpoch !== 0n
+    ) {
+      continue;
+    }
+
+    authorityOptions.push({
+      id: delegation.id,
+      mode: "delegation",
+      label: `Vote for ${delegation.delegatorLockHash.slice(0, 14)}...`,
+      voterLockHash: delegation.delegatorLockHash,
+      delegationId: delegation.id,
+      ...intentState(delegation.delegatorLockHash),
+    });
+  }
+
+  return authorityOptions;
+}
+
 export type PollLifecycleFilter = "open" | "needsClose" | "archived" | "all";
 export type PollLifecycleStatus = "open" | "needsClose" | "archived";
 
@@ -191,7 +262,13 @@ export interface ProtocolTimelineStep {
   op: string;
   label: string;
   detail: string;
-  state: "completed" | "live" | "pending";
+  /**
+   * `skipped` is terminal, unlike `pending`. It marks a stage that will never
+   * run for this poll — a closed poll that counted nothing, or a recovery-only
+   * weighted poll whose voting path is disabled — so the strip does not present
+   * a finished lifecycle as unfinished work waiting on the user.
+   */
+  state: "completed" | "live" | "pending" | "skipped" | "ended";
 }
 
 function emptyCoverage(): Uint8Array {
@@ -304,6 +381,44 @@ function compareOptionalEpochDesc(left: bigint | null, right: bigint | null): nu
   return 0;
 }
 
+/**
+ * Reads a finalized tally as a leader, a tie, or no counted votes.
+ *
+ * Pure and derived only from the counts, so an impossible presentation state
+ * cannot be constructed by a caller or injected by a test. Ties are reported as
+ * ties across every joint-leading option; the contract defines no tie-break, so
+ * inventing one here (lowest index, for example) would misattribute a UI
+ * convention to consensus. This describes counted finalized votes only —
+ * intents that were never aggregated are not represented.
+ */
+export function derivePollOutcome(voteCounts: bigint[]): PollOutcome {
+  let leadingVotes = 0n;
+  let optionIndices: number[] = [];
+
+  voteCounts.forEach((count, index) => {
+    if (count <= 0n) return;
+    if (count > leadingVotes) {
+      leadingVotes = count;
+      optionIndices = [index];
+    } else if (count === leadingVotes) {
+      optionIndices.push(index);
+    }
+  });
+
+  if (optionIndices.length === 0) return { kind: "no-votes" };
+  if (optionIndices.length === 1) {
+    return { kind: "leader", optionIndex: optionIndices[0], votes: leadingVotes };
+  }
+  return { kind: "tie", optionIndices, votesEach: leadingVotes };
+}
+
+/** True when the option is a leading option of the derived outcome. */
+export function isLeadingOption(outcome: PollOutcome, optionIndex: number): boolean {
+  if (outcome.kind === "leader") return outcome.optionIndex === optionIndex;
+  if (outcome.kind === "tie") return outcome.optionIndices.includes(optionIndex);
+  return false;
+}
+
 export function getPollLifecycleStatus(
   poll: Pick<Poll, "isClosed" | "deadline">,
   currentEpoch: bigint
@@ -349,6 +464,51 @@ export function sortPollsByLifecycle(polls: Poll[], currentEpoch: bigint): Poll[
   });
 }
 
+/**
+ * Deterministic ordering for the protocol timeline's poll subject.
+ *
+ * Distinct from `sortPollsByLifecycle`, which leads with needs-close because
+ * the registry surfaces work waiting on the user. The timeline instead leads
+ * with the newest open poll: it describes a lifecycle in progress, and an open
+ * poll is the one whose stages are still moving.
+ *
+ * Ordering is total and independent of indexer order — `createdEpoch` desc,
+ * then `deadline` desc, then id — so the same poll list always yields the same
+ * default and the same picker order regardless of the order cells came back in.
+ */
+export function sortPollsForTimeline(polls: Poll[], currentEpoch: bigint): Poll[] {
+  const priority: Record<PollLifecycleStatus, number> = {
+    open: 0,
+    needsClose: 1,
+    archived: 2,
+  };
+
+  return [...polls].sort((left, right) => {
+    const leftStatus = getPollLifecycleStatus(left, currentEpoch);
+    const rightStatus = getPollLifecycleStatus(right, currentEpoch);
+    if (priority[leftStatus] !== priority[rightStatus]) {
+      return priority[leftStatus] - priority[rightStatus];
+    }
+
+    const createdCompare = compareOptionalEpochDesc(left.createdEpoch, right.createdEpoch);
+    if (createdCompare !== 0) return createdCompare;
+    if (left.deadline !== right.deadline) return left.deadline > right.deadline ? -1 : 1;
+    return left.id.localeCompare(right.id);
+  });
+}
+
+/**
+ * Picks the poll the timeline describes when the user has not chosen one.
+ *
+ * The previous selection read `polls` in raw indexer order, so "newest open"
+ * was whichever open poll the indexer happened to return first; `PollList`
+ * sorts its own copy and does not affect the array `App` holds. This selects
+ * from the timeline ordering instead, so the default is reproducible.
+ */
+export function selectDefaultTimelinePoll(polls: Poll[], currentEpoch: bigint): Poll | null {
+  return sortPollsForTimeline(polls, currentEpoch)[0] ?? null;
+}
+
 export function filterPollsByLifecycle(
   polls: Poll[],
   filter: PollLifecycleFilter,
@@ -357,6 +517,150 @@ export function filterPollsByLifecycle(
   const sorted = sortPollsByLifecycle(polls, currentEpoch);
   if (filter === "all") return sorted;
   return sorted.filter((poll) => getPollLifecycleStatus(poll, currentEpoch) === filter);
+}
+
+/**
+ * Lifecycle reading of one indexed delegation cell.
+ *
+ * A live delegation cell is not evidence of usable voting authority: the poll
+ * it scopes may have closed or passed its deadline, and a delegation created
+ * against a poll this wallet cannot see indexes with no poll at all. Calling
+ * every live cell an "active delegation" told delegators they had authority
+ * they could not exercise.
+ *
+ * - `usable`      — scoped poll is indexed, open, and before its deadline.
+ * - `expired`     — deadline passed, poll not yet closed. Revocation only.
+ * - `closed`      — scoped poll is closed. Revocation only.
+ * - `unknown`     — scoped poll is not in the indexed set; usability unknown.
+ * - `legacy-global` — historical testnet v1 cell with no poll scope. New global
+ *   delegations are disabled in the builder; these remain revocable.
+ */
+export type DelegationLifecycleState =
+  | "usable"
+  | "expired"
+  | "closed"
+  | "unknown"
+  | "legacy-global";
+
+export interface DelegationLifecycle {
+  state: DelegationLifecycleState;
+  /** True only when this cell can still authorize a new vote intent. */
+  usable: boolean;
+  /** Only the delegator may revoke; delegates hold authority, not ownership. */
+  revocableByViewer: boolean;
+  label: string;
+  detail: string;
+}
+
+export function getDelegationLifecycle(
+  delegation: Pick<DelegationRecord, "pollId" | "isDelegator">,
+  polls: Array<Pick<Poll, "id" | "isClosed" | "deadline">>,
+  currentEpoch: bigint
+): DelegationLifecycle {
+  const revocableByViewer = delegation.isDelegator;
+
+  if (delegation.pollId === null) {
+    return {
+      state: "legacy-global",
+      usable: false,
+      revocableByViewer,
+      label: "Testnet legacy global",
+      detail:
+        "Historical testnet v1 cell with no poll scope. New global delegations are disabled; this cell remains visible and revocable.",
+    };
+  }
+
+  const scopedPollId = delegation.pollId.toLowerCase();
+  const poll = polls.find((candidate) => candidate.id.toLowerCase() === scopedPollId);
+
+  if (!poll) {
+    return {
+      state: "unknown",
+      usable: false,
+      revocableByViewer,
+      label: "Scoped poll not indexed",
+      detail:
+        "The scoped poll is not in the indexed set, so this cell's usability cannot be determined here.",
+    };
+  }
+
+  if (poll.isClosed) {
+    return {
+      state: "closed",
+      usable: false,
+      revocableByViewer,
+      label: "Scoped poll closed",
+      detail: "The scoped poll is closed. No new intent can be created; the cell is recoverable.",
+    };
+  }
+
+  if (currentEpoch > poll.deadline) {
+    return {
+      state: "expired",
+      usable: false,
+      revocableByViewer,
+      label: "Past voting deadline",
+      detail:
+        "The scoped poll passed its deadline. No new intent can be created; the cell is recoverable.",
+    };
+  }
+
+  return {
+    state: "usable",
+    usable: true,
+    revocableByViewer,
+    label: "Usable authority",
+    detail: "The scoped poll is open before its deadline, so this authority can create an intent.",
+  };
+}
+
+export interface DelegationSummary {
+  total: number;
+  usable: number;
+  /** Live cells that grant no usable authority: recovery or revocation only. */
+  recoveryOnly: number;
+  revocableByViewer: number;
+}
+
+export function summarizeDelegations(
+  delegations: Array<Pick<DelegationRecord, "pollId" | "isDelegator">>,
+  polls: Array<Pick<Poll, "id" | "isClosed" | "deadline">>,
+  currentEpoch: bigint
+): DelegationSummary {
+  let usable = 0;
+  let revocableByViewer = 0;
+
+  for (const delegation of delegations) {
+    const lifecycle = getDelegationLifecycle(delegation, polls, currentEpoch);
+    if (lifecycle.usable) usable += 1;
+    if (lifecycle.revocableByViewer) revocableByViewer += 1;
+  }
+
+  return {
+    total: delegations.length,
+    usable,
+    recoveryOnly: delegations.length - usable,
+    revocableByViewer,
+  };
+}
+
+/**
+ * True when a poll can still receive a *new* delegation.
+ *
+ * Mirrors the hook's `createDelegation` preconditions so the button is not
+ * offered for an action that would be rejected: a wallet must be connected, the
+ * poll must be open before its deadline, and the poll creator cannot delegate
+ * authority for their own poll.
+ */
+export function canDelegateForPoll(
+  poll: Pick<Poll, "isClosed" | "deadline" | "creator">,
+  viewerLockHash: string | null,
+  currentEpoch: bigint
+): boolean {
+  if (!viewerLockHash) return false;
+  if (poll.isClosed) return false;
+  if (currentEpoch > poll.deadline) return false;
+  return poll.creator.toLowerCase() !== viewerLockHash.toLowerCase();
 }
 
 export function canFinalizeTallyShardFromUi(poll: Poll, currentEpoch: bigint): boolean {
@@ -555,56 +859,221 @@ export function selectCloseTimeIntentRefunds<T>(
   };
 }
 
+/**
+ * Reports tally-lane progress for one poll.
+ * Merge coverage decoding is defensive because indexed cells are discovery
+ * data, not consensus authority.
+ */
+export function getPollTallyProgress(poll: Poll): {
+  indexedShardCount: number;
+  finalizedShardCount: number;
+  allShardsFinalized: boolean;
+  unfinalizedShardCount: number;
+  requiresMerge: boolean;
+  hasCompleteMergeResult: boolean;
+  closeStateReady: boolean;
+} {
+  const indexedShardCount = poll.tallyShards.length;
+  const finalizedShardCount = poll.tallyShards.filter((shard) => shard.finalized).length;
+  const allShardsFinalized =
+    poll.shardCount > 0 &&
+    indexedShardCount === poll.shardCount &&
+    finalizedShardCount === poll.shardCount;
+  const requiresMerge = poll.shardCount > MAX_DIRECT_CLOSE_SHARDS;
+  const hasCompleteMergeResult =
+    requiresMerge &&
+    poll.tallyMergeResults.some((result) => {
+      try {
+        return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
+      } catch {
+        return false;
+      }
+    });
+
+  return {
+    indexedShardCount,
+    finalizedShardCount,
+    allShardsFinalized,
+    unfinalizedShardCount: poll.tallyShards.filter((shard) => !shard.finalized).length,
+    requiresMerge,
+    hasCompleteMergeResult,
+    closeStateReady:
+      (!requiresMerge && allShardsFinalized) || (requiresMerge && hasCompleteMergeResult),
+  };
+}
+
+/**
+ * Builds the lifecycle strip for one selected poll.
+ *
+ * Scoped to a single poll because a dashboard-wide strip cannot describe a
+ * lifecycle: it mixed unrelated polls and left delegation steps reading "live"
+ * with no poll open. Delegation is not a poll lifecycle stage, so it is
+ * reported in the delegation panel instead of here.
+ */
 export function buildProtocolTimeline(
-  polls: Poll[],
-  delegations: DelegationRecord[],
+  poll: Poll | null,
   currentEpoch: bigint
 ): ProtocolTimelineStep[] {
-  const hasPolls = polls.length > 0;
-  const supportedPolls = polls.filter(isPollVotingSupported);
-  const hasSupportedPolls = supportedPolls.length > 0;
-  const hasIntent = supportedPolls.some((poll) => poll.totalVoters > 0n || poll.pendingIntentCount > 0n);
-  const hasAggregated = supportedPolls.some((poll) => poll.totalVotes > 0n);
-  const hasExpiredOpen = polls.some((poll) => !poll.isClosed && currentEpoch > poll.deadline);
-  const hasClosed = polls.some((poll) => poll.isClosed);
-  const hasDelegation = delegations.length > 0;
+  if (!poll) {
+    return [
+      {
+        op: "CREATE_POLL",
+        label: "Create poll cell",
+        detail: "Lock creator deposit and initialize governance state.",
+        state: "live",
+      },
+      {
+        op: "CREATE_VOTE_INTENT",
+        label: "Record vote intent",
+        detail: "Store independent voter or delegated intent cells.",
+        state: "pending",
+      },
+      {
+        op: "CREATE_TALLY_SHARD",
+        label: "Aggregate into lanes",
+        detail: "Batch pending intents into tally lane state.",
+        state: "pending",
+      },
+      {
+        op: "CREATE_TALLY_SHARD",
+        label: "Finalize lanes",
+        detail: "Freeze each tally lane after the deadline.",
+        state: "pending",
+      },
+      {
+        op: "CLOSE_POLL",
+        label: "Close or recover",
+        detail: "Creator closes after deadline; anyone can force-close after grace.",
+        state: "pending",
+      },
+    ];
+  }
 
-  return [
+  const progress = getPollTallyProgress(poll);
+  const votingSupported = isPollVotingSupported(poll);
+  const isExpired = currentEpoch > poll.deadline;
+  const isOpen = !poll.isClosed && !isExpired;
+  const hasIntent = poll.totalVoters > 0n || poll.pendingIntentCount > 0n;
+  const hasPending = poll.pendingIntentCount > 0n;
+  const hasAggregated = poll.totalVotes > 0n || poll.tallyShards.some((shard) => shard.totalVoters > 0n);
+
+  // Weighted polls are recovery-only: voting and aggregation are never valid
+  // paths for them, so those stages are terminal-skipped rather than pending.
+  // Reporting them as pending presented a disabled path as unfinished work.
+  // A closed poll is likewise terminal: a stage that never ran cannot run now.
+  const intentState: ProtocolTimelineStep["state"] = !votingSupported
+    ? "skipped"
+    : isOpen
+      ? "live"
+      : hasIntent
+        ? "completed"
+        : poll.isClosed
+          ? "skipped"
+          : "pending";
+
+  const aggregateState: ProtocolTimelineStep["state"] = !votingSupported
+    ? "skipped"
+    : poll.isClosed
+      ? hasAggregated
+        ? "completed"
+        : // A closed poll that counted nothing never aggregated and never will;
+          // its close transaction already consumed the lane cells.
+          "skipped"
+      : hasPending && progress.allShardsFinalized
+        ? "ended"
+        : hasPending
+          ? "live"
+        : hasAggregated
+          ? "completed"
+          : "pending";
+
+  const finalizeState: ProtocolTimelineStep["state"] = poll.isClosed || progress.allShardsFinalized
+    ? "completed"
+    : isExpired
+      ? "live"
+      : "pending";
+
+  const closeState: ProtocolTimelineStep["state"] = poll.isClosed
+    ? "completed"
+    : isExpired && progress.closeStateReady
+      ? "live"
+      : "pending";
+
+  const steps: ProtocolTimelineStep[] = [
     {
       op: "CREATE_POLL",
       label: "Create poll cell",
-      detail: "Lock creator deposit and initialize governance state.",
-      state: hasPolls ? "completed" : "live",
+      detail: "Creator deposit locked and governance state initialized.",
+      state: "completed",
     },
     {
       op: "CREATE_VOTE_INTENT",
       label: "Record vote intent",
-      detail: "Store independent voter or delegated intent cells.",
-      state: hasIntent ? "completed" : hasSupportedPolls ? "live" : "pending",
+      detail: !votingSupported
+        ? UNSUPPORTED_WEIGHTED_POLL_LABEL
+        : hasIntent
+          ? `${poll.totalVoters.toString()} counted, ${poll.pendingIntentCount.toString()} pending.`
+          : isOpen
+            ? "Voting is open; no intent cells indexed yet."
+            : "No vote intents were recorded before the deadline.",
+      state: intentState,
     },
     {
       op: "CREATE_TALLY_SHARD",
-      label: "Shard aggregation",
-      detail: "Batch pending intents into shard tally state.",
-      state: hasAggregated ? "completed" : hasIntent ? "live" : "pending",
+      label: "Aggregate into lanes",
+      detail: !votingSupported
+        ? "Aggregation is disabled for this recovery-only poll."
+        : hasPending && progress.allShardsFinalized
+          ? `Aggregation ended when all lanes were finalized; ${poll.pendingIntentCount.toString()} indexed timely intent(s) remain uncounted and refundable after close.`
+          : hasPending
+          ? `${poll.pendingIntentCount.toString()} pending intent(s) not yet aggregated.`
+          : hasAggregated
+            ? "All indexed intents are aggregated into tally lanes."
+            : poll.isClosed
+              ? "Nothing was aggregated; this poll closed with no counted votes."
+              : "Nothing to aggregate yet.",
+      state: aggregateState,
     },
     {
-      op: "CLOSE_POLL",
-      label: "Close or recover",
-      detail: "Creator closes after deadline; anyone can force-close after grace.",
-      state: hasClosed ? "completed" : hasExpiredOpen ? "live" : "pending",
-    },
-    {
-      op: "DELEGATE",
-      label: "Delegate authority",
-      detail: "Issue poll-scoped delegation cells for one represented voter.",
-      state: hasDelegation ? "completed" : hasPolls ? "live" : "pending",
-    },
-    {
-      op: "DELEGATE",
-      label: "Revoke delegation",
-      detail: "Delegators consume delegation cells to revoke authority.",
-      state: hasDelegation ? "live" : "pending",
+      op: "CREATE_TALLY_SHARD",
+      label: "Finalize lanes",
+      // A close transaction consumes the lane cells, so a closed poll indexes
+      // zero of them. Reporting the live count there would read "0/8 finalized"
+      // next to a completed state, so describe the outcome instead.
+      detail: poll.isClosed
+        ? "Every lane was finalized before this poll closed."
+        : `${progress.finalizedShardCount.toString()}/${poll.shardCount.toString()} lanes finalized. Up to 8 ordered lanes can finalize in one transaction.`,
+      state: finalizeState,
     },
   ];
+
+  if (progress.requiresMerge) {
+    steps.push({
+      op: "MERGE_TALLY_SHARDS",
+      label: "Merge lanes",
+      detail: progress.hasCompleteMergeResult
+        ? "A complete merge result is indexed."
+        : `Polls above ${MAX_DIRECT_CLOSE_SHARDS.toString()} lanes need one complete merge result before close.`,
+      state: poll.isClosed || progress.hasCompleteMergeResult
+        ? "completed"
+        : isExpired && progress.finalizedShardCount > 0
+          ? "live"
+          : "pending",
+    });
+  }
+
+  steps.push({
+    op: "CLOSE_POLL",
+    label: "Close or recover",
+    detail: poll.isClosed
+      ? "Poll is closed and deposits were returned by the close transaction."
+      : isExpired
+        ? progress.closeStateReady
+          ? "Tally state is ready; close can run now."
+          : "Close is blocked until every lane is finalized."
+        : `Close becomes valid after epoch ${poll.deadline.toString()}.`,
+    state: closeState,
+  });
+
+  return steps;
 }

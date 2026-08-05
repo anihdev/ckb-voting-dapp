@@ -9,27 +9,29 @@ use alloc::vec::Vec;
 use ckb_std::{
     ckb_constants::Source,
     error::SysError,
-    high_level::{load_cell_capacity, load_cell_data, load_cell_type_hash},
+    high_level::{load_cell_capacity, load_cell_data, load_cell_type_hash, load_witness_args},
     type_id::check_type_id,
 };
+use sparse_merkle_tree::{SMTBuilder, H256};
 
 use crate::{
     codec::{
-        decode_delegation, decode_poll, decode_tally_merge_result, decode_tally_shard,
-        decode_vote_intent, EncodedScript, PollData, TallyMergeResultData, TallyShardData,
+        decode_delegation, decode_poll, decode_tally_aggregation_proof, decode_tally_merge_result,
+        decode_tally_shard, decode_vote_intent, EncodedScript, PollData, TallyMergeResultData,
+        TallyShardData,
     },
     constants::*,
     error::Error,
     helpers::{
         assert_condition, compare_arrays, compare_scripts, compare_slice_items, compare_vec_bytes,
-        count_unique_counted_voters, count_unique_shard_voters, derive_tally_shard_id,
-        first_input_type_byte, load_cell_dep_lock_hash_bytes, load_cell_dep_script,
-        load_cell_dep_type_script, load_current_script, load_group_input_script,
-        load_group_output_script, load_input_capacity, load_input_creation_epoch,
-        load_input_lock_hash_bytes, load_input_script, load_input_type_hash_bytes,
-        load_input_type_script, load_output_capacity, load_output_lock_hash_bytes,
-        load_output_script, load_output_type_hash_bytes, load_output_type_script,
-        min_poll_capacity, require_input_since_strictly_after, validate_deadline_epoch,
+        count_unique_counted_voters, derive_tally_shard_id, first_input_type_byte,
+        load_cell_dep_lock_hash_bytes, load_cell_dep_script, load_cell_dep_type_script,
+        load_current_script, load_group_input_script, load_group_output_script,
+        load_input_capacity, load_input_creation_epoch, load_input_lock_hash_bytes,
+        load_input_script, load_input_type_hash_bytes, load_input_type_script,
+        load_output_capacity, load_output_lock_hash_bytes, load_output_script,
+        load_output_type_hash_bytes, load_output_type_script, min_poll_capacity,
+        require_input_since_strictly_after, validate_deadline_epoch,
     },
 };
 
@@ -900,11 +902,7 @@ fn assert_initial_tally_shard_data(
     assert_condition(shard.shard_id == expected_shard_id, Error::Validation)?;
     assert_condition(!shard.finalized, Error::Validation)?;
     assert_condition(shard.total_voters == 0, Error::Validation)?;
-    assert_condition(
-        shard.counted_voter_lock_hashes.is_empty(),
-        Error::Validation,
-    )?;
-    assert_condition(count_unique_shard_voters(shard), Error::Validation)?;
+    assert_condition(shard.counted_voter_root == [0u8; 32], Error::Validation)?;
     assert_condition(
         shard.vote_counts.len() == poll.options.len(),
         Error::Validation,
@@ -1096,15 +1094,16 @@ fn validate_create_tally_shard() -> Result<(), Error> {
 fn assert_tally_shard_group_update_policy(
     before: &TallyShardData,
     after: &TallyShardData,
-) -> Result<(PollData, [u8; 32], u32), Error> {
+) -> Result<(PollData, [u8; 32], u32, usize), Error> {
     let current_script = load_current_script()?;
     let input_lock = load_group_input_script(0)?;
     let output_lock = load_group_output_script(0)?;
     let input_capacity = load_cell_capacity(0, Source::GroupInput)?;
     let output_capacity = load_cell_capacity(0, Source::GroupOutput)?;
     let (script_poll_type_hash, script_shard_id) = parse_tally_shard_scope(&current_script)?;
-    let global_input_type = load_input_type_script(0)?;
-    let global_output_type = load_output_type_script(0)?;
+    let global_index = find_current_type_input_index(&current_script)?;
+    let global_input_type = load_input_type_script(global_index)?;
+    let global_output_type = load_output_type_script(global_index)?;
 
     assert_condition(
         compare_scripts(&global_input_type, &current_script),
@@ -1159,6 +1158,7 @@ fn assert_tally_shard_group_update_policy(
     assert_condition(poll.shard_count == before.shard_count, Error::Validation)?;
     assert_condition(before.shard_count == after.shard_count, Error::Validation)?;
     assert_condition(before.shard_id == after.shard_id, Error::Validation)?;
+    assert_condition(before.version == after.version, Error::Validation)?;
     assert_condition(
         before.vote_counts.len() == poll.options.len(),
         Error::Validation,
@@ -1167,25 +1167,76 @@ fn assert_tally_shard_group_update_policy(
         after.vote_counts.len() == before.vote_counts.len(),
         Error::Validation,
     )?;
-    assert_condition(
-        before.total_voters == before.counted_voter_lock_hashes.len() as u64,
-        Error::Validation,
-    )?;
-    assert_condition(count_unique_shard_voters(before), Error::Validation)?;
-    assert_condition(count_unique_shard_voters(after), Error::Validation)?;
+    Ok((poll, script_poll_type_hash, script_shard_id, global_index))
+}
 
-    Ok((poll, script_poll_type_hash, script_shard_id))
+/// Locate the exact global input represented by the current one-cell type group.
+/// Multi-lane finalization gives every lane distinct script args, so every group
+/// sees itself at group index zero but may live at any global input index.
+fn find_current_type_input_index(current_script: &EncodedScript) -> Result<usize, Error> {
+    let mut matched = None;
+    let mut index = 0usize;
+    loop {
+        match load_cell_data(index, Source::Input) {
+            Ok(_) => {
+                if let Ok(input_type) = load_input_type_script(index) {
+                    if compare_scripts(&input_type, current_script) {
+                        assert_condition(matched.is_none(), Error::Validation)?;
+                        matched = Some(index);
+                    }
+                }
+                index = index.checked_add(1).ok_or(Error::Validation)?;
+            }
+            Err(SysError::IndexOutOfBound) => return matched.ok_or(Error::Validation),
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn verify_counted_voter_root_transition(
+    before_root: &[u8; 32],
+    after_root: &[u8; 32],
+    voter_keys: &[[u8; 32]],
+) -> Result<(), Error> {
+    let witness = load_witness_args(0, Source::Input)?;
+    let input_type = witness.input_type().to_opt().ok_or(Error::Validation)?;
+    let proof = decode_tally_aggregation_proof(&input_type.raw_data())?;
+
+    // One compiled multiproof authenticates both sides of the state transition:
+    // every intent key is absent from the old tree and present in the new tree.
+    let mut absent = SMTBuilder::new();
+    let mut present = SMTBuilder::new();
+    let present_value = H256::from(COUNTED_VOTER_PRESENT_VALUE);
+    for voter_key in voter_keys {
+        let key = H256::from(*voter_key);
+        absent = absent
+            .insert(&key, &H256::zero())
+            .map_err(|_| Error::Validation)?;
+        present = present
+            .insert(&key, &present_value)
+            .map_err(|_| Error::Validation)?;
+    }
+    absent
+        .build()
+        .map_err(|_| Error::Validation)?
+        .verify(&H256::from(*before_root), &proof.compiled_proof)
+        .map_err(|_| Error::Validation)?;
+    present
+        .build()
+        .map_err(|_| Error::Validation)?
+        .verify(&H256::from(*after_root), &proof.compiled_proof)
+        .map_err(|_| Error::Validation)
 }
 
 fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Error> {
     let before = decode_tally_shard(input)?;
     let after = decode_tally_shard(output)?;
-    let (poll, _, _) = assert_tally_shard_group_update_policy(&before, &after)?;
+    let (poll, _, _, global_lane_index) = assert_tally_shard_group_update_policy(&before, &after)?;
+    assert_condition(global_lane_index == 0, Error::Validation)?;
     assert_condition(!poll.token_weighted, Error::Validation)?;
     assert_condition(!before.finalized, Error::Validation)?;
     assert_condition(!after.finalized, Error::Validation)?;
 
-    let mut seen_voters = before.counted_voter_lock_hashes.clone();
     let mut batch_voters: Vec<[u8; 32]> = Vec::new();
     let mut deltas = alloc::vec![0u64; before.vote_counts.len()];
     let mut matched_intents = 0usize;
@@ -1271,7 +1322,7 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
         )?;
         assert_condition(derived_shard_id == before.shard_id, Error::Validation)?;
         assert_condition(
-            !seen_voters
+            !batch_voters
                 .iter()
                 .any(|existing| existing == &before_intent.voter_lock_hash),
             Error::Validation,
@@ -1281,7 +1332,6 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
         deltas[option_index] = deltas[option_index]
             .checked_add(1)
             .ok_or(Error::Validation)?;
-        seen_voters.push(before_intent.voter_lock_hash);
         batch_voters.push(before_intent.voter_lock_hash);
         matched_intents += 1;
         assert_condition(matched_intents <= MAX_INTENTS_PER_AGG, Error::Validation)?;
@@ -1289,24 +1339,11 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
     }
 
     assert_condition(matched_intents > 0, Error::Validation)?;
-    assert_condition(
-        after.counted_voter_lock_hashes.len()
-            == before.counted_voter_lock_hashes.len() + batch_voters.len(),
-        Error::Validation,
+    verify_counted_voter_root_transition(
+        &before.counted_voter_root,
+        &after.counted_voter_root,
+        &batch_voters,
     )?;
-    for (index, voter) in before.counted_voter_lock_hashes.iter().enumerate() {
-        assert_condition(
-            compare_arrays(&after.counted_voter_lock_hashes[index], voter),
-            Error::Validation,
-        )?;
-    }
-    for (offset, voter) in batch_voters.iter().enumerate() {
-        let next_index = before.counted_voter_lock_hashes.len() + offset;
-        assert_condition(
-            compare_arrays(&after.counted_voter_lock_hashes[next_index], voter),
-            Error::Validation,
-        )?;
-    }
     for (index, previous_count) in before.vote_counts.iter().enumerate() {
         let expected = previous_count
             .checked_add(deltas[index])
@@ -1318,32 +1355,160 @@ fn validate_aggregate_tally_shard(input: &[u8], output: &[u8]) -> Result<(), Err
         .total_voters
         .checked_add(u64::try_from(matched_intents).map_err(|_| Error::Validation)?)
         .ok_or(Error::Validation)?;
-    assert_condition(after.total_voters == expected_total, Error::Validation)?;
-    assert_condition(
-        after.total_voters == after.counted_voter_lock_hashes.len() as u64,
-        Error::Validation,
-    )
+    assert_condition(after.total_voters == expected_total, Error::Validation)
 }
 
 fn validate_finalize_tally_shard(
     before: &TallyShardData,
     after: &TallyShardData,
 ) -> Result<(), Error> {
-    assert_tally_shard_group_update_policy(before, after)?;
-    let poll = ensure_poll_dep_unclosed(&before.poll_type_hash)?;
+    let (_, _, _, current_global_index) = assert_tally_shard_group_update_policy(before, after)?;
+    validate_finalize_tally_shard_batch(current_global_index)
+}
 
-    assert_condition(!before.finalized, Error::Validation)?;
-    assert_condition(after.finalized, Error::Validation)?;
-    require_input_since_strictly_after(0, poll.deadline)?;
+fn validate_finalize_tally_shard_batch(current_global_index: usize) -> Result<(), Error> {
+    let current_script = load_current_script()?;
+    let mut lane_count = 0usize;
+    let mut expected_poll_hash: Option<[u8; 32]> = None;
+    let mut previous_shard_id: Option<u32> = None;
+    let mut current_group_seen = false;
+    let mut index = 0usize;
+
+    loop {
+        let input_data = match load_cell_data(index, Source::Input) {
+            Ok(data) => data,
+            Err(SysError::IndexOutOfBound) => break,
+            Err(err) => return Err(err.into()),
+        };
+        let input_type = match load_input_type_script(index) {
+            Ok(script) => script,
+            Err(Error::Validation) => {
+                index += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let shard_id = match read_shard_id_from_tally_script(&input_type)? {
+            Some(shard_id) => shard_id,
+            None => {
+                index += 1;
+                continue;
+            }
+        };
+
+        // Protocol lanes form one ordered prefix. Wallet fee inputs may follow,
+        // but cannot be interleaved with or placed before a lane in this batch.
+        assert_condition(index == lane_count, Error::Validation)?;
+        lane_count = lane_count.checked_add(1).ok_or(Error::Validation)?;
+        assert_condition(lane_count <= MAX_SHARDS_PER_FINALIZE, Error::Validation)?;
+        if index == current_global_index {
+            current_group_seen = true;
+        }
+
+        let output_data = load_cell_data(index, Source::Output)?;
+        let output_type = load_output_type_script(index)?;
+        let input_lock = load_input_script(index)?;
+        let output_lock = load_output_script(index)?;
+        let before_lane = decode_tally_shard(&input_data)?;
+        let after_lane = decode_tally_shard(&output_data)?;
+        let (poll_hash, script_shard_id) = parse_tally_shard_scope(&input_type)?;
+
+        assert_condition(
+            compare_scripts(&input_type, &output_type),
+            Error::Validation,
+        )?;
+        assert_condition(
+            compare_scripts(&input_lock, &output_lock),
+            Error::Validation,
+        )?;
+        assert_condition(
+            load_input_capacity(index)? == load_output_capacity(index)?,
+            Error::Validation,
+        )?;
+        assert_condition(script_shard_id == shard_id, Error::Validation)?;
+        assert_tally_shard_script_policy(&input_lock, &input_type, &poll_hash, shard_id)?;
+        assert_condition(
+            !before_lane.finalized && after_lane.finalized,
+            Error::Validation,
+        )?;
+        assert_condition(before_lane.version == after_lane.version, Error::Validation)?;
+        assert_condition(
+            before_lane.poll_type_hash == after_lane.poll_type_hash,
+            Error::Validation,
+        )?;
+        assert_condition(before_lane.poll_type_hash == poll_hash, Error::Validation)?;
+        assert_condition(
+            before_lane.shard_id == shard_id && after_lane.shard_id == shard_id,
+            Error::Validation,
+        )?;
+        assert_condition(
+            before_lane.shard_count == after_lane.shard_count,
+            Error::Validation,
+        )?;
+        assert_condition(
+            before_lane.vote_counts == after_lane.vote_counts,
+            Error::Validation,
+        )?;
+        assert_condition(
+            before_lane.total_voters == after_lane.total_voters,
+            Error::Validation,
+        )?;
+        assert_condition(
+            before_lane.counted_voter_root == after_lane.counted_voter_root,
+            Error::Validation,
+        )?;
+
+        if let Some(expected) = expected_poll_hash {
+            assert_condition(expected == poll_hash, Error::Validation)?;
+        } else {
+            expected_poll_hash = Some(poll_hash);
+        }
+        if let Some(previous) = previous_shard_id {
+            assert_condition(shard_id > previous, Error::Validation)?;
+        }
+        previous_shard_id = Some(shard_id);
+
+        let poll = ensure_poll_dep_unclosed(&poll_hash)?;
+        assert_condition(
+            before_lane.shard_count == poll.shard_count,
+            Error::Validation,
+        )?;
+        assert_condition(
+            before_lane.vote_counts.len() == poll.options.len(),
+            Error::Validation,
+        )?;
+        require_input_since_strictly_after(index, poll.deadline)?;
+        index += 1;
+    }
+
+    assert_condition(lane_count > 0, Error::Validation)?;
+    assert_condition(current_group_seen, Error::Validation)?;
+    let poll_hash = expected_poll_hash.ok_or(Error::Validation)?;
+    assert_no_matching_poll_input(&poll_hash)?;
+
+    // No extra current-code tally output may be hidden after the protocol
+    // prefix. This closes the same-index bypass and duplicate-output surfaces.
+    let mut output_index = 0usize;
+    loop {
+        match load_cell_data(output_index, Source::Output) {
+            Ok(_) => {
+                if let Ok(output_type) = load_output_type_script(output_index) {
+                    if read_shard_id_from_tally_script(&output_type)?.is_some() {
+                        assert_condition(output_index < lane_count, Error::Validation)?;
+                    }
+                }
+                output_index += 1;
+            }
+            Err(SysError::IndexOutOfBound) => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    // Every invocation must correspond to one of the exact same-index lanes.
     assert_condition(
-        compare_slice_items(&after.vote_counts, &before.vote_counts),
-        Error::Validation,
-    )?;
-    assert_condition(after.total_voters == before.total_voters, Error::Validation)?;
-    assert_condition(
-        compare_slice_items(
-            &after.counted_voter_lock_hashes,
-            &before.counted_voter_lock_hashes,
+        compare_scripts(
+            &load_input_type_script(current_global_index)?,
+            &current_script,
         ),
         Error::Validation,
     )
@@ -1559,11 +1724,6 @@ fn validate_merge_tally_shards(output: &[u8]) -> Result<(), Error> {
                     shard.vote_counts.len() == poll.options.len(),
                     Error::Validation,
                 )?;
-                assert_condition(
-                    shard.total_voters == shard.counted_voter_lock_hashes.len() as u64,
-                    Error::Validation,
-                )?;
-                assert_condition(count_unique_shard_voters(&shard), Error::Validation)?;
                 assert_tally_shard_script_policy(
                     &input_lock,
                     &input_type,
@@ -1799,11 +1959,6 @@ fn validate_sharded_close_result(
         assert_condition(shard.finalized, Error::Validation)?;
         assert_condition(
             shard.vote_counts.len() == before.options.len(),
-            Error::Validation,
-        )?;
-        assert_condition(count_unique_shard_voters(&shard), Error::Validation)?;
-        assert_condition(
-            shard.total_voters == shard.counted_voter_lock_hashes.len() as u64,
             Error::Validation,
         )?;
         assert_condition(

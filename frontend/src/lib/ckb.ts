@@ -12,6 +12,8 @@ import {
   DELEGATION_MIN_SHANNONS,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
+  MAX_INTENTS_PER_AGG,
+  MAX_SHARDS_PER_FINALIZE,
   MAX_SHARDS_PER_MERGE,
   MAX_TALLY_SHARDS,
   MERGE_COVERAGE_BYTES,
@@ -39,12 +41,14 @@ import {
   decodePollData,
   encodeTallyShardData,
   decodeTallyShardData,
+  encodeTallyAggregationProof,
   encodeTallyMergeResultData,
   decodeTallyMergeResultData,
   decodeVoteIntentData,
   encodeVoteIntentData,
   utf8ByteLength,
 } from "./molecule";
+import { buildTallySmtTransition } from "./tallySmt";
 
 const SCRIPT_HASH_TYPE = "data1";
 const ZERO_HASH_32 = `0x${"00".repeat(32)}`;
@@ -70,6 +74,8 @@ export {
   TALLY_SHARD_MIN_SHANNONS,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
+  MAX_INTENTS_PER_AGG,
+  MAX_SHARDS_PER_FINALIZE,
   MAX_SHARDS_PER_MERGE,
   MAX_TALLY_SHARDS,
   MERGE_COVERAGE_BYTES,
@@ -468,12 +474,13 @@ export async function buildCreatePollTx(
   const shardOutputs = Array.from({ length: shardCount }, (_, shardId) => {
     const shardScript = buildTallyShardTypeScript(pollTypeHash, shardId);
     const shardData = encodeTallyShardData({
+      version: 2,
       poll_type_hash: (ccc as any).bytesFrom(pollTypeHash),
       shard_id: shardId,
       shard_count: shardCount,
       vote_counts: input.options.map(() => 0n),
       total_voters: 0n,
-      counted_voter_lock_hashes: [],
+      counted_voter_root: new Uint8Array(32),
       finalized: false,
     });
     const shardCapacity = [
@@ -635,16 +642,23 @@ export async function buildCreateVoteIntentTx(
 
 /**
  * @notice Builds a DELEGATE transaction.
- * @dev Creates a delegation cell scoped to all polls or one poll type hash.
+ * @dev Creates a delegation cell scoped to exactly one poll type hash.
  */
 export async function buildDelegateTx(
   signer: any,
   input: {
     delegateLockHash: string;
-    pollTypeHash?: string;
+    pollTypeHash: string;
     forbiddenDelegateLockHash?: string;
   }
 ): Promise<any> {
+  const pollTypeHash = input.pollTypeHash.trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(pollTypeHash)) {
+    throw new Error("Delegation poll scope must be a 32-byte type hash");
+  }
+  if (pollTypeHash.toLowerCase() === ZERO_HASH_HEX.toLowerCase()) {
+    throw new Error("New global delegations are disabled; select one poll");
+  }
   const signerAddress = await getSignerAddressObj(signer);
   const delegatorLockHash = await getSignerLockHash(signer);
   const delegateLockHash = await resolveDelegateLockHash(signer, input.delegateLockHash);
@@ -663,10 +677,10 @@ export async function buildDelegateTx(
   const delegationData = encodeDelegationData({
     delegator_lock_hash: delegatorLockHash,
     delegate_lock_hash: (ccc as any).bytesFrom(delegateLockHash),
-    poll_type_hash: (ccc as any).bytesFrom(input.pollTypeHash ?? ZERO_HASH_HEX),
+    poll_type_hash: (ccc as any).bytesFrom(pollTypeHash),
     expires_epoch: 0n,
   });
-  const delegationType = buildGovernanceTypeScript(OP.DELEGATE, input.pollTypeHash ?? ZERO_HASH_HEX);
+  const delegationType = buildGovernanceTypeScript(OP.DELEGATE, pollTypeHash);
   const delegationCapacity = estimateOutputCapacity(signerAddress.script, delegationType, delegationData.length);
 
   const tx = (ccc as any).Transaction.from({
@@ -883,21 +897,31 @@ function setProtocolInputSince(
   tx: any,
   expectedOutPointKey: string,
   since: bigint,
-  context: string
+  context: string,
+  inputIndex = 0
 ): void {
-  assertPinnedInputs(tx, [expectedOutPointKey], context);
-  tx.inputs[0].since = since;
-  assertProtocolInputSince(tx, expectedOutPointKey, since, context);
+  const input = tx.inputs?.[inputIndex];
+  const previousOutput = input?.previousOutput ?? input?.previous_output;
+  if (!previousOutput || outPointKeyFromOutPoint(previousOutput) !== expectedOutPointKey) {
+    throw new Error(`${context} input layout changed after fee completion at input ${inputIndex}`);
+  }
+  tx.inputs[inputIndex].since = since;
+  assertProtocolInputSince(tx, expectedOutPointKey, since, context, inputIndex);
 }
 
 function assertProtocolInputSince(
   tx: any,
   expectedOutPointKey: string,
   expectedSince: bigint,
-  context: string
+  context: string,
+  inputIndex = 0
 ): void {
-  assertPinnedInputs(tx, [expectedOutPointKey], context);
-  if (BigInt(tx.inputs[0].since) !== expectedSince) {
+  const input = tx.inputs?.[inputIndex];
+  const previousOutput = input?.previousOutput ?? input?.previous_output;
+  if (!previousOutput || outPointKeyFromOutPoint(previousOutput) !== expectedOutPointKey) {
+    throw new Error(`${context} input layout changed after fee completion at input ${inputIndex}`);
+  }
+  if (BigInt(tx.inputs[inputIndex].since) !== expectedSince) {
     throw new Error(`${context} protocol input since changed after completion`);
   }
 }
@@ -945,7 +969,12 @@ export function deduplicateHeaderHashes(headers: Array<{ hash: string }>): strin
  */
 export async function buildAggregateTallyShardTx(
   signer: any,
-  input: { pollCell: any; shardCell: any; intentCells: any[] }
+  input: {
+    pollCell: any;
+    shardCell: any;
+    intentCells: any[];
+    aggregatedMarkerCells?: any[];
+  }
 ): Promise<any> {
   const pollOutput = getCellOutput(input.pollCell);
   const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
@@ -982,7 +1011,27 @@ export async function buildAggregateTallyShardTx(
     throw new Error("Shard type does not match governance shard policy");
   }
 
-  const seenVoters = new Set(shardData.counted_voter_lock_hashes.map((hash) => bytesToHex(hash).toLowerCase()));
+  if (input.intentCells.length > MAX_INTENTS_PER_AGG) {
+    throw new Error(`Aggregation can consume at most ${MAX_INTENTS_PER_AGG} intents per transaction`);
+  }
+
+  const existingVoters = (input.aggregatedMarkerCells ?? []).map((cell) => {
+    const marker = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+    if (!marker.aggregated) throw new Error("Counted-voter reconstruction received a pending intent");
+    if (bytesToHex(marker.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
+      throw new Error("Counted-voter marker belongs to another poll");
+    }
+    const markerShardId = deriveTallyShardId(
+      marker.poll_type_hash,
+      marker.voter_lock_hash,
+      shardData.shard_count
+    );
+    if (markerShardId !== shardData.shard_id) {
+      throw new Error("Counted-voter marker belongs to another tally lane");
+    }
+    return marker.voter_lock_hash;
+  });
+  const seenVoters = new Set(existingVoters.map((hash) => bytesToHex(hash).toLowerCase()));
   const nextVoteCounts = [...shardData.vote_counts];
   const appendedVoters: Uint8Array[] = [];
   const intentOrigins = await Promise.all(
@@ -1036,13 +1085,27 @@ export async function buildAggregateTallyShardTx(
     throw new Error("No pending intent cells to aggregate for this shard");
   }
 
+  // Flow: reconstruct the committed set from live aggregated markers, prove
+  // the selected pending voters were absent, then commit their present leaves.
+  const transition = await buildTallySmtTransition({
+    expectedBeforeRoot: shardData.counted_voter_root,
+    existingVoterKeys: existingVoters,
+    pendingVoterKeys: appendedVoters,
+  });
+
   const updatedShard = encodeTallyShardData({
     ...shardData,
     vote_counts: nextVoteCounts,
     total_voters: shardData.total_voters + BigInt(nextIntentOutputs.length),
-    counted_voter_lock_hashes: [...shardData.counted_voter_lock_hashes, ...appendedVoters],
+    counted_voter_root: transition.afterRoot,
     finalized: false,
   });
+  const proofWitness = (ccc as any).WitnessArgs.from({
+    inputType: encodeTallyAggregationProof({
+      version: 1,
+      compiled_proof: transition.compiledProof,
+    }),
+  }).toBytes();
 
   const tx = (ccc as any).Transaction.from({
     cellDeps: [
@@ -1068,7 +1131,7 @@ export async function buildAggregateTallyShardTx(
       ...nextIntentOutputs.map((item) => item.output),
     ],
     outputsData: [bytesToHex(updatedShard), ...nextIntentOutputs.map((item) => item.data)],
-    witnesses: new Array(input.intentCells.length + 1).fill("0x"),
+    witnesses: [proofWitness, ...new Array(input.intentCells.length).fill("0x")],
   });
 
   const aggregatePinnedKeys = [
@@ -1216,36 +1279,60 @@ export async function buildFinalizeTallyShardTx(
   signer: any,
   input: { pollCell: any; shardCell: any }
 ): Promise<any> {
+  return buildFinalizeTallyShardsTx(signer, {
+    pollCell: input.pollCell,
+    shardCells: [input.shardCell],
+  });
+}
+
+/**
+ * @notice Finalizes one bounded batch of tally lanes in one transaction.
+ * @dev Lanes occupy the ordered input/output prefix and every protocol input
+ * carries the same absolute-epoch lower bound. The wallet signs this tx once.
+ */
+export async function buildFinalizeTallyShardsTx(
+  signer: any,
+  input: { pollCell: any; shardCells: any[] }
+): Promise<any> {
   const currentEpoch = await getTipEpoch(signer.client);
   const pollOutput = getCellOutput(input.pollCell);
   const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const pollTypeHash = hashScript(pollOutput.type);
-  const shardData = decodeTallyShardData((ccc as any).bytesFrom(input.shardCell.outputData ?? "0x"));
-  const shardScript = buildTallyShardTypeScript(pollTypeHash, shardData.shard_id);
 
   if (pollData.is_closed) throw new Error("Poll is already closed");
-  if (currentEpoch <= pollData.deadline) throw new Error("Shard cannot be finalized before poll deadline");
-  if (bytesToHex(shardData.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
-    throw new Error("Shard cell does not belong to the selected poll");
+  if (currentEpoch <= pollData.deadline) throw new Error("Tally lanes cannot be finalized before poll deadline");
+  if (input.shardCells.length === 0) throw new Error("No unfinalized tally lanes selected");
+  if (input.shardCells.length > MAX_SHARDS_PER_FINALIZE) {
+    throw new Error(`Finalization can consume at most ${MAX_SHARDS_PER_FINALIZE} lanes per transaction`);
   }
-  if (shardData.shard_count !== pollData.shard_count) {
-    throw new Error("Shard count does not match poll configuration");
-  }
-  if (shardData.finalized) {
-    throw new Error("Shard is already finalized");
-  }
-  if (scriptKey(getCellLock(input.shardCell)) !== scriptKey(shardScript)) {
-    throw new Error("Shard lock does not match governance shard policy");
-  }
-  if (scriptKey(getCellType(input.shardCell)) !== scriptKey(shardScript)) {
-    throw new Error("Shard type does not match governance shard policy");
-  }
-  const requiredSince = absoluteEpochSince(pollData.deadline + 1n);
 
-  const finalizedShard = encodeTallyShardData({
-    ...shardData,
-    finalized: true,
+  const ordered = [...input.shardCells].sort((left, right) => {
+    const leftData = decodeTallyShardData((ccc as any).bytesFrom(left.outputData ?? "0x"));
+    const rightData = decodeTallyShardData((ccc as any).bytesFrom(right.outputData ?? "0x"));
+    return leftData.shard_id - rightData.shard_id;
   });
+  const seenShardIds = new Set<number>();
+  const lanes = ordered.map((cell) => {
+    const shardData = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+    const shardScript = buildTallyShardTypeScript(pollTypeHash, shardData.shard_id);
+    if (seenShardIds.has(shardData.shard_id)) throw new Error("Duplicate tally lane selected");
+    seenShardIds.add(shardData.shard_id);
+    if (bytesToHex(shardData.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
+      throw new Error("Tally lane does not belong to the selected poll");
+    }
+    if (shardData.shard_count !== pollData.shard_count) {
+      throw new Error("Tally lane count does not match poll configuration");
+    }
+    if (shardData.finalized) throw new Error("Tally lane is already finalized");
+    if (scriptKey(getCellLock(cell)) !== scriptKey(shardScript)) {
+      throw new Error("Tally lane lock does not match governance policy");
+    }
+    if (scriptKey(getCellType(cell)) !== scriptKey(shardScript)) {
+      throw new Error("Tally lane type does not match governance policy");
+    }
+    return { cell, shardData };
+  });
+  const requiredSince = absoluteEpochSince(pollData.deadline + 1n);
   const tx = (ccc as any).Transaction.from({
     cellDeps: [
       buildGovernanceCellDep(),
@@ -1254,35 +1341,32 @@ export async function buildFinalizeTallyShardTx(
         depType: "code",
       },
     ],
-    inputs: [{ previousOutput: getOutPoint(input.shardCell) }],
-    outputs: [
-      {
-        lock: getCellLock(input.shardCell),
-        type: getCellType(input.shardCell),
-        capacity: getCellCapacity(input.shardCell),
-      },
-    ],
-    outputsData: [bytesToHex(finalizedShard)],
-    witnesses: ["0x"],
+    // Flow: all protocol lanes remain one ordered prefix; CCC may only append
+    // wallet fee inputs/change after these pinned cells.
+    inputs: lanes.map(({ cell }) => ({ previousOutput: getOutPoint(cell) })),
+    outputs: lanes.map(({ cell }) => ({
+      lock: getCellLock(cell),
+      type: getCellType(cell),
+      capacity: getCellCapacity(cell),
+    })),
+    outputsData: lanes.map(({ shardData }) => bytesToHex(encodeTallyShardData({
+      ...shardData,
+      finalized: true,
+    }))),
+    witnesses: new Array(lanes.length).fill("0x"),
   });
 
-  const finalizePinnedKeys = [outPointKey(input.shardCell)];
+  const finalizePinnedKeys = lanes.map(({ cell }) => outPointKey(cell));
   await tx.completeInputsByCapacity(signer);
   assertPinnedInputs(tx, finalizePinnedKeys, "CREATE_TALLY_SHARD finalization");
-  setProtocolInputSince(
-    tx,
-    finalizePinnedKeys[0],
-    requiredSince,
-    "CREATE_TALLY_SHARD finalization"
-  );
+  for (const [index, key] of finalizePinnedKeys.entries()) {
+    setProtocolInputSince(tx, key, requiredSince, "CREATE_TALLY_SHARD finalization", index);
+  }
   await tx.completeFeeBy(signer, 1000);
   assertPinnedInputs(tx, finalizePinnedKeys, "CREATE_TALLY_SHARD finalization");
-  assertProtocolInputSince(
-    tx,
-    finalizePinnedKeys[0],
-    requiredSince,
-    "CREATE_TALLY_SHARD finalization"
-  );
+  for (const [index, key] of finalizePinnedKeys.entries()) {
+    assertProtocolInputSince(tx, key, requiredSince, "CREATE_TALLY_SHARD finalization", index);
+  }
   return tx;
 }
 

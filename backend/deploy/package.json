@@ -6,6 +6,7 @@
   },
   "scripts": {
     "deploy": "ts-node -P tsconfig.json deploy.ts",
+    "roles": "ts-node -P tsconfig.json role-balances.ts",
     "seed": "ts-node -P tsconfig.json seed.ts",
     "smoke": "ts-node -P tsconfig.json smoke.ts",
     "setup:multi": "ts-node -P tsconfig.json setup-multi-actors.ts",

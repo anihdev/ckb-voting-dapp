@@ -12,6 +12,7 @@ dist/
 build/
 backend/contracts-rust/target/
 frontend/src/dist/
+frontend/tally-smt-wasm/target/
 .cache/
 .turbo/
 .ts-node/
@@ -57,6 +58,7 @@ Thumbs.db
 # Documentation
 *.md
 !README.md
+!CLAUDE.md
 z_contracts/
 !ckb_weekly_update.md
 !phase_b_weekly_update.md
@@ -66,3 +68,5 @@ z_contracts/
 !June_sdk2_4th_weekly_update.md
 !SHARDED_AGGREGATION_EXPLAINED.md
 !OFFICIAL_DAO_BUILDER_SDK_GRANT_PROPOSAL.md
+!Governance_Ui_Clarity.md
+!Tally_lane_Sparse-merkle_ImplL.md

@@ -4,19 +4,14 @@
  * Lists polls with lifecycle-aware filtering and archive access.
  */
 
-import React, { useState } from "react";
+import { useState } from "react";
 import { Poll, TxState } from "../lib/types";
 import { VoteOnPoll } from "./VoteOnPoll";
 import {
   filterPollsByLifecycle,
   EpochPosition,
-  estimatePollCloseHours,
-  formatApproxWallClockDuration,
   getPollFilterCounts,
-  getPollLifecycleStatus,
-  isPollVotingSupported,
   PollLifecycleFilter,
-  UNSUPPORTED_WEIGHTED_POLL_LABEL,
 } from "../lib/protocolUi";
 
 interface Props {
@@ -27,11 +22,13 @@ interface Props {
   voterAddress: string | null;
   voterLockHash: string | null;
   txState: TxState;
+  actionInFlight: boolean;
   currentEpoch: bigint;
   currentEpochPosition?: EpochPosition;
   onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
   onFinalizeShards: (poll: Poll) => Promise<string>;
+  onFinalizeAllShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
@@ -50,11 +47,13 @@ export function PollList({
   voterAddress,
   voterLockHash,
   txState,
+  actionInFlight,
   currentEpoch,
   currentEpochPosition,
   onVote,
   onAggregate,
   onFinalizeShards,
+  onFinalizeAllShards,
   onMergeShards,
   onClose,
   onForceClose,
@@ -65,43 +64,12 @@ export function PollList({
   onDelegateForPoll,
 }: Props) {
   const [filter, setFilter] = useState<PollLifecycleFilter>("open");
-  const [copiedPollId, setCopiedPollId] = useState<string | null>(null);
   const isInitialLoading = loading && polls.length === 0;
   const isRefreshing = loading || refreshing;
   const hasNoPolls = polls.length === 0;
 
-  const copyPollId = async (pollId: string) => {
-    try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(pollId);
-      } else if (typeof document !== "undefined") {
-        const tempInput = document.createElement("textarea");
-        tempInput.value = pollId;
-        tempInput.style.position = "fixed";
-        tempInput.style.opacity = "0";
-        document.body.appendChild(tempInput);
-        tempInput.focus();
-        tempInput.select();
-        document.execCommand("copy");
-        document.body.removeChild(tempInput);
-      } else {
-        throw new Error("Clipboard not available");
-      }
-      setCopiedPollId(pollId);
-      setTimeout(() => {
-        setCopiedPollId((active) => (active === pollId ? null : active));
-      }, 1800);
-    } catch {
-      setCopiedPollId(null);
-    }
-  };
-
   const filteredPolls = filterPollsByLifecycle(polls, filter, currentEpoch);
   const filterCounts = getPollFilterCounts(polls, currentEpoch);
-
-  const pollStatus = (poll: Poll): "open" | "needsClose" | "archived" => {
-    return getPollLifecycleStatus(poll, currentEpoch);
-  };
 
   const pollAnchorId = (poll: Poll) =>
     `poll-${poll.id.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24)}-${poll.outPoint.index}`;
@@ -245,88 +213,6 @@ export function PollList({
             {" "}
             Closed polls are archived by default but remain accessible from the Archived or All tabs.
           </div>
-          <div className="table-shell">
-            <div className="table-mobile-hint">Swipe horizontally to copy Poll ID.</div>
-            <table className="table-grid">
-              <thead>
-                <tr>
-                  <th>Question</th>
-                  <th>Status</th>
-                  <th>Window</th>
-                  <th>Tally</th>
-                  <th>Pending Intents</th>
-                  <th>Mode</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredPolls.map((poll) => {
-                  const status = pollStatus(poll);
-                  const anchorId = pollAnchorId(poll);
-                  const estimatedTimeToClose = formatApproxWallClockDuration(
-                    estimatePollCloseHours(
-                      poll.deadline,
-                      currentEpochPosition ?? { epoch: currentEpoch, index: 0n, length: 1n }
-                    )
-                  );
-                  return (
-                    <tr key={`row-${poll.id}`}>
-                      <td>
-                        <div className="max-w-[340px] truncate font-semibold" style={{ color: "var(--ink)" }}>{poll.question}</div>
-                        <div className="mt-1 font-mono text-[10px] subtle">{poll.id.slice(0, 16)}...</div>
-                      </td>
-                      <td>
-                        {status === "archived" && <span className="status-pill status-closed">Archived</span>}
-                        {status === "needsClose" && <span className="status-pill status-expired">Needs Close</span>}
-                        {status === "open" && <span className="status-pill status-active">Open</span>}
-                      </td>
-                      <td className="text-xs subtle">
-                        <div>Now: {currentEpoch.toString()}</div>
-                        <div>Deadline: {poll.deadline.toString()}</div>
-                        {status === "open" && <div>{estimatedTimeToClose} to close window</div>}
-                      </td>
-                      <td>
-                        <div className="font-semibold" style={{ color: "var(--ink)" }}>{poll.totalVotes.toString()}</div>
-                        <div className="text-[11px] subtle">{poll.totalVoters.toString()} voters</div>
-                      </td>
-                      <td className="font-semibold" style={{ color: "var(--ink)" }}>{poll.pendingIntentCount.toString()}</td>
-                      <td className="text-xs font-semibold uppercase subtle">
-                        {poll.tokenWeighted ? UNSUPPORTED_WEIGHTED_POLL_LABEL : "1p1v"}
-                      </td>
-                      <td>
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            onClick={() =>
-                              document.getElementById(anchorId)?.scrollIntoView({ behavior: "smooth", block: "start" })
-                            }
-                            className="btn-quiet px-3 py-1.5 text-xs"
-                          >
-                            Inspect
-                          </button>
-                          <button
-                            onClick={() => {
-                              void copyPollId(poll.id);
-                            }}
-                            className="btn-quiet px-3 py-1.5 text-xs"
-                          >
-                            {copiedPollId === poll.id ? "Copied" : "Copy Poll ID"}
-                          </button>
-                          {isConnected && isPollVotingSupported(poll) && (
-                            <button
-                              onClick={() => onDelegateForPoll(poll.id)}
-                              className="btn-quiet px-3 py-1.5 text-xs"
-                            >
-                              Delegate for this poll
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
 
           {filteredPolls.map((poll) => (
             <VoteOnPoll
@@ -336,14 +222,17 @@ export function PollList({
               voterAddress={voterAddress}
               voterLockHash={voterLockHash}
               txState={txState}
+              actionInFlight={actionInFlight}
               onVote={onVote}
               onAggregate={onAggregate}
               onFinalizeShards={onFinalizeShards}
+              onFinalizeAllShards={onFinalizeAllShards}
               onMergeShards={onMergeShards}
               onClose={onClose}
               onForceClose={onForceClose}
               onRefundClosedIntent={onRefundClosedIntent}
               onRefundLateIntent={onRefundLateIntent}
+              onDelegateForPoll={onDelegateForPoll}
               currentEpoch={currentEpoch}
               currentEpochPosition={currentEpochPosition}
             />

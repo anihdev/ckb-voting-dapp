@@ -115,13 +115,27 @@ CKB's cell model is a strong fit for governance because proposals, votes, delega
 
 This grant funds the productization of an already-working protocol, not a project starting from zero.
 
-Deployed the release contract to CKB testnet in [transaction `0xe701cc3f...6ed571c`](https://pudge.explorer.nervos.org/transaction/0xe701cc3ff439eda89b4ffb4b86db11f308b1ba89ef32a00f0aab7b6bd6ed571c), output `0`, with `data1` code hash `0x126d92bd112caec39e1e3b4d453dab32374c4019879779c2898d552721f564e1`. Rebuilt the [live reference frontend](https://ckb-voting-dapp.vercel.app) against that deployment and verified its served configuration. This is deployment/configuration evidence.
+On August 5, 2026, I deployed the v2 tally-lane release to CKB testnet in
+[transaction `0x5a3ecd82...06ae9d5`](https://pudge.explorer.nervos.org/transaction/0x5a3ecd82853538347a3a6b48ef110f368062979f6cb88bbb9d4bcbb7306ae9d5),
+output `0`, with `data1` code hash
+`0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`.
+I rebuilt the [live reference frontend](https://ckb-voting-dapp.vercel.app)
+against that code cell and verified that its served bundle contains the new
+contract identifiers and browser sparse-Merkle WASM. The prior code cell remains
+live for historical testnet cells and was not recycled.
+
+This establishes the current deployment and frontend configuration. It does not
+replace the still-pending controlled multi-actor lifecycle rehearsal, and I will
+not present unexercised testnet flows as completed evidence.
 
 Already implemented:
 
 - Type ID-backed proposal identity.
 - Governance-locked vote intent cells.
 - Sharded tally aggregation using `CREATE_TALLY_SHARD`.
+- Fixed-size per-lane counted-voter commitments with versioned aggregation
+  proofs, removing the former growing lane-data boundary.
+- One-to-eight-lane finalization in one bounded transaction.
 - Bounded merge/result close using `MERGE_TALLY_SHARDS`.
 - Creator close and permissionless force-close paths.
 - Delegation and revocation cells.
@@ -149,7 +163,9 @@ The Rust contract and codec remain authoritative for protocol behavior. Active s
 
 - Intent cutoff is authenticated from the block epoch that created each consumed intent cell, not from caller-selected metadata or a claimed current header.
 - Aggregation includes the corresponding creation headers and validates them through the consumed inputs.
-- Shard finalization, creator close, and force-close require validated absolute epoch `since` values on protocol input 0.
+- Every selected shard-finalization input requires a validated absolute epoch
+  `since`; creator close and force-close retain their fixed protocol-input
+  timing rules.
 - Timely intents may aggregate after the deadline until their shard is finalized. Late intents cannot count and have an exact-capacity refund path.
 - Version 1 delegation is revocation-based; the retained expiry field must be zero.
 - Poll creators cannot submit vote intents directly, delegate their own vote, or submit as another voter's delegate. This is enforced by lock hash and is not a personhood claim.
@@ -158,7 +174,13 @@ The Rust contract and codec remain authoritative for protocol behavior. Active s
 
 Deposits are recoverable through validated close and refund paths. Final tallies are correct over intents actually aggregated into finalized shards, but the protocol does not prove that every valid timely intent was included. Sharding reduces contention across tally lanes, although updates to the same lane still serialize. Permissionless maintenance authorizes any valid operator transaction; it does not create a built-in operator reward.
 
-Current v1 enforces one validated intent output per creation transaction and one counted vote per represented voter, but it does not yet enforce only one confirmable intent across separate transactions, resolving this limitation is an explicit grant deliverable: Milestone 1 will finalize the canonical-principal and singleton-authority design, and Milestone 2 will implement and CKB-VM-test the reviewed strict reference path before the public SDK voting API is frozen.
+The current intent-authority model enforces one validated intent output per
+creation transaction and one counted vote per represented voter, but it does not
+yet enforce only one confirmable intent across separate transactions. Resolving
+this limitation is an explicit grant deliverable: Milestone 1 will finalize the
+canonical-principal and singleton-authority design, and Milestone 2 will
+implement and CKB-VM-test the reviewed strict reference path before the public
+SDK voting API is frozen.
 
 ---
 

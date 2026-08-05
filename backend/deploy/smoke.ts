@@ -14,6 +14,7 @@ import {
   PollData,
   VoteIntentData,
   decodeVoteIntentData,
+  encodeTallyAggregationProof,
   encodeDelegationData,
   encodePollData,
   encodeTallyShardData,
@@ -27,6 +28,7 @@ import {
   requirePrivateKey,
 } from "./config";
 import { epochNumber } from "./epoch";
+import { buildNodeTallySmtTransition } from "./tally-smt";
 
 const PRIVATE_KEY = requirePrivateKey();
 const { codeHash: GOVERNANCE_CODE_HASH, scriptTxHash: GOVERNANCE_SCRIPT_TX_HASH } = requireGovernanceHashes();
@@ -248,12 +250,13 @@ async function main(): Promise<void> {
   const shardOutputs = Array.from({ length: shardCount }, (_, shardId) => {
     const shardScript = tallyShardScript(pollTypeHash, shardId);
     const shardData = encodeTallyShardData({
+      version: 2,
       poll_type_hash: (ccc as any).bytesFrom(pollTypeHash),
       shard_id: shardId,
       shard_count: shardCount,
       vote_counts: pollData.options.map(() => 0n),
       total_voters: 0n,
-      counted_voter_lock_hashes: [],
+      counted_voter_root: new Uint8Array(32),
       finalized: false,
     });
     const capacity = [
@@ -381,11 +384,18 @@ async function main(): Promise<void> {
     outputData: shardOutputs[0].data,
   };
   const beforeShard = decodeTallyShardData((ccc as any).bytesFrom(shardCell.outputData));
+  // Flow: the deployment rehearsal uses the same Rust/WASM proof engine as
+  // the browser, starting from this lane's authenticated empty root.
+  const transition = buildNodeTallySmtTransition({
+    expectedBeforeRoot: beforeShard.counted_voter_root,
+    existingVoterKeys: [],
+    pendingVoterKeys: [signerLockHash],
+  });
   const updatedShardBytes = encodeTallyShardData({
     ...beforeShard,
     vote_counts: [1n, 0n],
     total_voters: 1n,
-    counted_voter_lock_hashes: [signerLockHash],
+    counted_voter_root: transition.afterRoot,
     finalized: false,
   });
   const aggregatedIntentBytes = encodeVoteIntentData({ ...intentData, aggregated: true });
@@ -427,7 +437,16 @@ async function main(): Promise<void> {
       },
     ],
     outputsData: [ccc.hexFrom(updatedShardBytes), ccc.hexFrom(aggregatedIntentBytes)],
-    witnesses: ["0x", "0x", "0x"],
+    witnesses: [
+      (ccc as any).WitnessArgs.from({
+        inputType: encodeTallyAggregationProof({
+          version: 1,
+          compiled_proof: transition.compiledProof,
+        }),
+      }).toBytes(),
+      "0x",
+      "0x",
+    ],
   });
   await aggregateTx.completeFeeBy(signer, 1000);
   await signer.signTransaction(aggregateTx);

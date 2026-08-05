@@ -4,7 +4,7 @@
  * Form for creating a new governance poll from the frontend.
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CreatePollParams } from "../hooks/usePolls";
 import {
   MAX_OPTION_BYTES,
@@ -25,13 +25,14 @@ import {
   pollDurationToEpochs,
   validatePollDurationSelection,
 } from "../lib/protocolUi";
-import { isTransactionInFlight } from "../lib/txLifecycle";
+import { areTransactionControlsLocked } from "../lib/txLifecycle";
 import { TxState } from "../lib/types";
 import { TxStatus } from "./TxStatus";
 
 interface Props {
   onSubmit: (params: CreatePollParams) => Promise<string>;
   txState: TxState;
+  actionInFlight: boolean;
   currentEpoch: bigint;
   currentEpochPosition?: EpochPosition;
 }
@@ -39,7 +40,7 @@ interface Props {
 const DEFAULT_DURATION_VALUE = 1;
 const DEFAULT_DURATION_UNIT: PollDurationUnit = "days";
 
-export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPosition }: Props) {
+export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, currentEpochPosition }: Props) {
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState(["", ""]);
   const [durationValue, setDurationValue] = useState(DEFAULT_DURATION_VALUE);
@@ -47,8 +48,13 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
 
-  const isBusy = submitting || isTransactionInFlight(txState.status);
+  // Only render lifecycle status for transactions this builder started.
+  // Status is rendered only for this builder's own transaction; controls lock
+  // globally because the hook permits one state-changing action at a time.
+  const ownsTxState = txState.scope?.kind === "createPoll";
+  const isBusy = submitting || areTransactionControlsLocked(txState, actionInFlight);
   const questionBytes = utf8ByteLength(question);
   const durationEpochs = pollDurationToEpochs(durationValue, durationUnit);
   const estimatedDeadline = currentEpoch + BigInt(durationEpochs);
@@ -57,6 +63,21 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
     currentEpochPosition ?? { epoch: currentEpoch, index: 0n, length: 1n }
   );
   const durationSelectionError = validatePollDurationSelection(durationValue, durationUnit);
+
+  useEffect(() => {
+    if (!expanded || isBusy) return;
+
+    // Folding is presentation-only: keep the draft in component state so an
+    // accidental outside press never discards the creator's form progress.
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || panelRef.current?.contains(target)) return;
+      setExpanded(false);
+    };
+
+    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
+  }, [expanded, isBusy]);
 
   const addOption = () => {
     if (options.length < MAX_OPTIONS) setOptions([...options, ""]);
@@ -154,7 +175,7 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
   }
 
   return (
-    <div className="card-shell">
+    <div ref={panelRef} className="card-shell">
       <div className="mb-5 flex items-center justify-between">
         <h2 className="section-title text-xl">Create New Poll</h2>
         <button
@@ -225,7 +246,7 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
 
         <div>
           <label className="label">Approximate voting duration</label>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="grid w-full min-w-0 gap-3">
             <input
               type="number"
               value={durationValue}
@@ -233,13 +254,13 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
               min={minimumPollDurationValue(durationUnit)}
               max={durationUnit === "days" ? 166.6667 : durationUnit === "hours" ? 4000 : 1000}
               step={durationUnit === "days" ? 0.25 : 1}
-              className="input w-full sm:w-32"
+              className="input min-w-0"
               disabled={isBusy}
             />
             <div
               role="group"
               aria-label="Voting duration unit"
-              className="grid w-full grid-cols-3 overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)] sm:w-64"
+              className="grid w-full min-w-0 grid-cols-3 overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)]"
             >
               {(["hours", "days", "epochs"] as PollDurationUnit[]).map((unit) => (
                 <button
@@ -248,7 +269,7 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
                   onClick={() => changeDurationUnit(unit)}
                   disabled={isBusy}
                   aria-pressed={durationUnit === unit}
-                  className="min-h-10 px-3 text-xs font-semibold transition"
+                  className="min-h-10 w-full min-w-0 whitespace-nowrap px-2 text-xs font-semibold transition"
                   style={
                     durationUnit === unit
                       ? { background: "var(--teal-dim)", color: "var(--teal)" }
@@ -282,7 +303,7 @@ export function CreatePoll({ onSubmit, txState, currentEpoch, currentEpochPositi
           </div>
         )}
 
-        {txState.status !== "idle" && <TxStatus txState={txState} />}
+        {ownsTxState && txState.status !== "idle" && <TxStatus txState={txState} />}
 
         <button
           type="submit"

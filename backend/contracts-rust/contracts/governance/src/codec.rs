@@ -5,7 +5,10 @@
 use alloc::vec::Vec;
 
 use crate::{
-    constants::{MAX_TALLY_SHARDS, MERGE_COVERAGE_BYTES},
+    constants::{
+        MAX_TALLY_AGGREGATION_PROOF_BYTES, MAX_TALLY_SHARDS, MERGE_COVERAGE_BYTES,
+        TALLY_AGGREGATION_PROOF_VERSION, TALLY_SHARD_CODEC_VERSION,
+    },
     error::Error,
 };
 
@@ -65,13 +68,21 @@ pub struct DelegationData {
 /// Shards move counted voters and vote totals out of the poll cell so
 /// independent aggregators can update different shard cells in parallel.
 pub struct TallyShardData {
+    pub version: u8,
     pub poll_type_hash: [u8; 32],
     pub shard_id: u32,
     pub shard_count: u32,
     pub vote_counts: Vec<u64>,
     pub total_voters: u64,
-    pub counted_voter_lock_hashes: Vec<[u8; 32]>,
+    pub counted_voter_root: [u8; 32],
     pub finalized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Versioned compiled sparse-Merkle proof carried by the lane input witness.
+pub struct TallyAggregationProof {
+    pub version: u8,
+    pub compiled_proof: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,11 +232,16 @@ pub fn decode_delegation(data: &[u8]) -> Result<DelegationData, Error> {
     Ok(delegation)
 }
 
-/// Parse a tally shard. Layout: poll(32) | shard_id(u32) | shard_count(u32) |
-/// vote_counts(vec<u64>) | total_voters(u64) | counted_voters(vec<[32]>) |
-/// finalized(1).
+/// Parse a v2 tally shard. Layout: version(1) | poll(32) | shard_id(u32) |
+/// shard_count(u32) | vote_counts(vec<u64>) | total_voters(u64) |
+/// counted_voter_root(32) | finalized(1).
 pub fn decode_tally_shard(data: &[u8]) -> Result<TallyShardData, Error> {
     let mut offset = 0;
+    let version = *data.get(offset).ok_or(Error::Encoding)?;
+    offset += 1;
+    if version != TALLY_SHARD_CODEC_VERSION {
+        return Err(Error::Encoding);
+    }
     let poll_type_hash = read_bytes::<32>(data, &mut offset)?;
     let shard_id = read_u32_le(data, &mut offset)?;
     let shard_count = read_u32_le(data, &mut offset)?;
@@ -240,24 +256,42 @@ pub fn decode_tally_shard(data: &[u8]) -> Result<TallyShardData, Error> {
     }
 
     let total_voters = read_u64_le(data, &mut offset)?;
-
-    let counted_len = read_u32_le(data, &mut offset)? as usize;
-    let mut counted_voter_lock_hashes = Vec::with_capacity(counted_len);
-    for _ in 0..counted_len {
-        counted_voter_lock_hashes.push(read_bytes::<32>(data, &mut offset)?);
-    }
-
+    let counted_voter_root = read_bytes::<32>(data, &mut offset)?;
     let finalized = read_bool(data, &mut offset)?;
     ensure_consumed(data, offset)?;
 
     Ok(TallyShardData {
+        version,
         poll_type_hash,
         shard_id,
         shard_count,
         vote_counts,
         total_voters,
-        counted_voter_lock_hashes,
+        counted_voter_root,
         finalized,
+    })
+}
+
+/// Parse the canonical aggregation witness: version(1) | proof(bytes).
+///
+/// The proof byte vector is length-prefixed with a little-endian u32, matching
+/// the repository's other vector codecs. Roots and voter keys are deliberately
+/// absent because the contract derives them from lane and intent cells.
+pub fn decode_tally_aggregation_proof(data: &[u8]) -> Result<TallyAggregationProof, Error> {
+    let mut offset = 0;
+    let version = *data.get(offset).ok_or(Error::Encoding)?;
+    offset += 1;
+    if version != TALLY_AGGREGATION_PROOF_VERSION {
+        return Err(Error::Encoding);
+    }
+    let compiled_proof = read_vec(data, &mut offset)?;
+    if compiled_proof.is_empty() || compiled_proof.len() > MAX_TALLY_AGGREGATION_PROOF_BYTES {
+        return Err(Error::Encoding);
+    }
+    ensure_consumed(data, offset)?;
+    Ok(TallyAggregationProof {
+        version,
+        compiled_proof,
     })
 }
 

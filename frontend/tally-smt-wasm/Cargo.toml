@@ -1,0 +1,17 @@
+[package]
+name = "ckb-governance-tally-smt-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+blake2b-ref = "0.3.1"
+js-sys = "0.3.77"
+sparse-merkle-tree = { git = "https://github.com/nervosnetwork/sparse-merkle-tree", rev = "725cd69d95e3e34cd302e83d86178e959fc53687", default-features = false, features = ["std", "with-blake2b-ref"] }
+wasm-bindgen = "=0.2.125"
+
+[workspace]

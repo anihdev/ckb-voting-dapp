@@ -16,7 +16,7 @@ use ckb_std::{
 };
 
 use crate::{
-    codec::{EncodedScript, PollData, TallyShardData},
+    codec::{EncodedScript, PollData},
     constants::MAX_DEADLINE_EPOCH,
     error::Error,
 };
@@ -219,12 +219,6 @@ pub fn min_poll_capacity(data_len: usize, creator_deposit: u64) -> Result<u64, E
 /// @dev Used to protect tally correctness during aggregation transitions.
 pub fn count_unique_counted_voters(poll: &PollData) -> bool {
     count_unique_lock_hashes(&poll.counted_voter_lock_hashes)
-}
-
-/// @notice Ensures shard counted voter registry has no duplicate lock hashes.
-/// @dev Sharded aggregation uses this bounded registry instead of poll growth.
-pub fn count_unique_shard_voters(shard: &TallyShardData) -> bool {
-    count_unique_lock_hashes(&shard.counted_voter_lock_hashes)
 }
 
 /// @notice Ensures a list of 32-byte lock hashes contains no duplicates.

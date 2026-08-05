@@ -18,18 +18,18 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v4.4.0
         with:
           version: 10.33.0
           run_install: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 20.19.0
           cache: pnpm
@@ -45,17 +45,29 @@ jobs:
           rustflags: ""
 
       # Keep contract builds on 1.81 for deployed ELF reproducibility while
-      # current ckb-testtool host dependencies require stable Rust 1.95+.
+      # current ckb-testtool host dependencies require Rust 1.95+.
       - name: Install VM test Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add wasm32-unknown-unknown --toolchain 1.95.0
 
-      - name: Install RISC-V C compiler
+      - name: Install exact WASM binding generator
+        run: cargo +1.95.0 install wasm-bindgen-cli --version 0.2.125 --locked
+
+      - name: Install native compilers
         run: |
           sudo apt-get update
-          sudo apt-get install --yes gcc-riscv64-unknown-elf
+          sudo apt-get install --yes clang gcc-riscv64-unknown-elf
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Rebuild sparse-Merkle WASM adapters
+        run: |
+          pnpm build:tally-smt-wasm
+          git diff --exit-code -- \
+            frontend/src/lib/tally-smt-wasm-pkg \
+            backend/deploy/tally-smt-wasm-pkg
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path backend/contracts-rust/Cargo.toml --all --check

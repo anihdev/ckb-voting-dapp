@@ -6,6 +6,13 @@ node_modules/**
 .pnpm-store
 .pnpm-store/**
 
+# Local configuration and maintainer records are never deployment inputs.
+.env
+.env.*
+*.md
+deployment
+deployment/**
+
 # Rust contract build artifacts (not needed for frontend deploy).
 backend/contracts-rust/target
 backend/contracts-rust/target/**

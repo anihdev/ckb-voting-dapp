@@ -6,13 +6,14 @@
  * intent checks and delegated voting authority discovery.
  */
 
-import { startTransition, useCallback, useRef, useState } from "react";
+import { startTransition, useCallback, useMemo, useRef, useState } from "react";
 import { ccc } from "@ckb-ccc/core";
 import {
   buildAggregateTallyShardTx,
   buildClosePollTx,
   buildForceCloseTx,
   buildFinalizeTallyShardTx,
+  buildFinalizeTallyShardsTx,
   buildMergeTallyShardsTx,
   buildCreatePollTx,
   buildCreateVoteIntentTx,
@@ -27,6 +28,8 @@ import {
   getSignerLockHashHex,
   hashScript,
   MAX_DIRECT_CLOSE_SHARDS,
+  MAX_INTENTS_PER_AGG,
+  MAX_SHARDS_PER_FINALIZE,
   MAX_SHARDS_PER_MERGE,
   OP,
   signAndSendTx,
@@ -46,16 +49,19 @@ import {
   Poll,
   TallyMergeResult,
   TallyShard,
+  TxScope,
   TxState,
-  VoteAuthorityOption,
   VoteIntent,
 } from "../lib/types";
 import {
   computeCanonicalTallyFrontier,
+  deriveVoteAuthorityOptions,
   selectCloseTimeIntentRefunds,
   tallyMergeCoverageComplete,
 } from "../lib/protocolUi";
 import {
+  createContextAwareRequestGate,
+  createTransactionExclusionGuard,
   monitorSubmittedTransaction,
   TransactionUnconfirmedError,
 } from "../lib/txLifecycle";
@@ -70,27 +76,6 @@ export interface CastVoteParams {
   poll: Poll;
   optionIndex: number;
   authorityId?: string;
-}
-
-function deriveWinnerIndex(voteCounts: bigint[]): number | null {
-  if (voteCounts.length === 0) return null;
-
-  let maxVotes = 0n;
-  let maxIndex = -1;
-  let isTie = false;
-
-  voteCounts.forEach((count, index) => {
-    if (count > maxVotes) {
-      maxVotes = count;
-      maxIndex = index;
-      isTie = false;
-    } else if (count > 0n && count === maxVotes) {
-      isTie = true;
-    }
-  });
-
-  if (maxVotes === 0n || isTie) return null;
-  return maxIndex;
 }
 
 async function resolveCellCreatedEpoch(
@@ -153,17 +138,49 @@ function buildCloseIntentRefundSelection(input: {
   });
 }
 
-export function usePolls(signer: any | null, readClient: any | null = signer?.client ?? null) {
+interface PollFetchContext {
+  client: any;
+  signer: any | null;
+  viewerLockHash: string | null;
+}
+
+export function usePolls(
+  signer: any | null,
+  readClient: any | null = signer?.client ?? null,
+  viewerLockHash: string | null = null
+) {
   const [polls, setPolls] = useState<Poll[]>([]);
   const [intents, setIntents] = useState<Record<string, VoteIntent[]>>({});
   const [delegations, setDelegations] = useState<DelegationRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [txState, setTxState] = useState<TxState>({ status: "idle", txHash: null, error: null });
+  const [txState, setTxState] = useState<TxState>({
+    status: "idle",
+    txHash: null,
+    error: null,
+    scope: null,
+    batch: null,
+  });
+  const [actionInFlight, setActionInFlight] = useState(false);
   const trackedTxHashRef = useRef<string | null>(null);
+  // Hook-level mutual exclusion for every state-changing action.
+  //
+  // Scoping the *rendered* transaction status per surface removed the
+  // accidental global lock that a single shared busy flag used to provide, so
+  // this restores it explicitly. Held for the whole of a multi-transaction run
+  // (batch lane finalization) so no other action can spend the wallet change
+  // cell or overwrite `trackedTxHashRef` mid-sequence.
+  const [exclusionGuard] = useState(createTransactionExclusionGuard);
+  const [fetchGate] = useState(() =>
+    createContextAwareRequestGate<PollFetchContext>(
+      (left, right) =>
+        left.client === right.client &&
+        left.signer === right.signer &&
+        left.viewerLockHash === right.viewerLockHash
+    )
+  );
   const hasLoadedRef = useRef(false);
-  const fetchPromiseRef = useRef<Promise<void> | null>(null);
   const [pollCells, setPollCells] = useState<Record<string, any>>({});
   const [intentCells, setIntentCells] = useState<Record<string, any[]>>({});
   const [tallyShardCells, setTallyShardCells] = useState<Record<string, any[]>>({});
@@ -173,17 +190,16 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
   const fetchPolls = useCallback((): Promise<void> => {
     const client = signer?.client ?? readClient;
     if (!client) return Promise.resolve();
-    if (fetchPromiseRef.current) return fetchPromiseRef.current;
 
-    const isInitialLoad = !hasLoadedRef.current;
-    if (isInitialLoad) {
-      setLoading(true);
-    } else {
-      setRefreshing(true);
-    }
-    setLoadError(null);
+    return fetchGate.run({ client, signer, viewerLockHash }, async () => {
+      const isInitialLoad = !hasLoadedRef.current;
+      if (isInitialLoad) {
+        setLoading(true);
+      } else {
+        setRefreshing(true);
+      }
+      setLoadError(null);
 
-    const request = (async () => {
       try {
       const pollScript = buildGovernanceTypeScript(OP.CREATE_POLL);
       const nextPolls: Poll[] = [];
@@ -194,7 +210,9 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       const nextTallyShards: Record<string, TallyShard[]> = {};
       const nextTallyMergeResultCells: Record<string, any[]> = {};
       const nextTallyMergeResults: Record<string, TallyMergeResult[]> = {};
-      const currentLockHashHex = signer ? await getSignerLockHashHex(signer) : null;
+      const currentLockHashHex = signer
+        ? viewerLockHash ?? await getSignerLockHashHex(signer)
+        : null;
 
       for await (const cell of client.findCells({
         script: pollScript,
@@ -251,7 +269,6 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
                 : [],
             },
             totalVotes,
-            winnerIndex: deriveWinnerIndex(voteCounts),
             authorityOptions: [],
             outstandingIntentCount: 0,
             lateIntentCount: 0,
@@ -294,6 +311,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
               shardCount: shardData.shard_count,
               voteCounts: shardData.vote_counts,
               totalVoters: shardData.total_voters,
+              countedVoterRoot: bytesToHex(shardData.counted_voter_root),
               finalized: shardData.finalized,
               capacity: BigInt(cell.cellOutput?.capacity ?? cell.output?.capacity ?? 0),
             });
@@ -350,7 +368,6 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         poll.voteCounts = tallyFrontier.voteCounts;
         poll.totalVoters = tallyFrontier.totalVoters;
         poll.totalVotes = tallyFrontier.totalVotes;
-        poll.winnerIndex = deriveWinnerIndex(tallyFrontier.voteCounts);
         poll.tallyFrontier = {
           source: tallyFrontier.source,
           coveredShardCount: tallyFrontier.coveredShardCount,
@@ -455,52 +472,12 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         const latePendingIntents = pendingPollIntents.filter(
           (intent) => intent.createdEpoch !== null && intent.createdEpoch > poll.deadline
         );
-        const authorityOptions: VoteAuthorityOption[] = [];
-
-        if (currentLockHashHex) {
-          const directIntents = pollIntents.filter(
-            (intent) => intent.voterLockHash === currentLockHashHex
-          );
-
-          authorityOptions.push({
-            id: "self",
-            mode: "self",
-            label: "Vote as connected wallet",
-            voterLockHash: currentLockHashHex,
-            delegationId: null,
-            hasIntent: directIntents.length > 0,
-            hasPendingIntent: directIntents.some((intent) => !intent.aggregated),
-            hasAggregatedIntent: directIntents.some((intent) => intent.aggregated),
-          });
-
-          const applicableDelegations = nextDelegations
-            .filter((delegation) => delegation.delegateLockHash === currentLockHashHex)
-            .filter((delegation) => delegation.pollId === null || delegation.pollId === poll.id)
-            .filter(
-              (delegation) =>
-                delegation.delegatorLockHash.toLowerCase() !== poll.creator.toLowerCase()
-            )
-            .filter((delegation) => delegation.expiresEpoch === 0n);
-
-          for (const delegation of applicableDelegations) {
-            const delegatedIntents = pollIntents.filter(
-              (intent) => intent.voterLockHash === delegation.delegatorLockHash
-            );
-
-            authorityOptions.push({
-              id: delegation.id,
-              mode: "delegation",
-              label: `Vote for ${delegation.delegatorLockHash.slice(0, 14)}...`,
-              voterLockHash: delegation.delegatorLockHash,
-              delegationId: delegation.id,
-              hasIntent: delegatedIntents.length > 0,
-              hasPendingIntent: delegatedIntents.some((intent) => !intent.aggregated),
-              hasAggregatedIntent: delegatedIntents.some((intent) => intent.aggregated),
-            });
-          }
-        }
-
-        poll.authorityOptions = authorityOptions;
+        poll.authorityOptions = deriveVoteAuthorityOptions({
+          poll,
+          intents: pollIntents,
+          delegations: nextDelegations,
+          viewerLockHash: currentLockHashHex,
+        });
         // UI action gates should follow indexer-observed pending intents until
         // poll.pending_intent_count is promoted to strict on-chain accounting.
         poll.pendingIntentCount = BigInt(timelyPendingIntents.length);
@@ -526,35 +503,58 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         setLoading(false);
         setRefreshing(false);
       }
-    })();
-
-    fetchPromiseRef.current = request;
-    void request.finally(() => {
-      if (fetchPromiseRef.current === request) {
-        fetchPromiseRef.current = null;
-      }
     });
-    return request;
-  }, [readClient, signer]);
+  }, [fetchGate, readClient, signer, viewerLockHash]);
+
+  /**
+   * Wraps one state-changing action in the hook-level exclusion guard.
+   *
+   * Applied once, at the hook boundary, so every exported action is covered by
+   * construction rather than by each action remembering to take the lock. A
+   * second invocation while any action is active — including one started from a
+   * different surface — rejects with `ConcurrentTransactionError` before the
+   * builder runs.
+   */
+  const guardExclusive = useCallback(
+    <A extends unknown[], R>(action: (...args: A) => Promise<R>) =>
+      exclusionGuard.guard(async (...args: A): Promise<R> => {
+        setActionInFlight(true);
+        try {
+          return await action(...args);
+        } finally {
+          setActionInFlight(false);
+        }
+      }),
+    [exclusionGuard]
+  );
 
   const trackSubmittedTransaction = useCallback(
     async (txHash: string): Promise<void> => {
       if (!signer) return;
+      // `trackedTxHashRef` decides which transaction may write terminal status.
+      // Only one guarded action runs at a time, so nothing can overwrite it
+      // while an earlier transaction is still being monitored; assert that
+      // invariant rather than trusting call sites to preserve it.
+      if (!exclusionGuard.isHeld()) {
+        throw new Error(
+          "Transaction tracking must run inside the hook's exclusion guard"
+        );
+      }
 
       trackedTxHashRef.current = txHash;
-      setTxState({ status: "confirming", txHash, error: null });
+      setTxState((prev) => ({ ...prev, status: "confirming", txHash, error: null }));
       const outcome = await monitorSubmittedTransaction({
         client: signer.client,
         txHash,
         onCommitted: async () => {
           if (trackedTxHashRef.current === txHash) {
-            setTxState({ status: "success", txHash, error: null });
+            setTxState((prev) => ({ ...prev, status: "success", txHash, error: null }));
           }
           await fetchPolls();
         },
         onUnconfirmed: (error) => {
           if (trackedTxHashRef.current === txHash) {
-            setTxState({ status: "unconfirmed", txHash, error: error.message });
+            setTxState((prev) => ({ ...prev, status: "unconfirmed", txHash, error: error.message }));
           }
         },
       });
@@ -562,7 +562,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         throw new TransactionUnconfirmedError(txHash);
       }
     },
-    [fetchPolls, signer]
+    [exclusionGuard, fetchPolls, signer]
   );
 
   const createPoll = useCallback(
@@ -572,7 +572,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       const validationError = validateCreatePollInput(params);
       if (validationError) throw new Error(validationError);
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "createPoll" }, batch: null });
       try {
         // Duration is a builder/UI policy. The transaction commits the exact
         // absolute epoch chosen from this observed tip; the VM cannot prove an
@@ -582,14 +582,14 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
           ...params,
           deadlineEpoch: observedEpoch + BigInt(params.durationEpochs),
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -623,7 +623,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       const pollCell = pollCells[poll.id];
       if (!pollCell) throw new Error("Poll cell is not currently indexed");
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const tx = await buildCreateVoteIntentTx(signer, {
           pollTypeHash: poll.id,
@@ -631,14 +631,14 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
           pollCell,
           delegationCell,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -659,7 +659,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
       });
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const closeIntentSelection = buildCloseIntentRefundSelection({
           cells: intentCells[poll.id] ?? [],
@@ -672,14 +672,14 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
           shardCells: poll.shardCount > MAX_DIRECT_CLOSE_SHARDS ? [] : indexedShardCells,
           mergeResultCell: finalMergeResultCell,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -700,7 +700,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
       });
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const closeIntentSelection = buildCloseIntentRefundSelection({
           cells: intentCells[poll.id] ?? [],
@@ -713,14 +713,14 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
           shardCells: poll.shardCount > MAX_DIRECT_CLOSE_SHARDS ? [] : indexedShardCells,
           mergeResultCell: finalMergeResultCell,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -760,20 +760,20 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       const intentCell = refundableIntentCandidates[0]?.cell;
       if (!intentCell) throw new Error("No live omitted intent cell is indexed for refund");
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const tx = await buildRefundClosedIntentTx(signer, {
           pollCell,
           intentCell,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -799,16 +799,16 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       );
       if (!intentCell) throw new Error("Late intent cell is no longer live");
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const tx = await buildRefundLateIntentTx(signer, { pollCell, intentCell });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -862,29 +862,43 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         const group = pendingByShard.get(shardData.shard_id) ?? [];
         if (group.length > 0) {
           selectedShardCell = cell;
-          selectedIntentCells = group.slice(0, 50);
+          selectedIntentCells = group.slice(0, MAX_INTENTS_PER_AGG);
           break;
         }
       }
       if (!selectedShardCell) {
         throw new Error("No indexed tally shard matches the pending intent cells");
       }
+      const selectedShard = decodeTallyShardData(
+        (ccc as any).bytesFrom(selectedShardCell.outputData ?? "0x")
+      );
+      const aggregatedMarkerCells = (intentCells[poll.id] ?? []).filter((cell) => {
+        try {
+          const marker = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+          return marker.aggregated &&
+            deriveTallyShardId(marker.poll_type_hash, marker.voter_lock_hash, poll.shardCount) ===
+              selectedShard.shard_id;
+        } catch {
+          return false;
+        }
+      });
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const tx = await buildAggregateTallyShardTx(signer, {
           pollCell,
           shardCell: selectedShardCell,
           intentCells: selectedIntentCells,
+          aggregatedMarkerCells,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -911,23 +925,84 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       });
       if (!nextShardCell) throw new Error("All indexed shards are already finalized");
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const tx = await buildFinalizeTallyShardTx(signer, {
           pollCell,
           shardCell: nextShardCell,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
+    },
+    [pollCells, signer, tallyShardCells, trackSubmittedTransaction]
+  );
+
+  /** Finalize ordered lane batches; each batch is one transaction/signature. */
+  const finalizeAllShards = useCallback(
+    async (poll: Poll) => {
+      if (!signer) throw new Error("Wallet not connected");
+
+      const pollCell = pollCells[poll.id];
+      if (!pollCell) throw new Error("Poll cell is not currently indexed");
+
+      const shardCells = tallyShardCells[poll.id] ?? [];
+      if (poll.shardCount <= 0) throw new Error("Poll is not configured for tally shards");
+      if (shardCells.length !== poll.shardCount) {
+        throw new Error("Finalize requires the complete indexed shard set");
+      }
+
+      const pendingShardCells = shardCells.filter((cell) => {
+        const shardData = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
+        return !shardData.finalized;
+      });
+      if (pendingShardCells.length === 0) throw new Error("All indexed shards are already finalized");
+
+      const scope: TxScope = { kind: "poll", pollId: poll.id };
+      const total = pendingShardCells.length;
+      const submitted: string[] = [];
+
+      for (let offset = 0; offset < pendingShardCells.length; offset += MAX_SHARDS_PER_FINALIZE) {
+        const shardBatch = pendingShardCells.slice(offset, offset + MAX_SHARDS_PER_FINALIZE);
+        const batch = { label: "Finalizing tally lanes", completed: offset, total };
+        setTxState({ status: "building", txHash: null, error: null, scope, batch });
+        try {
+          // Flow: one bounded transaction freezes up to eight lanes. A poll
+          // with more lanes proceeds through later explicitly signed batches.
+          const tx = await buildFinalizeTallyShardsTx(signer, {
+            pollCell,
+            shardCells: shardBatch,
+          });
+          setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
+          const txHash = await signAndSendTx(signer, tx);
+          submitted.push(txHash);
+          await trackSubmittedTransaction(txHash);
+        } catch (error: any) {
+          if (!(error instanceof TransactionUnconfirmedError)) {
+            setTxState((prev) => ({
+              ...prev,
+              status: "error",
+              txHash: null,
+              error: `${error.message ?? String(error)} (finalized ${offset.toString()} of ${total.toString()} lanes; rerun to continue)`,
+            }));
+          }
+          throw error;
+        }
+      }
+
+      setTxState((prev) => ({
+        ...prev,
+        batch: { label: "Finalizing tally lanes", completed: total, total },
+      }));
+      return submitted[submitted.length - 1] ?? "";
     },
     [pollCells, signer, tallyShardCells, trackSubmittedTransaction]
   );
@@ -949,7 +1024,7 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         throw new Error("No finalized shard or merge result cells are indexed");
       }
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
       try {
         const selectedShardCells: any[] = [];
         const selectedResultCells: any[] = [];
@@ -997,14 +1072,14 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
           shardCells: selectedShardCells,
           mergeResultCells: selectedResultCells,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -1030,21 +1105,21 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
         throw new Error("Delegation can only be created for an open poll before its deadline");
       }
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "delegation" }, batch: null });
       try {
         const tx = await buildDelegateTx(signer, {
           delegateLockHash: params.delegateLockHash,
           pollTypeHash: targetPoll.id,
           forbiddenDelegateLockHash: targetPoll.creator,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -1059,19 +1134,19 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
       const delegationCell = delegationCells[delegationId];
       if (!delegationCell) throw new Error("Delegation cell is not currently indexed");
 
-      setTxState({ status: "building", txHash: null, error: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "delegation" }, batch: null });
       try {
         const tx = await buildRevokeDelegationTx(signer, {
           delegationCell,
         });
-        setTxState({ status: "signing", txHash: null, error: null });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
         const txHash = await signAndSendTx(signer, tx);
         await trackSubmittedTransaction(txHash);
 
         return txHash;
       } catch (error: any) {
         if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState({ status: "error", txHash: null, error: error.message ?? String(error) });
+          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
         }
         throw error;
       }
@@ -1084,26 +1159,71 @@ export function usePolls(signer: any | null, readClient: any | null = signer?.cl
     return getTipEpoch(signer.client);
   }, [signer]);
 
+  // Poll and intent scans are wallet-neutral. Re-derive role options from the
+  // cached index as soon as the connected lock hash changes, so a valid voter
+  // does not wait for the next 30-second refresh before `Vote now` appears.
+  const viewerPolls = useMemo(
+    () =>
+      polls.map((poll) => ({
+        ...poll,
+        authorityOptions: deriveVoteAuthorityOptions({
+          poll,
+          intents: intents[poll.id] ?? [],
+          delegations,
+          viewerLockHash,
+        }),
+      })),
+    [delegations, intents, polls, viewerLockHash]
+  );
+
+  /**
+   * Only guarded actions leave the hook, so no surface can reach an unguarded
+   * one. `fetchPolls` and `currentEpoch` are deliberately excluded: they are
+   * read-only and must stay usable while a transaction is in flight.
+   */
+  const guardedActions = useMemo(
+    () => ({
+      createPoll: guardExclusive(createPoll),
+      castVote: guardExclusive(castVote),
+      aggregatePoll: guardExclusive(aggregatePoll),
+      finalizeShards: guardExclusive(finalizeShards),
+      finalizeAllShards: guardExclusive(finalizeAllShards),
+      mergeShards: guardExclusive(mergeShards),
+      closePoll: guardExclusive(closePoll),
+      createDelegation: guardExclusive(createDelegation),
+      revokeDelegation: guardExclusive(revokeDelegation),
+      forceClose: guardExclusive(forceClose),
+      refundClosedIntent: guardExclusive(refundClosedIntent),
+      refundLateIntent: guardExclusive(refundLateIntent),
+    }),
+    [
+      aggregatePoll,
+      castVote,
+      closePoll,
+      createDelegation,
+      createPoll,
+      finalizeAllShards,
+      finalizeShards,
+      forceClose,
+      guardExclusive,
+      mergeShards,
+      refundClosedIntent,
+      refundLateIntent,
+      revokeDelegation,
+    ]
+  );
+
   return {
-    polls,
+    polls: viewerPolls,
     intents,
     delegations,
     loading,
     refreshing,
     loadError,
     txState,
+    actionInFlight,
     fetchPolls,
-    createPoll,
-    castVote,
-    aggregatePoll,
-    finalizeShards,
-    mergeShards,
-    closePoll,
-    createDelegation,
-    revokeDelegation,
-    forceClose,
-    refundClosedIntent,
-    refundLateIntent,
     currentEpoch,
+    ...guardedActions,
   };
 }

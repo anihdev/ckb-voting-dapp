@@ -20,6 +20,9 @@ import {
   buildProtocolTimeline,
   formatApproxWallClockDuration,
   getPollFilterCounts,
+  getPollLifecycleStatus,
+  selectDefaultTimelinePoll,
+  sortPollsForTimeline,
 } from "./lib/protocolUi";
 import { WalletConnect } from "./components/WalletConnect";
 
@@ -64,11 +67,13 @@ function InnerApp() {
     refreshing,
     loadError,
     txState,
+    actionInFlight,
     fetchPolls,
     createPoll,
     castVote,
     aggregatePoll,
     finalizeShards,
+    finalizeAllShards,
     mergeShards,
     closePoll,
     forceClose,
@@ -76,12 +81,13 @@ function InnerApp() {
     refundLateIntent,
     createDelegation,
     revokeDelegation,
-  } = usePolls(signer, defaultClient);
+  } = usePolls(signer, defaultClient, lockScriptHash);
 
   const [chainTip, setChainTip] = useState<ChainTipStatus | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<number>(Date.now());
   const [secondsSinceSync, setSecondsSinceSync] = useState<number>(0);
   const [delegationScopePrefill, setDelegationScopePrefill] = useState<{ pollId: string; requestId: number } | null>(null);
+  const [timelinePollId, setTimelinePollId] = useState<string | null>(null);
 
   const syncDashboard = useCallback(async () => {
     const client = signer?.client ?? defaultClient;
@@ -135,9 +141,27 @@ function InnerApp() {
         )
       : null;
 
-  const protocolTimeline = useMemo(() => {
-    return buildProtocolTimeline(polls, delegations, currentEpoch);
-  }, [currentEpoch, delegations, polls]);
+  /**
+   * The timeline describes one poll's lifecycle, so it needs a subject. The
+   * default and the picker share one deterministic ordering, so the subject
+   * does not depend on the order the indexer returned cells in.
+   */
+  const timelinePolls = useMemo(
+    () => sortPollsForTimeline(polls, currentEpoch),
+    [currentEpoch, polls]
+  );
+  const timelinePoll = useMemo(() => {
+    if (timelinePollId) {
+      const selected = timelinePolls.find((poll) => poll.id === timelinePollId);
+      if (selected) return selected;
+    }
+    return selectDefaultTimelinePoll(timelinePolls, currentEpoch);
+  }, [currentEpoch, timelinePollId, timelinePolls]);
+
+  const protocolTimeline = useMemo(
+    () => buildProtocolTimeline(timelinePoll, currentEpoch),
+    [currentEpoch, timelinePoll]
+  );
   const pollFilterCounts = useMemo(
     () => getPollFilterCounts(polls, currentEpoch),
     [currentEpoch, polls]
@@ -335,6 +359,7 @@ function InnerApp() {
             voterAddress={configError ? null : address}
             voterLockHash={configError ? null : lockScriptHash}
             txState={txState}
+            actionInFlight={actionInFlight}
             currentEpoch={currentEpoch}
             currentEpochPosition={
               chainTip
@@ -350,6 +375,7 @@ function InnerApp() {
             }
             onAggregate={aggregatePoll}
             onFinalizeShards={finalizeShards}
+            onFinalizeAllShards={finalizeAllShards}
             onMergeShards={mergeShards}
             onClose={closePoll}
             onForceClose={forceClose}
@@ -368,18 +394,10 @@ function InnerApp() {
             <div className="kicker" style={{ marginBottom: 10 }}>Creator and Delegation Tools</div>
             <div className="action-grid">
               <Suspense fallback={sectionFallback}>
-                <DelegatePower
-                  delegations={delegations}
-                  txState={txState}
-                  onDelegate={createDelegation}
-                  onRevoke={revokeDelegation}
-                  prefillPollScope={delegationScopePrefill}
-                />
-              </Suspense>
-              <Suspense fallback={sectionFallback}>
                 <CreatePoll
                   onSubmit={createPoll}
                   txState={txState}
+                  actionInFlight={actionInFlight}
                   currentEpoch={currentEpoch}
                   currentEpochPosition={
                     chainTip
@@ -392,14 +410,54 @@ function InnerApp() {
                   }
                 />
               </Suspense>
+              <Suspense fallback={sectionFallback}>
+                <DelegatePower
+                  delegations={delegations}
+                  polls={polls}
+                  currentEpoch={currentEpoch}
+                  viewerLockHash={lockScriptHash}
+                  txState={txState}
+                  actionInFlight={actionInFlight}
+                  onDelegate={createDelegation}
+                  onRevoke={revokeDelegation}
+                  prefillPollScope={delegationScopePrefill}
+                />
+              </Suspense>
             </div>
           </div>
         )}
 
         <div id="protocol-timeline" className="card-shell ui-enter-delay-1" style={{ marginBottom: 20, overflow: "hidden", padding: 0 }}>
-          <div style={{ padding: "16px 24px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div className="card-title">Protocol Timeline</div>
-            <div className="card-sub">Live operation state</div>
+          <div className="protocol-strip-head">
+            <div>
+              <div className="card-title">Protocol Timeline</div>
+              <div className="card-sub">
+                {timelinePoll
+                  ? "Lifecycle of the selected poll. Delegation is not a poll stage and is reported in the Delegation panel."
+                  : "No poll is indexed yet. Stages activate once a poll exists."}
+              </div>
+            </div>
+            {polls.length > 0 && (
+              <label className="protocol-strip-picker">
+                <span className="subtle">Poll</span>
+                <select
+                  className="input"
+                  value={timelinePoll?.id ?? ""}
+                  onChange={(event) => setTimelinePollId(event.target.value || null)}
+                >
+                  {timelinePolls.map((poll) => (
+                    <option key={poll.id} value={poll.id}>
+                      {getPollLifecycleStatus(poll, currentEpoch) === "archived"
+                        ? "[Closed] "
+                        : getPollLifecycleStatus(poll, currentEpoch) === "needsClose"
+                          ? "[Needs close] "
+                          : "[Open] "}
+                      {poll.question.length > 56 ? `${poll.question.slice(0, 56)}...` : poll.question}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
           </div>
 
           <div className="protocol-strip">
@@ -412,18 +470,33 @@ function InnerApp() {
                     textTransform: "uppercase",
                     letterSpacing: 0,
                     color:
-                      step.state === "completed" ? "var(--teal)" : step.state === "live" ? "var(--amber)" : "var(--ink-3)",
+                      step.state === "completed"
+                        ? "var(--teal)"
+                        : step.state === "ended"
+                          ? "var(--amber)"
+                        : step.state === "live"
+                          ? "var(--amber)"
+                          : "var(--ink-3)",
                     marginBottom: 5,
                   }}
                 >
-                  {step.state === "completed" ? "Done" : step.state === "live" ? "Live" : "Pending"}
+                  {step.state === "completed"
+                    ? "Done"
+                    : step.state === "ended"
+                      ? "Ended"
+                    : step.state === "live"
+                      ? "Live"
+                      : step.state === "skipped"
+                        ? "Not applicable"
+                        : "Pending"}
                 </div>
                 <div className="protocol-op">
                   {step.op}
                 </div>
-                <div style={{ fontSize: 12, fontWeight: 500, color: step.state === "pending" ? "var(--ink-2)" : "var(--ink)" }}>
+                <div style={{ fontSize: 12, fontWeight: 500, color: step.state === "completed" || step.state === "live" || step.state === "ended" ? "var(--ink)" : "var(--ink-2)" }}>
                   {step.label}
                 </div>
+                <div className="protocol-detail">{step.detail}</div>
               </div>
             ))}
           </div>
