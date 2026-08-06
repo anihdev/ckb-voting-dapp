@@ -8,6 +8,8 @@ node_out_dir="$repo_root/backend/deploy/tally-smt-wasm-pkg"
 wasm_bindgen_bin="${WASM_BINDGEN_BIN:-$HOME/.cargo/bin/wasm-bindgen}"
 host_rust_toolchain="${HOST_RUST_TOOLCHAIN:-1.95.0}"
 wasm_bindgen_version="0.2.125"
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 
 if [[ ! -x "$wasm_bindgen_bin" ]]; then
   echo "wasm-bindgen $wasm_bindgen_version is required at $wasm_bindgen_bin" >&2
@@ -19,7 +21,23 @@ if [[ "$($wasm_bindgen_bin --version)" != "wasm-bindgen $wasm_bindgen_version" ]
   exit 1
 fi
 
-cargo +"$host_rust_toolchain" build \
+# Rust retains panic-location source paths in the WASM. Normalize those paths
+# so local and GitHub Actions builds produce the same committed adapters.
+rustflags=(
+  "--remap-path-prefix=$repo_root=/workspace"
+  "--remap-path-prefix=$cargo_home=/cargo-home"
+  "--remap-path-prefix=$rustup_home=/rustup-home"
+)
+printf -v encoded_rustflags '%s\x1f' "${rustflags[@]}"
+encoded_rustflags="${encoded_rustflags%$'\x1f'}"
+
+env \
+  -u RUSTFLAGS \
+  -u CARGO_BUILD_RUSTFLAGS \
+  -u CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS \
+  CARGO_ENCODED_RUSTFLAGS="$encoded_rustflags" \
+  CARGO_INCREMENTAL=0 \
+  cargo +"$host_rust_toolchain" build \
   --manifest-path "$crate_dir/Cargo.toml" \
   --target wasm32-unknown-unknown \
   --release \

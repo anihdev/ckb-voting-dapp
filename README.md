@@ -379,20 +379,6 @@ pnpm build:contract:rust
 pnpm build:frontend
 ```
 
-Continuous integration runs the same checks on every push and pull request. It
-additionally rebuilds the sparse-Merkle WASM adapters and fails if the result
-differs from the committed `frontend/src/lib/tally-smt-wasm-pkg` and
-`backend/deploy/tally-smt-wasm-pkg` output, so regenerate and commit those
-packages whenever the WASM crate or `wasm-bindgen` version changes. CI also
-verifies that the release contract ELF contains no atomic instructions, which
-CKB-VM does not support.
-
-Dependency advisories are reported separately and are non-blocking:
-
-```bash
-pnpm audit --prod
-```
-
 ### Testnet rehearsal
 
 These commands broadcast transactions, create cells, and spend testnet CKB. They
@@ -416,8 +402,6 @@ They deliberately stop before post-deadline finalization and close.
 
 ## Deployment Status
 
-The v2 tally-lane release was deployed as a new CKB testnet code cell on August
-5, 2026. The historical code cell was not recycled.
 
 - contract transaction: [`0x5a3ecd82...06ae9d5`](https://pudge.explorer.nervos.org/transaction/0x5a3ecd82853538347a3a6b48ef110f368062979f6cb88bbb9d4bcbb7306ae9d5);
 - code-cell output index: `0`;
