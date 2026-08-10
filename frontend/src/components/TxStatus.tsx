@@ -54,6 +54,7 @@ export function TxStatus({ txState }: Props) {
               href="https://faucet.nervos.org/"
               target="_blank"
               rel="noopener noreferrer"
+              title="Open the Nervos CKB testnet faucet"
               style={{ display: "inline-block", marginTop: 4, fontSize: 11, color: "var(--teal)", textDecoration: "underline" }}
             >
               Get CKB testnet tokens (Nervos Faucet)
@@ -94,6 +95,7 @@ export function TxStatus({ txState }: Props) {
               href={`${EXPLORER_BASE}/${txHash}`}
               target="_blank"
               rel="noopener noreferrer"
+              title="Inspect this unconfirmed transaction on the CKB testnet explorer"
               style={{ display: "inline-block", marginTop: 5, color: "var(--teal)", fontSize: 11 }}
             >
               Check transaction on Explorer -&gt;
@@ -174,6 +176,7 @@ export function TxStatus({ txState }: Props) {
             href={`${EXPLORER_BASE}/${txHash}`}
             target="_blank"
             rel="noopener noreferrer"
+            title="Inspect this transaction on the CKB testnet explorer"
             style={{ marginLeft: "auto", color: "var(--teal)", textDecoration: "none", fontSize: 11 }}
           >
             View on Explorer -&gt;

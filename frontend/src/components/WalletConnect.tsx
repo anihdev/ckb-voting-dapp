@@ -49,6 +49,7 @@ export function WalletConnect() {
       <div className="wallet-shell wallet-shell-disconnected">
         <button
           onClick={connect}
+          title="Connect a CKB testnet wallet"
           className="btn-primary"
           style={{ borderRadius: 9999, padding: "9px 20px", fontSize: 12, letterSpacing: 0 }}
         >
@@ -99,6 +100,7 @@ export function WalletConnect() {
 
       <button
         onClick={disconnect}
+        title="Disconnect the current wallet from this app"
         className="btn-danger"
         style={{ borderRadius: 9999, padding: "8px 16px", fontSize: 11, letterSpacing: 0, textTransform: "uppercase" }}
       >

@@ -5,7 +5,7 @@
  */
 
 import { useState } from "react";
-import { Poll, TxState } from "../lib/types";
+import { FinalizationReadinessCheck, Poll, TxState } from "../lib/types";
 import { VoteOnPoll } from "./VoteOnPoll";
 import {
   filterPollsByLifecycle,
@@ -27,6 +27,7 @@ interface Props {
   currentEpochPosition?: EpochPosition;
   onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
+  onCheckFinalizationReadiness: (poll: Poll) => Promise<FinalizationReadinessCheck>;
   onFinalizeShards: (poll: Poll) => Promise<string>;
   onFinalizeAllShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
@@ -52,6 +53,7 @@ export function PollList({
   currentEpochPosition,
   onVote,
   onAggregate,
+  onCheckFinalizationReadiness,
   onFinalizeShards,
   onFinalizeAllShards,
   onMergeShards,
@@ -98,6 +100,7 @@ export function PollList({
             <button
               key={tab.key}
               onClick={() => setFilter(tab.key)}
+              title={`Show ${tab.label.toLowerCase()} polls`}
               className="inline-flex min-w-[144px] flex-none items-center justify-center gap-3 whitespace-nowrap rounded-lg px-4 py-1.5 text-sm font-medium transition-all"
               style={
                 filter === tab.key
@@ -124,6 +127,7 @@ export function PollList({
           onClick={onRefresh}
           disabled={isRefreshing}
           aria-label={isRefreshing ? "Refreshing poll registry" : "Refresh poll registry"}
+          title={isRefreshing ? "Refreshing indexed CKB poll data" : "Refresh indexed CKB poll data"}
           className="btn-quiet flex min-w-[104px] items-center justify-center gap-2 self-end text-xs uppercase sm:self-auto"
         >
           <span className={isRefreshing ? "animate-spin" : ""} aria-hidden="true">*</span>
@@ -171,6 +175,7 @@ export function PollList({
               <div className="mt-5">
                 <button
                   onClick={onConnectWallet}
+                  title="Connect a wallet to create a governance proposal"
                   className="btn-quiet"
                 >
                   Connect wallet to create the first proposal
@@ -180,6 +185,7 @@ export function PollList({
                     href="https://faucet.nervos.org/"
                     target="_blank"
                     rel="noopener noreferrer"
+                    title="Open the Nervos CKB testnet faucet"
                     className="subtle"
                     style={{ fontSize: 12, textDecoration: "underline" }}
                   >
@@ -193,6 +199,7 @@ export function PollList({
                   onClick={() => {
                     document.getElementById("creator-tools")?.scrollIntoView({ behavior: "smooth", block: "start" });
                   }}
+                  title="Open the poll creation tools"
                   className="btn-quiet"
                 >
                   Create the first proposal
@@ -225,6 +232,7 @@ export function PollList({
               actionInFlight={actionInFlight}
               onVote={onVote}
               onAggregate={onAggregate}
+              onCheckFinalizationReadiness={onCheckFinalizationReadiness}
               onFinalizeShards={onFinalizeShards}
               onFinalizeAllShards={onFinalizeAllShards}
               onMergeShards={onMergeShards}

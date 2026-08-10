@@ -162,6 +162,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
     return (
       <button
         onClick={() => setExpanded(true)}
+        title="Open the poll creation form"
         className="card-shell w-full text-left transition hover:-translate-y-0.5"
         style={{ borderStyle: "dashed", borderWidth: 2, borderColor: "var(--line-2)" }}
       >
@@ -181,6 +182,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
         <button
           onClick={() => setExpanded(false)}
           disabled={isBusy}
+          title="Fold the poll creation form without discarding its draft"
           className="btn-quiet px-3 py-1.5 text-xs uppercase"
         >
           Close
@@ -194,6 +196,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
             value={question}
             onChange={(event) => setQuestion(event.target.value)}
             placeholder="What should we vote on?"
+            title="Enter the governance question participants will vote on"
             rows={2}
             maxLength={256}
             className="input resize-none"
@@ -215,6 +218,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
                   value={option}
                   onChange={(event) => updateOption(index, event.target.value)}
                   placeholder={`Option ${index + 1}`}
+                  title={`Enter voting option ${(index + 1).toString()}`}
                   maxLength={64}
                   className="input flex-1"
                   disabled={isBusy}
@@ -223,6 +227,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
                   <button
                     type="button"
                     onClick={() => removeOption(index)}
+                    title={`Remove option ${(index + 1).toString()}`}
                     className="btn-danger px-3 py-2 text-xs uppercase"
                     disabled={isBusy}
                   >
@@ -237,6 +242,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
               type="button"
               onClick={addOption}
               disabled={isBusy}
+              title="Add another voting option"
               className="btn-quiet mt-2"
             >
               Add option
@@ -251,6 +257,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
               type="number"
               value={durationValue}
               onChange={(event) => setDurationValue(Number(event.target.value))}
+              title="Enter the approximate voting duration in the selected unit"
               min={minimumPollDurationValue(durationUnit)}
               max={durationUnit === "days" ? 166.6667 : durationUnit === "hours" ? 4000 : 1000}
               step={durationUnit === "days" ? 0.25 : 1}
@@ -269,6 +276,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
                   onClick={() => changeDurationUnit(unit)}
                   disabled={isBusy}
                   aria-pressed={durationUnit === unit}
+                  title={`Express the approximate poll duration in ${formatPollDurationUnit(unit)}`}
                   className="min-h-10 w-full min-w-0 whitespace-nowrap px-2 text-xs font-semibold transition"
                   style={
                     durationUnit === unit
@@ -308,6 +316,7 @@ export function CreatePoll({ onSubmit, txState, actionInFlight, currentEpoch, cu
         <button
           type="submit"
           disabled={isBusy}
+          title="Build, sign, and submit this poll creation transaction"
           className="btn-primary w-full py-3"
         >
           {isBusy ? "Processing..." : "Create Poll on CKB"}

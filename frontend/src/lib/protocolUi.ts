@@ -8,12 +8,14 @@
 import {
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_DIRECT_CLOSE_SHARDS,
+  MAX_INTENTS_PER_AGG,
   MAX_TALLY_SHARDS,
   MERGE_COVERAGE_BYTES,
 } from "./constants";
 import { hexToBytes } from "./molecule";
 import {
   DelegationRecord,
+  FinalizationReadinessCheck,
   Poll,
   PollOutcome,
   TallyFrontierSource,
@@ -31,6 +33,29 @@ export const UNSUPPORTED_WEIGHTED_POLL_MESSAGE =
   "Weighted voting is unsupported in this equal-weight deployment. New voting and aggregation are disabled; finalization, close, and exact-capacity recovery remain available.";
 export const CREATOR_VOTING_DISABLED_MESSAGE =
   "Voting is not allowed for poll creator.";
+
+export interface IndexerQueryWarning {
+  message: string;
+  detail: string | null;
+}
+
+/** Converts low-level browser/RPC failures into actionable stale-data copy. */
+export function describeIndexerQueryError(rawError: string): IndexerQueryWarning {
+  const detail = rawError.trim() || "Unknown CKB data query failure";
+  const normalized = detail.toLowerCase();
+  const isConnectionFailure =
+    normalized.includes("failed to fetch") ||
+    normalized.includes("networkerror") ||
+    normalized.includes("network error") ||
+    normalized.includes("load failed");
+
+  return {
+    message: isConnectionFailure
+      ? "The app could not reach the configured CKB RPC/indexer. Existing poll data may be stale; check your connection and retry."
+      : "The CKB poll query did not complete. Existing poll data may be stale; retry the indexer scan.",
+    detail,
+  };
+}
 
 export const CKB_EPOCH_TARGET_HOURS = 4;
 
@@ -159,6 +184,83 @@ export function isPollVotingSupported(
 }
 
 /**
+ * Estimates required aggregation transactions from per-lane pending counts.
+ * A transaction updates exactly one lane, so underfilled lanes cannot be
+ * combined merely because their total is below the per-transaction cap.
+ */
+export function countAggregationBatches(laneIntentCounts: Iterable<number>): number {
+  let batches = 0;
+  for (const count of laneIntentCounts) {
+    if (!Number.isInteger(count) || count < 0) {
+      throw new Error("Aggregation lane intent counts must be non-negative integers");
+    }
+    batches += Math.ceil(count / MAX_INTENTS_PER_AGG);
+  }
+  return batches;
+}
+
+/**
+ * Separates unaggregated intents by their authenticated creation-header epoch.
+ * Late intents are deliberately not treated as aggregation work because the
+ * Rust contract rejects them from tally transitions and exposes a refund path.
+ */
+export function summarizeFinalizationReadiness(
+  intents: Iterable<Pick<VoteIntent, "aggregated" | "createdEpoch">>,
+  deadline: bigint,
+  unresolvedIntentCount = 0
+): FinalizationReadinessCheck {
+  if (!Number.isInteger(unresolvedIntentCount) || unresolvedIntentCount < 0) {
+    throw new Error("Unresolved intent count must be a non-negative integer");
+  }
+
+  let timelyPendingIntentCount = 0;
+  let latePendingIntentCount = 0;
+  let unresolvedCount = unresolvedIntentCount;
+
+  for (const intent of intents) {
+    if (intent.aggregated) continue;
+    if (intent.createdEpoch === null) {
+      unresolvedCount += 1;
+    } else if (intent.createdEpoch <= deadline) {
+      timelyPendingIntentCount += 1;
+    } else {
+      latePendingIntentCount += 1;
+    }
+  }
+
+  return {
+    timelyPendingIntentCount,
+    latePendingIntentCount,
+    unresolvedIntentCount: unresolvedCount,
+  };
+}
+
+export function finalizationReadinessNeedsCaution(
+  check: FinalizationReadinessCheck
+): boolean {
+  return check.timelyPendingIntentCount > 0 || check.unresolvedIntentCount > 0;
+}
+
+/** Human-readable handshake shown before a finalization transaction is built. */
+export function formatFinalizationReadinessCheck(
+  check: FinalizationReadinessCheck
+): string {
+  if (check.timelyPendingIntentCount > 0) {
+    return `${check.timelyPendingIntentCount.toString()} timely pending intent${check.timelyPendingIntentCount === 1 ? " remains" : "s remain"}. Finalizing now can leave ${check.timelyPendingIntentCount === 1 ? "it" : "them"} permanently uncounted.`;
+  }
+
+  if (check.unresolvedIntentCount > 0) {
+    return `${check.unresolvedIntentCount.toString()} matching intent${check.unresolvedIntentCount === 1 ? " could" : "s could"} not be classified. Finalizing now can leave timely intents permanently uncounted.`;
+  }
+
+  if (check.latePendingIntentCount > 0) {
+    return `No indexed timely pending intents remain. ${check.latePendingIntentCount.toString()} late intent${check.latePendingIntentCount === 1 ? " cannot count and remains" : "s cannot count and remain"} refundable.`;
+  }
+
+  return "No indexed timely pending intents remain.";
+}
+
+/**
  * Derives the connected wallet's usable voting identities from indexed cells.
  *
  * This is intentionally pure: a wallet connection should update poll actions
@@ -184,10 +286,14 @@ export function deriveVoteAuthorityOptions(input: {
         intent.voterLockHash.toLowerCase() === normalizedVoterLockHash
     );
 
+    const optionIndices = [...new Set(representedIntents.map((intent) => intent.optionIndex))];
+
     return {
       hasIntent: representedIntents.length > 0,
       hasPendingIntent: representedIntents.some((intent) => !intent.aggregated),
       hasAggregatedIntent: representedIntents.some((intent) => intent.aggregated),
+      recordedOptionIndex: optionIndices.length === 1 ? optionIndices[0] : null,
+      hasConflictingIntentChoices: optionIndices.length > 1,
     };
   };
 
@@ -672,9 +778,16 @@ export function canFinalizeTallyShardFromUi(poll: Poll, currentEpoch: bigint): b
   );
 }
 
-export function getFinalizeShardConfirmationMessage(poll: Poll): string {
+export function getFinalizeShardConfirmationMessage(
+  poll: Poll,
+  readinessCheck?: FinalizationReadinessCheck
+): string {
   const base =
-    "This finalizes one tally shard after the deadline. Finalized shards cannot be aggregated again and are required before small-poll direct close or large-poll merge.";
+    "Finalization freezes the selected tally lane state after the deadline. Finalized lanes cannot be aggregated again and are required before small-poll direct close or large-poll merge.";
+
+  if (readinessCheck) {
+    return formatFinalizationReadinessCheck(readinessCheck);
+  }
 
   if (poll.pendingIntentCount > 0n) {
     return `${FINALIZE_PENDING_INTENTS_WARNING}\n\n${base}`;

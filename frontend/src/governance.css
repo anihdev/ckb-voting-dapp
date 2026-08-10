@@ -348,6 +348,23 @@
   border: 1px solid rgba(0, 200, 151, 0.3);
 }
 
+/* Keep the live signal readable by pulsing its halo and dot, not the label. */
+.governance-theme .status-poll-live {
+  box-shadow: 0 0 0 0 rgba(0, 223, 168, 0);
+  animation: poll-live-halo 2.4s ease-in-out infinite;
+}
+
+.governance-theme .status-poll-live::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 7px rgba(0, 223, 168, 0.75);
+  animation: poll-live-dot 1.2s ease-in-out infinite;
+}
+
 .governance-theme .status-expired {
   background: var(--amber-dim);
   color: var(--amber);
@@ -719,6 +736,32 @@
   background: var(--teal-dim);
 }
 
+.governance-theme .poll-option.recorded-choice {
+  border-color: rgba(0, 223, 168, 0.72);
+  background: rgba(0, 200, 151, 0.1);
+  box-shadow: inset 3px 0 0 var(--teal);
+  opacity: 1;
+}
+
+.governance-theme .poll-option.recorded-choice .poll-option-label {
+  flex-wrap: wrap;
+}
+
+.governance-theme .recorded-choice-badge {
+  flex: 0 0 auto;
+  border: 1px solid rgba(0, 223, 168, 0.32);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--teal);
+  background: rgba(0, 200, 151, 0.09);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 .governance-theme .poll-option-bar {
   position: absolute;
   top: 0;
@@ -747,6 +790,29 @@
 .governance-theme .poll-option.selected .poll-option-radio {
   border-color: var(--teal);
   background: var(--teal);
+}
+
+.governance-theme .poll-action-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+.governance-theme .button-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: button-spin 0.75s linear infinite;
+}
+
+.governance-theme .poll-transaction-feedback {
+  min-width: 0;
+  padding: 14px 22px 18px;
+  border-top: 1px solid var(--line);
 }
 
 .governance-theme .poll-lifecycle-details {
@@ -1166,6 +1232,38 @@
   }
 }
 
+@keyframes poll-live-halo {
+  0%,
+  100% {
+    border-color: rgba(0, 200, 151, 0.32);
+    box-shadow: 0 0 0 0 rgba(0, 223, 168, 0);
+  }
+  50% {
+    border-color: rgba(0, 223, 168, 0.72);
+    box-shadow:
+      0 0 0 4px rgba(0, 223, 168, 0.08),
+      0 0 15px rgba(0, 223, 168, 0.24);
+  }
+}
+
+@keyframes poll-live-dot {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.18);
+  }
+}
+
+@keyframes button-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @keyframes shimmer {
   0% {
     background-position: -400% 0;
@@ -1196,6 +1294,18 @@
 
 .governance-theme .ui-enter-delay-2 {
   animation: ui-enter 0.4s 0.16s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .governance-theme .status-poll-live,
+  .governance-theme .status-poll-live::before,
+  .governance-theme .button-spinner {
+    animation: none;
+  }
+
+  .governance-theme .status-poll-live {
+    box-shadow: 0 0 0 2px rgba(0, 223, 168, 0.08);
+  }
 }
 
 .governance-theme ::-webkit-scrollbar {

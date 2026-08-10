@@ -76,10 +76,22 @@ export function ActionConfirmDialog({
         </div>
 
         <div className="confirm-actions">
-          <button type="button" className="btn-quiet" onClick={onCancel} disabled={busy}>
+          <button
+            type="button"
+            className="btn-quiet"
+            onClick={onCancel}
+            disabled={busy}
+            title="Cancel this pending action"
+          >
             Cancel
           </button>
-          <button type="button" className="btn-primary" onClick={onConfirm} disabled={busy}>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={onConfirm}
+            disabled={busy}
+            title={`Confirm: ${title}`}
+          >
             {busy ? "Processing..." : confirmLabel}
           </button>
         </div>

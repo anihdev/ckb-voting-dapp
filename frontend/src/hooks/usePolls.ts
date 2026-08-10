@@ -46,6 +46,7 @@ import {
 import {
   DelegateParams,
   DelegationRecord,
+  FinalizationReadinessCheck,
   Poll,
   TallyMergeResult,
   TallyShard,
@@ -54,9 +55,11 @@ import {
   VoteIntent,
 } from "../lib/types";
 import {
+  countAggregationBatches,
   computeCanonicalTallyFrontier,
   deriveVoteAuthorityOptions,
   selectCloseTimeIntentRefunds,
+  summarizeFinalizationReadiness,
   tallyMergeCoverageComplete,
 } from "../lib/protocolUi";
 import {
@@ -270,6 +273,7 @@ export function usePolls(
             },
             totalVotes,
             authorityOptions: [],
+            aggregationBatchCount: 0,
             outstandingIntentCount: 0,
             lateIntentCount: 0,
             refundableIntentCount: 0,
@@ -472,6 +476,23 @@ export function usePolls(
         const latePendingIntents = pendingPollIntents.filter(
           (intent) => intent.createdEpoch !== null && intent.createdEpoch > poll.deadline
         );
+        const unfinalizedShardIds = new Set(
+          poll.tallyShards.filter((shard) => !shard.finalized).map((shard) => shard.shardId)
+        );
+        const pendingCountByShard = new Map<number, number>();
+        for (const intent of timelyPendingIntents) {
+          const shardId = deriveTallyShardId(
+            (ccc as any).bytesFrom(poll.id),
+            (ccc as any).bytesFrom(intent.voterLockHash),
+            poll.shardCount
+          );
+          if (!unfinalizedShardIds.has(shardId)) continue;
+          pendingCountByShard.set(shardId, (pendingCountByShard.get(shardId) ?? 0) + 1);
+        }
+        // Flow: lane assignment is deterministic and one transaction mutates
+        // one lane. This estimate drives copy only; the builder and contract
+        // still select and validate the actual next aggregation transaction.
+        poll.aggregationBatchCount = countAggregationBatches(pendingCountByShard.values());
         poll.authorityOptions = deriveVoteAuthorityOptions({
           poll,
           intents: pollIntents,
@@ -505,6 +526,51 @@ export function usePolls(
       }
     });
   }, [fetchGate, readClient, signer, viewerLockHash]);
+
+  const checkFinalizationReadiness = useCallback(
+    async (poll: Poll): Promise<FinalizationReadinessCheck> => {
+      const client = signer?.client ?? readClient;
+      if (!client) throw new Error("CKB RPC/indexer is unavailable for the finalization check");
+
+      const intentScript = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, poll.id);
+      const pendingIntents: Array<Pick<VoteIntent, "aggregated" | "createdEpoch">> = [];
+      let unresolvedIntentCount = 0;
+
+      // Flow: finalization uses a fresh exact-scope scan instead of the card's
+      // periodic snapshot. The result remains advisory because indexer discovery
+      // is not consensus and cannot prove that no matching cell was omitted.
+      for await (const cell of client.findCells({
+        script: intentScript,
+        scriptType: "type",
+        scriptSearchMode: "exact",
+      })) {
+        try {
+          const intentData = decodeVoteIntentData(
+            (ccc as any).bytesFrom(cell.outputData ?? "0x")
+          );
+          if (bytesToHex(intentData.poll_type_hash).toLowerCase() !== poll.id.toLowerCase()) {
+            unresolvedIntentCount += 1;
+            continue;
+          }
+          if (intentData.aggregated) continue;
+
+          pendingIntents.push({
+            aggregated: false,
+            createdEpoch: await resolveCellCreatedEpoch(client, cell),
+          });
+        } catch {
+          unresolvedIntentCount += 1;
+        }
+      }
+
+      return summarizeFinalizationReadiness(
+        pendingIntents,
+        poll.deadline,
+        unresolvedIntentCount
+      );
+    },
+    [readClient, signer]
+  );
 
   /**
    * Wraps one state-changing action in the hook-level exclusion guard.
@@ -1178,8 +1244,9 @@ export function usePolls(
 
   /**
    * Only guarded actions leave the hook, so no surface can reach an unguarded
-   * one. `fetchPolls` and `currentEpoch` are deliberately excluded: they are
-   * read-only and must stay usable while a transaction is in flight.
+   * one. `fetchPolls`, `checkFinalizationReadiness`, and `currentEpoch` are
+   * deliberately excluded: they are read-only and must stay usable while a
+   * transaction is in flight.
    */
   const guardedActions = useMemo(
     () => ({
@@ -1223,6 +1290,7 @@ export function usePolls(
     txState,
     actionInFlight,
     fetchPolls,
+    checkFinalizationReadiness,
     currentEpoch,
     ...guardedActions,
   };

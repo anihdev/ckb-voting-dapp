@@ -6,14 +6,18 @@ import {
   buildProtocolTimeline,
   canDelegateForPoll,
   canFinalizeTallyShardFromUi,
+  countAggregationBatches,
   computeCanonicalTallyFrontier,
   CREATOR_VOTING_DISABLED_MESSAGE,
   derivePollOutcome,
   deriveVoteAuthorityOptions,
+  describeIndexerQueryError,
   epochSpanInUnit,
   estimatePollCloseHours,
+  finalizationReadinessNeedsCaution,
   filterPollsByLifecycle,
   FINALIZE_PENDING_INTENTS_WARNING,
+  formatFinalizationReadinessCheck,
   formatApproxEpochDuration,
   formatApproxWallClockDuration,
   formatPollDurationUnit,
@@ -27,6 +31,7 @@ import {
   selectCloseTimeIntentRefunds,
   selectDefaultTimelinePoll,
   sortPollsForTimeline,
+  summarizeFinalizationReadiness,
   summarizeDelegations,
   tallyMergeCoverageComplete,
   tallyMergeCoverageCount,
@@ -114,6 +119,7 @@ function makePoll(overrides: Partial<Poll> = {}): Poll {
     },
     totalVotes: 0n,
     authorityOptions: [],
+    aggregationBatchCount: 0,
     outstandingIntentCount: 0,
     lateIntentCount: 0,
     refundableIntentCount: 0,
@@ -179,7 +185,13 @@ describe("vote authority derivation", () => {
     });
 
     expect(available).toMatchObject([
-      { id: "self", voterLockHash: VIEWER, hasIntent: false },
+      {
+        id: "self",
+        voterLockHash: VIEWER,
+        hasIntent: false,
+        recordedOptionIndex: null,
+        hasConflictingIntentChoices: false,
+      },
     ]);
     expect(used).toMatchObject([
       {
@@ -187,6 +199,8 @@ describe("vote authority derivation", () => {
         hasIntent: true,
         hasPendingIntent: true,
         hasAggregatedIntent: false,
+        recordedOptionIndex: 0,
+        hasConflictingIntentChoices: false,
       },
     ]);
   });
@@ -213,6 +227,42 @@ describe("vote authority derivation", () => {
       hasIntent: true,
       hasPendingIntent: false,
       hasAggregatedIntent: true,
+      recordedOptionIndex: 0,
+      hasConflictingIntentChoices: false,
+    });
+  });
+
+  test("does not invent one recorded choice for conflicting indexed intents", () => {
+    const authorities = deriveVoteAuthorityOptions({
+      poll: makePoll(),
+      intents: [makeIntent({ optionIndex: 0 }), makeIntent({ id: "intent-1", optionIndex: 1 })],
+      delegations: [],
+      viewerLockHash: VIEWER,
+    });
+
+    expect(authorities[0]).toMatchObject({
+      hasIntent: true,
+      recordedOptionIndex: null,
+      hasConflictingIntentChoices: true,
+    });
+  });
+});
+
+describe("aggregation batch presentation", () => {
+  test("counts one-lane chunks without combining different underfilled lanes", () => {
+    expect(countAggregationBatches([40])).toBe(1);
+    expect(countAggregationBatches([60])).toBe(2);
+    expect(countAggregationBatches([30, 20])).toBe(2);
+    expect(countAggregationBatches([50, 50, 1])).toBe(3);
+  });
+});
+
+describe("indexer warning presentation", () => {
+  test("explains a browser fetch failure as stale CKB data, not a contract error", () => {
+    expect(describeIndexerQueryError("Failed to fetch")).toEqual({
+      message:
+        "The app could not reach the configured CKB RPC/indexer. Existing poll data may be stale; check your connection and retry.",
+      detail: "Failed to fetch",
     });
   });
 });
@@ -421,6 +471,58 @@ describe("poll lifecycle UI", () => {
     expect(canFinalizeTallyShardFromUi(poll, 100n)).toBe(false);
     expect(canFinalizeTallyShardFromUi(poll, 101n)).toBe(true);
     expect(getFinalizeShardConfirmationMessage(poll)).toContain(FINALIZE_PENDING_INTENTS_WARNING);
+  });
+
+  test("separates timely, late, aggregated, and unresolved intents for finalization", () => {
+    const check = summarizeFinalizationReadiness(
+      [
+        { aggregated: false, createdEpoch: 100n },
+        { aggregated: false, createdEpoch: 101n },
+        { aggregated: false, createdEpoch: null },
+        { aggregated: true, createdEpoch: 100n },
+      ],
+      100n,
+      1
+    );
+
+    expect(check).toEqual({
+      timelyPendingIntentCount: 1,
+      latePendingIntentCount: 1,
+      unresolvedIntentCount: 2,
+    });
+    expect(finalizationReadinessNeedsCaution(check)).toBe(true);
+    expect(formatFinalizationReadinessCheck(check)).toBe(
+      "1 timely pending intent remains. Finalizing now can leave it permanently uncounted."
+    );
+    expect(getFinalizeShardConfirmationMessage(makePoll(), check)).toBe(
+      "1 timely pending intent remains. Finalizing now can leave it permanently uncounted."
+    );
+  });
+
+  test("keeps the finalization warning concise for many pending intents", () => {
+    const check = summarizeFinalizationReadiness(
+      Array.from({ length: 15 }, () => ({ aggregated: false, createdEpoch: 100n })),
+      100n
+    );
+
+    expect(formatFinalizationReadinessCheck(check)).toBe(
+      "15 timely pending intents remain. Finalizing now can leave them permanently uncounted."
+    );
+  });
+
+  test("does not treat authenticated late intents as finalization blockers", () => {
+    const check = summarizeFinalizationReadiness(
+      [{ aggregated: false, createdEpoch: 101n }],
+      100n
+    );
+
+    expect(finalizationReadinessNeedsCaution(check)).toBe(false);
+    expect(formatFinalizationReadinessCheck(check)).toContain(
+      "No indexed timely pending intents remain"
+    );
+    expect(formatFinalizationReadinessCheck(check)).toContain(
+      "1 late intent cannot count and remains refundable"
+    );
   });
 
   test("shows the active sharded protocol timeline for one poll", () => {

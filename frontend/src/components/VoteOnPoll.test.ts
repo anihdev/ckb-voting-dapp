@@ -49,8 +49,11 @@ function pollFixture(): Poll {
         hasIntent: false,
         hasPendingIntent: false,
         hasAggregatedIntent: false,
+        recordedOptionIndex: null,
+        hasConflictingIntentChoices: false,
       },
     ],
+    aggregationBatchCount: 0,
     outstandingIntentCount: 0,
     lateIntentCount: 0,
     refundableIntentCount: 0,
@@ -59,6 +62,11 @@ function pollFixture(): Poll {
 
 const idleTxState: TxState = { status: "idle", txHash: null, error: null, scope: null, batch: null };
 const action = async () => "0x01";
+const finalizationCheck = async () => ({
+  timelyPendingIntentCount: 0,
+  latePendingIntentCount: 0,
+  unresolvedIntentCount: 0,
+});
 
 function renderPoll(
   voterLockHash: string,
@@ -75,6 +83,7 @@ function renderPoll(
       ...(defaultExpanded === undefined ? {} : { defaultExpanded }),
       onVote: action,
       onAggregate: action,
+      onCheckFinalizationReadiness: finalizationCheck,
       onFinalizeShards: action,
       onFinalizeAllShards: action,
       onMergeShards: action,
@@ -99,6 +108,7 @@ function renderPollWithTxState(txState: TxState, overrides: Partial<Poll> = {}):
       defaultExpanded: true,
       onVote: action,
       onAggregate: action,
+      onCheckFinalizationReadiness: finalizationCheck,
       onFinalizeShards: action,
       onFinalizeAllShards: action,
       onMergeShards: action,
@@ -127,6 +137,7 @@ function renderPollWithDelegate(
       actionInFlight: false,
       onVote: action,
       onAggregate: action,
+      onCheckFinalizationReadiness: finalizationCheck,
       onFinalizeShards: action,
       onFinalizeAllShards: action,
       onMergeShards: action,
@@ -147,6 +158,7 @@ describe("poll-card presentation", () => {
 
     expect(markup).toContain("View details");
     expect(markup).toContain("Vote now");
+    expect(markup).toContain("status-poll-live");
     expect(markup).not.toContain("Hide details");
     expect(markup).not.toContain("Lifecycle and tally details");
     expect(markup).not.toContain("Manchester United");
@@ -260,11 +272,119 @@ describe("poll-card presentation", () => {
     // one action at a time, so this card's controls must still be locked.
     expect(foreignInFlight).not.toContain(`0x${"ee".repeat(32)}`);
     expect(idle).toContain("Select an option");
-    expect(foreignInFlight).toContain("Sending...");
-    expect(foreignInFlight).not.toContain("Select an option");
+    expect(foreignInFlight).toContain("Select an option");
+    expect(foreignInFlight).not.toContain("Submitting intent...");
     expect(idle.match(/disabled=""/g)?.length ?? 0).toBeLessThan(
       foreignInFlight.match(/disabled=""/g)?.length ?? 0
     );
+  });
+
+  test("hides directional tally results until close", () => {
+    const liveMarkup = renderPoll(
+      VOTER,
+      {
+        voteCounts: [2n, 1n, 0n],
+        totalVotes: 3n,
+        totalVoters: 3n,
+      },
+      true
+    );
+    const closedMarkup = renderPoll(
+      VOTER,
+      {
+        isClosed: true,
+        voteCounts: [2n, 1n, 0n],
+        totalVotes: 3n,
+        totalVoters: 3n,
+      },
+      true
+    );
+
+    expect(liveMarkup).not.toContain("poll-option-tally");
+    expect(liveMarkup).not.toContain("poll-option-bar");
+    expect(liveMarkup).toContain("option totals remain hidden here until the poll closes");
+    expect(closedMarkup).toContain("poll-option-tally");
+    expect(closedMarkup).toContain("poll-option-bar");
+    expect(closedMarkup).toContain("(66%)");
+  });
+
+  test("highlights one indexed recorded choice without revealing live totals", () => {
+    const recordedAuthority = {
+      ...pollFixture().authorityOptions[0],
+      hasIntent: true,
+      hasPendingIntent: true,
+      recordedOptionIndex: 1,
+    };
+    const markup = renderPoll(
+      VOTER,
+      { authorityOptions: [recordedAuthority], pendingIntentCount: 1n },
+      true
+    );
+
+    expect(markup).toContain("recorded-choice");
+    expect(markup).toContain("Your recorded choice");
+    expect(markup.indexOf("Chelsea")).toBeLessThan(markup.indexOf("Your recorded choice"));
+    expect(markup).not.toContain("poll-option-tally");
+  });
+
+  test("does not invent one recorded choice for conflicting indexed intents", () => {
+    const conflictingAuthority = {
+      ...pollFixture().authorityOptions[0],
+      hasIntent: true,
+      hasPendingIntent: true,
+      recordedOptionIndex: null,
+      hasConflictingIntentChoices: true,
+    };
+    const markup = renderPoll(
+      VOTER,
+      { authorityOptions: [conflictingAuthority], pendingIntentCount: 2n },
+      true
+    );
+
+    expect(markup).toContain("Multiple indexed intents for this represented voter encode different choices");
+    expect(markup).not.toContain("Your recorded choice");
+    expect(markup).not.toContain("recorded-choice");
+  });
+
+  test("places poll transaction feedback before lifecycle details", () => {
+    const txHash = `0x${"dd".repeat(32)}`;
+    const markup = renderPollWithTxState({
+      status: "confirming",
+      txHash,
+      error: null,
+      scope: { kind: "poll", pollId: pollFixture().id },
+      batch: null,
+    });
+
+    expect(markup).toContain("poll-transaction-feedback");
+    expect(markup.indexOf(txHash.slice(0, 20))).toBeLessThan(
+      markup.indexOf("Lifecycle and tally details")
+    );
+  });
+
+  test("uses Aggregate initially and Next Batch only after tally progress", () => {
+    const oneBatch = renderPoll(VOTER, { aggregationBatchCount: 1 }, true);
+    const initialMultipleBatches = renderPoll(VOTER, { aggregationBatchCount: 2 }, true);
+    const remainingBatch = renderPoll(
+      VOTER,
+      { aggregationBatchCount: 1, totalVotes: 1n, totalVoters: 1n },
+      true
+    );
+    const remainingMultipleBatches = renderPoll(
+      VOTER,
+      { aggregationBatchCount: 2, totalVotes: 1n, totalVoters: 1n },
+      true
+    );
+
+    expect(oneBatch).toContain(">Aggregate</button>");
+    expect(oneBatch).not.toContain("Aggregate Next Batch");
+    expect(initialMultipleBatches).toContain(">Aggregate</button>");
+    expect(initialMultipleBatches).not.toContain("Aggregate Next Batch");
+    expect(initialMultipleBatches).toContain("About 2 aggregation transactions are currently required");
+    expect(remainingBatch).toContain(">Aggregate Next Batch</button>");
+    expect(remainingBatch).toContain("About 1 aggregation transaction remains");
+    expect(remainingMultipleBatches).toContain(">Aggregate Next Batch</button>");
+    expect(remainingMultipleBatches).toContain("About 2 aggregation transactions remain");
   });
 
   test("offers delegation only to a connected non-creator on an open poll", () => {
@@ -280,6 +400,14 @@ describe("poll-card presentation", () => {
     expect(renderPollWithDelegate("ckt1test", VOTER, { isClosed: true })).not.toContain(
       DELEGATE_ACTION
     );
+  });
+
+  test("renders safely when a disconnected viewer has no voting authority", () => {
+    const markup = renderPollWithDelegate(null, null, { authorityOptions: [] });
+
+    expect(markup).toContain("Which is the best team?");
+    expect(markup).not.toContain("Vote now");
+    expect(markup).not.toContain("Your recorded choice");
   });
 
   test("offers the compact voting shortcut only for an unused eligible authority", () => {

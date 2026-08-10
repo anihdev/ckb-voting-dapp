@@ -7,7 +7,7 @@ It is written for other builders, future implementation sessions, and models
 picking up this repo. It is not a protocol spec. For protocol behavior see
 `README.md`, `SHARDED_AGGREGATION_EXPLAINED.md`, and the contract code.
 
-Original pass: 2026-08-03. Follow-up verification: 2026-08-05.
+Original pass: 2026-08-03. Latest follow-up: 2026-08-10.
 
 **Implementation follow-up:** the capacity and multi-transaction finalization
 analysis in this note led to an approved v2 implementation later on August 5.
@@ -439,3 +439,119 @@ Outside folding is disabled during signing, broadcasting, and confirmation so
 transaction feedback cannot be hidden. A successful transaction retains the
 existing form-reset behavior. Drafts are deliberately not persisted to browser
 storage, where stale poll scope or wallet-specific data could survive a reload.
+
+## Follow-Up: Live Poll Status Motion
+
+The `Active` status on a live poll now uses a restrained animated halo and
+status dot. The label itself remains fully opaque and fixed in place, so the
+motion signals that voting is live without changing the badge dimensions or
+reducing readability.
+
+The animation is poll-specific. Expired and closed poll states, delegation
+statuses, and other uses of the active status color remain static. Browsers
+with reduced-motion enabled receive a static highlighted outline instead.
+
+The live status was reviewed at desktop, split-screen, and 390px mobile widths.
+It remains contained within the poll header without overlap or layout shift.
+
+## Follow-Up: Vote Feedback, Tally Visibility, And Maintenance Actions
+
+Real testnet use showed that the active poll card still mixed three different
+concerns: selecting a vote, observing the transaction, and reading detailed
+lifecycle state. It also displayed live option totals even though a participant
+mainly needs confirmation of their own recorded choice while voting remains
+open.
+
+The expanded card now follows this order:
+
+1. voting authority, options, and state-changing actions;
+2. transaction progress or a local action error;
+3. lifecycle and tally details, always last.
+
+After a vote intent commits, the selected represented authority's option is
+highlighted as `Your recorded choice`. The durable label is derived from
+indexed intent data. A local committed-choice fallback makes the confirmation
+visible immediately while the refreshed index is being rendered. If the
+indexer finds conflicting live choices for the same represented voter, the UI
+does not invent one recorded choice; it reports the conflict instead.
+
+Open and expired-but-unclosed polls no longer render per-option counts,
+percentage bars, or percentage labels. Closed polls render those final result
+details. Overall participation and pending-intent metadata may remain visible
+because they do not identify the currently leading option. This is a display
+policy, not cryptographic privacy: vote-intent and tally cells remain public on
+CKB and can be inspected outside this frontend.
+
+### Aggregation wording
+
+One aggregation transaction updates exactly one deterministic tally lane and
+includes at most `MAX_INTENTS_PER_AGG` (50) timely intents. Intents assigned to
+different lanes cannot share one transaction even when both lanes are below
+the limit. The UI therefore estimates remaining transactions per lane and sums
+`ceil(pending_in_lane / 50)` across unfinalized lanes:
+
+- before any indexed tally progress: `Aggregate`, regardless of how many
+  lane-bound transactions are estimated;
+- after tally state has advanced and timely work remains: `Aggregate Next
+  Batch`;
+- active operation: `Aggregating...` with a fixed-size spinner.
+
+Indexed tally totals provide the durable progress signal, with a just-confirmed
+local aggregation as a short refresh fallback. The estimate only selects
+wording and visibility. The builder still chooses one actual lane and up to 50
+intents, and the Rust contract remains the source of truth for acceptance.
+Finalization has its own `Finalizing...` state and continues to use the reviewed
+bounded multi-lane transaction flow.
+
+### Finalization readiness handshake
+
+Clicking a finalization action now performs a fresh exact-scope indexer scan for
+that poll's live intent cells before opening the confirmation dialog. The scan
+classifies unaggregated intents by authenticated creation-header epoch:
+
+- timely pending intents still need aggregation and trigger `Finalize Anyway`;
+- late intents cannot count and remain refundable, so they are reported but do
+  not make the readiness result cautionary;
+- missing creation headers or unreadable matching cells make the result
+  inconclusive and trigger `Finalize Anyway`.
+
+The scan is a UI handshake rather than a blocker. To keep the confirmation
+compact, the dialog shows one readiness result: the timely pending count, an
+inconclusive warning, or confirmation that no indexed timely work remains. A
+failed or cautionary check permits an explicit `Finalize Anyway`, preserving
+the protocol's liveness policy. Public protocol documentation separately states
+that indexer discovery is not proof of complete vote coverage. Independently,
+the Rust aggregation validator loads each intent input's creation header through
+`Source::Input` and rejects an epoch after the poll deadline, so a stale or
+incorrect frontend classification cannot make a late intent count.
+
+### Connection failures and control hints
+
+A browser `Failed to fetch` error means the app could not reach its configured
+CKB RPC/indexer endpoint; it is not a contract rejection. The warning now says
+that indexed data may be stale, offers an explicit retry, and preserves the raw
+error under a technical-detail disclosure.
+
+App-owned buttons, links, selectors, and disclosure controls now carry concise
+native hover descriptions. Visible labels and accessibility names remain the
+primary interaction text, so mobile and keyboard use do not depend on hover.
+Poll cards also stay expanded while a state-changing transaction is active so
+their transaction feedback cannot disappear on an outside pointer press.
+
+### Latest verification
+
+`make validate` passes with 63 CKB-VM tests and 151 focused
+TypeScript/React/deploy tests. Browser checks covered 1440px desktop, 720px
+split-screen, and 390px mobile layouts, including an expanded active poll. The
+option grid, warning copy, horizontal lifecycle filters, poll metadata, and
+lifecycle table remained contained without incoherent overlap.
+
+The first browser run also caught a disconnected-view regression that static
+fixtures had missed: both the submitted choice and selected authority were
+null, and comparing their optional ids entered a branch that dereferenced the
+null submitted choice. The condition now requires an actual submitted choice,
+and a disconnected/no-authority component test protects startup rendering.
+
+Wallet signing was not automated by this visual pass. Operation-specific
+spinners and the transaction track are covered by component logic and should
+still be exercised during the next connected-wallet testnet rehearsal.

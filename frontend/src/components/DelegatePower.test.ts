@@ -44,6 +44,7 @@ function pollFixture(overrides: Partial<Poll> = {}): Poll {
     },
     totalVotes: 0n,
     authorityOptions: [],
+    aggregationBatchCount: 0,
     outstandingIntentCount: 0,
     lateIntentCount: 0,
     refundableIntentCount: 0,

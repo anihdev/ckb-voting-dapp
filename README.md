@@ -264,7 +264,6 @@ Incomplete or operationally limited:
 ckb-voting-dapp/
 ├── README.md
 ├── SHARDED_AGGREGATION_EXPLAINED.md
-├── Tally_lane_Sparse-merkle_ImplL.md
 ├── Governance_Ui_Clarity.md
 ├── OFFICIAL_DAO_BUILDER_SDK_GRANT_PROPOSAL.md
 ├── LICENSE
@@ -409,7 +408,7 @@ They deliberately stop before post-deadline finalization and close.
 - deployed `data1` code hash: `0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`;
 - release ELF: `125,376` bytes, SHA-256 `6c1c3437e158ec075af12840d89cc2d84a9ff88a1aa86e8fd242047636f5a039`;
 - production frontend: [ckb-voting-dapp.vercel.app](https://ckb-voting-dapp.vercel.app);
-- Vercel deployment: `dpl_4MUiN1QZRfKQt7LcjBZ7GG2WPmnP`.
+- Vercel deployment: `dpl_7MPbGfSZcyDPhmfomvJa8JVyvB9W`.
 
 ## Indexing And UI
 
@@ -421,7 +420,11 @@ The frontend discovers cells with scoped type-script queries:
 - merge results by exact `MERGE_TALLY_SHARDS || poll_type_hash`;
 - delegations by the `DELEGATE` prefix.
 
-The UI distinguishes aggregated tally state, timely pending intents, late refundable intents, active revocation-based delegations, finalized shard coverage, merge progress, close readiness, and refund actions.
+The UI distinguishes aggregated tally state, timely pending intents, late refundable intents, active revocation-based delegations, finalized shard coverage, merge progress, close readiness, and refund actions. During an open poll it highlights the connected represented voter's indexed choice but hides per-option counts, bars, and percentages until close. This is presentation-only, not ballot privacy: intent and tally cells remain publicly inspectable on CKB.
+
+Aggregation copy follows indexed lane assignment. One transaction updates one deterministic tally lane and processes at most 50 timely intents, so underfilled intents from different lanes cannot be combined merely because their total is below 50. The first operation reads `Aggregate` even when several lane-bound transactions are estimated. After tally state has advanced, remaining work reads `Aggregate Next Batch`; Rust contract validation remains authoritative.
+
+Before opening a finalization confirmation, the reference UI performs a fresh exact-scope indexer scan of the poll's live intent cells. The popup gives one concise readiness result: a timely pending count, an inconclusive warning, or confirmation that no indexed timely work remains. A cautionary or unavailable result changes the action to `Finalize Anyway` but does not become a protocol gate. This preflight reduces accidental omission.
 
 ## Testing
 
@@ -458,5 +461,4 @@ The contract, frontend, deployment tooling, and proposed SDK work are available 
 - [Nervos sparse-merkle-tree](https://github.com/nervosnetwork/sparse-merkle-tree)
 - [Pinned sparse-merkle-tree revision](https://github.com/nervosnetwork/sparse-merkle-tree/tree/725cd69d95e3e34cd302e83d86178e959fc53687)
 - [Sharded aggregation explainer](SHARDED_AGGREGATION_EXPLAINED.md)
-- [Tally lane sparse-Merkle implementation](Tally_lane_Sparse-merkle_ImplL.md)
 - [Governance UI clarity pass](Governance_Ui_Clarity.md)

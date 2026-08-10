@@ -18,6 +18,7 @@ import {
 } from "./lib/ckb";
 import {
   buildProtocolTimeline,
+  describeIndexerQueryError,
   formatApproxWallClockDuration,
   getPollFilterCounts,
   getPollLifecycleStatus,
@@ -69,6 +70,7 @@ function InnerApp() {
     txState,
     actionInFlight,
     fetchPolls,
+    checkFinalizationReadiness,
     createPoll,
     castVote,
     aggregatePoll,
@@ -120,6 +122,7 @@ function InnerApp() {
   }, [lastSyncedAt]);
 
   const currentEpoch = chainTip?.epoch ?? 0n;
+  const indexerWarning = loadError ? describeIndexerQueryError(loadError) : null;
   const bestKnownBlock = chainTip?.bestKnownBlockNumber ?? null;
   const blocksBehind =
     chainTip && bestKnownBlock !== null && bestKnownBlock > chainTip.blockNumber
@@ -318,10 +321,29 @@ function InnerApp() {
                 <div style={{ marginTop: 4 }}>{walletError}</div>
               </div>
             )}
-            {loadError && (
+            {indexerWarning && (
               <div className="alert alert-warn">
-                <strong>Indexer query warning</strong>
-                <div style={{ marginTop: 4 }}>{loadError}</div>
+                <strong>CKB data connection warning</strong>
+                <div style={{ marginTop: 4 }}>{indexerWarning.message}</div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void syncDashboard();
+                    }}
+                    disabled={loading || refreshing}
+                    title="Retry the CKB RPC and indexer queries now"
+                    className="btn-quiet px-3 py-1.5 text-xs"
+                  >
+                    {loading || refreshing ? "Retrying..." : "Retry data query"}
+                  </button>
+                  <details className="text-xs subtle">
+                    <summary title="Show the underlying RPC or browser error">Technical detail</summary>
+                    <div className="mt-1 font-mono" style={{ overflowWrap: "anywhere" }}>
+                      {indexerWarning.detail}
+                    </div>
+                  </details>
+                </div>
               </div>
             )}
           </div>
@@ -341,6 +363,7 @@ function InnerApp() {
                 href="https://faucet.nervos.org/"
                 target="_blank"
                 rel="noopener noreferrer"
+                title="Open the Nervos CKB testnet faucet"
                 className="btn-primary"
                 style={{ display: "inline-block", borderRadius: 9999, padding: "11px 24px", textDecoration: "none" }}
               >
@@ -374,6 +397,7 @@ function InnerApp() {
               castVote({ poll, optionIndex, authorityId })
             }
             onAggregate={aggregatePoll}
+            onCheckFinalizationReadiness={checkFinalizationReadiness}
             onFinalizeShards={finalizeShards}
             onFinalizeAllShards={finalizeAllShards}
             onMergeShards={mergeShards}
@@ -444,6 +468,7 @@ function InnerApp() {
                   className="input"
                   value={timelinePoll?.id ?? ""}
                   onChange={(event) => setTimelinePollId(event.target.value || null)}
+                  title="Choose which poll lifecycle to display"
                 >
                   {timelinePolls.map((poll) => (
                     <option key={poll.id} value={poll.id}>

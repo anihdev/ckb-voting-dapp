@@ -48,9 +48,18 @@ export interface Poll {
   tallyFrontier: TallyFrontierMetadata;
   totalVotes: bigint;
   authorityOptions: VoteAuthorityOption[];
+  /** Indexer-derived estimate; contract validation remains authoritative. */
+  aggregationBatchCount: number;
   outstandingIntentCount: number;
   lateIntentCount: number;
   refundableIntentCount: number;
+}
+
+/** Advisory result from a fresh poll-scoped intent scan before finalization. */
+export interface FinalizationReadinessCheck {
+  timelyPendingIntentCount: number;
+  latePendingIntentCount: number;
+  unresolvedIntentCount: number;
 }
 
 export interface VoteIntent {
@@ -101,6 +110,10 @@ export interface VoteAuthorityOption {
   hasIntent: boolean;
   hasPendingIntent: boolean;
   hasAggregatedIntent: boolean;
+  /** One unambiguous indexed choice for this represented voter, if available. */
+  recordedOptionIndex: number | null;
+  /** True when separately valid live intents encode different choices. */
+  hasConflictingIntentChoices: boolean;
 }
 
 /**

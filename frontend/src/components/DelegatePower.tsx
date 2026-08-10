@@ -174,6 +174,7 @@ export function DelegatePower({
         <button
           type="button"
           onClick={() => setExpanded(true)}
+          title="Open the poll-scoped delegation form"
           className="btn-primary mt-4"
         >
           Create Delegation
@@ -191,6 +192,7 @@ export function DelegatePower({
             type="button"
             onClick={() => setExpanded(false)}
             disabled={isBusy}
+            title="Fold delegation tools without discarding the draft"
             className="btn-quiet px-3 py-1.5 text-xs uppercase"
           >
             Close
@@ -212,6 +214,7 @@ export function DelegatePower({
             value={delegateLockHash}
             onChange={(event) => setDelegateLockHash(event.target.value)}
             placeholder="ckt1... or 0x..."
+            title="Enter the delegate's CKB address or lock hash"
             className="input"
             disabled={isBusy}
           />
@@ -227,6 +230,7 @@ export function DelegatePower({
               value={pollId}
               onChange={(event) => setPollId(event.target.value)}
               placeholder="Paste the poll ID"
+              title="Enter the poll ID this delegation may authorize"
               className="input"
               required
               disabled={isBusy}
@@ -256,6 +260,7 @@ export function DelegatePower({
         <button
           type="submit"
           disabled={!canSubmitNew}
+          title="Build, sign, and submit this poll-scoped delegation"
           className="btn-primary"
         >
           {isBusy ? "Processing..." : "Create Delegation"}
@@ -304,6 +309,7 @@ export function DelegatePower({
                           void revokeDelegation(delegation.id);
                         }}
                         disabled={isBusy}
+                        title="Revoke this delegation and recover its locked capacity"
                         className="btn-danger"
                       >
                         Revoke
