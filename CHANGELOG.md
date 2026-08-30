@@ -1,0 +1,2 @@
+This file contains the changelog for the CKB Voting DApp project. It documents the recent edits made to the protocol, highlighting the changes in the code and providing context for the modifications.
+

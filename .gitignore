@@ -16,6 +16,7 @@ frontend/tally-smt-wasm/target/
 .cache/
 .turbo/
 .ts-node/
+.claude
 
 # TypeScript
 *.tsbuildinfo
@@ -68,7 +69,12 @@ z_contracts/
 !June_zk_1st_weekly_update.md
 !June_dao_builder_sdk_3rd_weekly_update.md
 !June_sdk2_4th_weekly_update.md
+!August_2nd_weekly_update.md
+!August_3rd_weekly_update.md
+!August_4th_weekly_update.md
+!CHANGELOG.md
 !SHARDED_AGGREGATION_EXPLAINED.md
 !OFFICIAL_DAO_BUILDER_SDK_GRANT_PROPOSAL.md
 !Governance_Ui_Clarity.md
 !Tally_lane_Sparse-merkle_ImplL.md
+# !FINALIZATION_ASSURANCE_IMPLEMENTATION_RECORD.md
