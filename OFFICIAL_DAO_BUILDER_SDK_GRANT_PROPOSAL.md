@@ -4,9 +4,9 @@
 
 ### One-Paragraph Overview
 
-This proposal requests a grant of **$9,000 USD equivalent in CKB** to productize the existing CKB Governance Protocol into a reusable DAO/SubDAO Builder SDK for CKB applications. The work turns a working cell-native governance protocol into integration-ready infrastructure: TypeScript transaction builders, React hooks/components, project-neutral eligibility adapters, a reference SubDAO dashboard, testnet demo flows, and integration documentation. The goal is not to build another standalone DAO app, but to give CKB community apps a governance kit they can plug into directly.
+This proposal requests a grant of **$9,500 USD equivalent in CKB** to productize the existing CKB Governance Protocol into a reusable DAO/SubDAO Builder SDK for CKB applications. The work turns a working cell-native governance protocol into integration-ready infrastructure: TypeScript transaction builders, React hooks/components, project-neutral eligibility adapters, a reference SubDAO dashboard, testnet demo flows, and integration documentation. The goal is not to build another standalone DAO app, but to give CKB community apps a governance kit they can plug into directly.
 
-The protocol finalizes auditable tallies over the vote intents actually aggregated into finalized tally shards. It does not yet prove that every valid timely intent was aggregated before finalization. Consuming applications define quorum, pass/fail thresholds, decision policy, and how a closed result is acted upon. Automatic treasury execution is not included.
+The protocol finalizes auditable tallies over the vote intents actually aggregated into finalized tally shards. Consuming applications define quorum, pass/fail thresholds, decision policy, and how a closed result is acted upon. Automatic treasury execution is not included.
 
 ### Deliverables
 
@@ -20,9 +20,9 @@ The protocol finalizes auditable tallies over the vote intents actually aggregat
 
 All deliverables ship on testnet.
 
-**Grant Amount Requested:** $9,000 USD equivalent, paid in CKB at the USD value at the time of each disbursement.
+**Grant Amount Requested:** $9,500 USD equivalent, paid in CKB at the USD value at the time of each disbursement.
 
-**ETA to Completion:** 12 weeks from disbursement of initial funding.
+**ETA to Completion:** 14 weeks from disbursement of initial funding.
 
 **Funding Address:** `ckb1qyqtltq6wl2dkga9nftmm4gwsk3yteu0ck7qjh7ctr`
 
@@ -115,34 +115,35 @@ CKB's cell model is a strong fit for governance because proposals, votes, delega
 
 This grant funds the productization of an already-working protocol, not a project starting from zero.
 
-On August 5, 2026, I deployed the v2 tally-lane release to CKB testnet in
-[transaction `0x5a3ecd82...06ae9d5`](https://pudge.explorer.nervos.org/transaction/0x5a3ecd82853538347a3a6b48ef110f368062979f6cb88bbb9d4bcbb7306ae9d5),
+On August 30, 2026, I deployed the approved hardened tally-lane release to CKB
+testnet in
+[transaction `0xc82294a1...e5fbd97e`](https://pudge.explorer.nervos.org/transaction/0xc82294a1503e51a0d668ab94554eaa60f972a0dd0f2cb14ddf573510e5fbd97e),
 output `0`, with `data1` code hash
-`0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`.
-I rebuilt the [live reference frontend](https://ckb-voting-dapp.vercel.app)
-against that code cell and verified that its served bundle contains the new
-contract identifiers and browser sparse-Merkle WASM. The prior code cell remains
-live for historical testnet cells and was not recycled.
+`0x2300964979e336dc8196c61a177846e7249091ba7db5a9bfd7db834048f7f6ef`.
+The deployment committed at block `22,252,969`. I redeployed the
+[live reference frontend](https://ckb-voting-dapp.vercel.app) with those
+identifiers as Vercel deployment `dpl_FYbPSSF1iZA7PAdAXdd5ge6EsLVq`.
 
-This establishes the current deployment and frontend configuration. It does not
-replace the still-pending controlled multi-actor lifecycle rehearsal, and I will
-not present unexercised testnet flows as completed evidence.
-
-Already implemented:
+Already implemented in the repository:
 
 - Type ID-backed proposal identity.
 - Governance-locked vote intent cells.
 - Sharded tally aggregation using `CREATE_TALLY_SHARD`.
 - Fixed-size per-lane counted-voter commitments with versioned aggregation
   proofs, removing the former growing lane-data boundary.
-- One-to-eight-lane finalization in one bounded transaction.
-- Bounded merge/result close using `MERGE_TALLY_SHARDS`.
-- Creator close and permissionless force-close paths.
+- One-transaction full-set finalization for current-code polls with `1..16`
+  active lanes after one aggregation-grace epoch.
+- Bounded direct close for `<=8` lanes and bounded merged close for `9..16`
+  lanes using `MERGE_TALLY_SHARDS`; larger shard counts are historical
+  old-code-hash territory, not active current-code maintenance.
+- Creator close at the same post-grace threshold and permissionless force-close
+  at the later grace threshold.
 - Delegation and revocation cells.
 - Post-close omitted-intent refund path.
 - Frontend reference app with create, vote, aggregate, finalize, merge, close, force-close, delegate, revoke, and refund surfaces.
 - A reproducible `make validate` workflow and GitHub Actions validation path.
 - Verified Vercel deployment of the reference frontend configured for the current testnet.
+- Current measured 16-lane full-set finalization envelope: 6,391 transaction bytes / 26,572,000 CKB-VM cycles.
 
 Still missing:
 
@@ -157,19 +158,45 @@ Still missing:
 - Integration guide for external apps.
 - Testnet demo specifically showing SDK-style integration.
 
+This roadmap was shaped through public implementation review documented in the
+[project journey and public review thread](https://talk.nervos.org/t/ckb-governance-cell-native-dao-voting-protocol-on-testnet-create-poll-question-vote-delegate-aggregate-close/10584).
+The May [multi-actor architecture review by chenyukang](https://github.com/Nervos-Community-Catalyst/CKBuilder-projects/issues/14#issuecomment-4394060554)
+exposed the single-signer happy path and shared poll-cell aggregation
+contention. The deployed protocol responds by governance-locking intent
+transitions while preserving refund ownership in cell data, and moves mutable
+tally state into deterministic lanes so independent voters do not consume one
+shared poll input.
+
+The later [finalization and completeness review by Phroi](https://talk.nervos.org/t/ckb-governance-cell-native-dao-voting-protocol-on-testnet-create-poll-question-vote-delegate-aggregate-close/10584/4)
+identified two immediate defects: selective subset finalization and a
+`pending_intent_count` field that was always zero but had been presented as a
+close-time lower bound. The August 30 hardened deployment now requires the
+complete ordered `0..shard_count-1` active lane set to finalize atomically for
+current-code polls, after one aggregation-grace epoch. It also treats
+`pending_intent_count` as reserved zero and removes the false lower-bound
+interpretation. These changes remove targeted lane sealing and the misleading
+counter guarantee.
+
+They do not prove that every timely intent was aggregated before the complete
+lane set was finalized. Result assurance therefore keeps intent inclusion
+explicitly `unproven`. This grant funds the next unfinished layer: strict
+represented-principal one-shot authority, principal-funded delegation, reusable
+SDK extraction, eligibility-policy integration, and public testnet integration
+evidence. Vote completeness remains outside this grant's current implementation
+scope.
+
 ### Protocol Guarantees And Timing Boundary
 
 The Rust contract and codec remain authoritative for protocol behavior. Active script families are `CREATE_POLL`, `CREATE_VOTE_INTENT`, `CREATE_TALLY_SHARD`, `MERGE_TALLY_SHARDS`, `CLOSE_POLL`, and `DELEGATE`. Delegation revocation is the validated destruction transition of a `DELEGATE` cell; retired opcodes `0x03` and `0x06` are permanently rejected.
 
 - Intent cutoff is authenticated from the block epoch that created each consumed intent cell, not from caller-selected metadata or a claimed current header.
 - Aggregation includes the corresponding creation headers and validates them through the consumed inputs.
-- Every selected shard-finalization input requires a validated absolute epoch
-  `since`; creator close and force-close retain their fixed protocol-input
-  timing rules.
+- Every selected shard-finalization input in the complete lane-set prefix requires the same validated absolute epoch `since`; current finalization and creator close first accept at integer epoch `deadline + 2`, while force-close first accepts at `deadline + 11`.
 - Timely intents may aggregate after the deadline until their shard is finalized. Late intents cannot count and have an exact-capacity refund path.
 - Version 1 delegation is revocation-based; the retained expiry field must be zero.
 - Poll creators cannot submit vote intents directly, delegate their own vote, or submit as another voter's delegate. This is enforced by lock hash and is not a personhood claim.
 - `VoteIntentData.voted_at_epoch` is retained as non-consensus codec metadata.
+- `pending_intent_count` is retained as a reserved-zero compatibility field for current producible polls. Visible pending and readiness counts come from advisory RPC/indexer discovery and fresh poll-scoped scans.
 - New polls are equal-weight only and require a zero `udt_type_hash`; weighted historical cells are recovery-only under the current deployment.
 
 Deposits are recoverable through validated close and refund paths. Final tallies are correct over intents actually aggregated into finalized shards, but the protocol does not prove that every valid timely intent was included. Sharding reduces contention across tally lanes, although updates to the same lane still serialize. Permissionless maintenance authorizes any valid operator transaction; it does not create a built-in operator reward.
@@ -196,7 +223,7 @@ A consuming CKB app's flow through the SDK:
 
 3. **Create a proposal.** The SDK builds the proposal transaction using the governance protocol's `CREATE_POLL` flow. The proposal creates a poll cell and its tally-lane set.
 
-4. **Submit votes.** Eligible participants will use one poll-scoped. Milestone 2 will implement a poll-scoped, one-shot authority for each canonical represented principal. The principal may exercise it directly or assign it exclusively to a delegate; both paths consume the same authority, ensuring that only one valid intent can be created. For protocol-enforced eligibility policies, the poll will commit to the policy and the governance contract will validate the corresponding eligibility evidence on chain.
+4. **Submit votes.** Milestone 2 will implement a poll-scoped, one-shot authority for each canonical represented principal. The principal may exercise it directly or assign it exclusively to a delegate; both paths consume the same authority, ensuring that only one valid intent can be created. For protocol-enforced eligibility policies, the poll will commit to the policy and the governance contract will validate the corresponding eligibility evidence on chain.
 
 5. **Maintain the proposal.** Any party can aggregate pending intents into tally lanes, finalize after deadline, merge larger results, close the proposal, or recover omitted deposits.
 
@@ -380,7 +407,7 @@ The core SDK remains open infrastructure.
 
 **ETA:** Week 0
 
-**Budget:** $900 USD (10%)
+**Budget:** $950 USD (10%)
 
 Deliverables:
 
@@ -399,7 +426,7 @@ Acceptance:
 
 **ETA:** Weeks 1-3
 
-**Budget:** $2,250 USD (25%)
+**Budget:** $2,375 USD (25%)
 
 Deliverables:
 
@@ -428,9 +455,9 @@ Acceptance:
 
 ### Milestone 2: Core Protocol And TypeScript Governance SDK
 
-**ETA:** Weeks 4-6
+**ETA:** Weeks 4-7
 
-**Budget:** $2,700 USD (30%)
+**Budget:** $2,850 USD (30%)
 
 Deliverables:
 
@@ -464,9 +491,9 @@ Acceptance:
 
 ### Milestone 3: React Integration Layer And Eligibility Adapters
 
-**ETA:** Weeks 7-9
+**ETA:** Weeks 8-11
 
-**Budget:** $2,250 USD (25%)
+**Budget:** $2,375 USD (25%)
 
 Deliverables:
 
@@ -489,9 +516,9 @@ Acceptance:
 
 ### Milestone 4: Testnet Demo And Integration Guide
 
-**ETA:** Weeks 10-12
+**ETA:** Weeks 12-14
 
-**Budget:** $900 USD (10%)
+**Budget:** $950 USD (10%)
 
 Deliverables:
 
@@ -520,14 +547,14 @@ Acceptance:
 
 ## Budget Breakdown
 
-The $9,000 USD equivalent funds 12 weeks of solo development to productize the existing CKB Governance Protocol into a reusable DAO/SubDAO Builder SDK and ship a testnet reference demo.
+The $9,500 USD equivalent funds 14 weeks of solo development to productize the existing CKB Governance Protocol into a reusable DAO/SubDAO Builder SDK and ship a testnet reference demo. The schedule gives four weeks each to the two implementation-heavy middle milestones: contract/core SDK work and React/adapter/external-consumer integration. Architecture review and final testnet delivery retain three weeks each.
 
-### Development Costs: $7,600
+### Development Costs: $8,100
 
-- Core protocol, represented-principal authority, and TypeScript SDK extraction/tests: ~$2,200.
+- Core protocol, represented-principal authority, and TypeScript SDK extraction/tests: ~$2,500.
 - React hooks/components and dashboard refactor: ~$1,500.
-- Eligibility adapter boundary, CKBoost-compatible reference, membership-cell reference, on-chain policy extension, and policy tests: ~$2,200.
-- Runtime validation, Pudge testnet rehearsal, demo flows, and integration cleanup: ~$1,700.
+- Eligibility adapter boundary, CKBoost-compatible reference, membership-cell reference, on-chain policy extension, and policy tests: ~$2,300.
+- Runtime validation, Pudge testnet rehearsal, demo flows, and integration cleanup: ~$1,800.
 
 ### Documentation And Community Reporting: $900
 
@@ -551,7 +578,7 @@ No formal third-party audit is included in this proposal. The SDK and reference 
 
 Absorbed in development. Solo developer; project management overhead is minimal.
 
-**Total:** $9,000 USD equivalent in CKB.
+**Total:** $9,500 USD equivalent in CKB.
 
 ---
 
@@ -679,6 +706,9 @@ Feedback, reviewer suggestions, and integration interest from CKB community proj
 
 - [CKB Community Fund DAO rules and process](https://talk.nervos.org/t/ckb-community-fund-dao-rules-and-process/6874)
 - [CKBoost proposal](https://talk.nervos.org/t/dis-ckboost-gamified-community-engagement-platform-proposal/8832)
+- [Project journey and public review thread](https://talk.nervos.org/t/ckb-governance-cell-native-dao-voting-protocol-on-testnet-create-poll-question-vote-delegate-aggregate-close/10584)
+- [Chenyukang's multi-actor architecture review](https://github.com/Nervos-Community-Catalyst/CKBuilder-projects/issues/14#issuecomment-4394060554)
+- [Phroi's finalization and completeness review](https://talk.nervos.org/t/ckb-governance-cell-native-dao-voting-protocol-on-testnet-create-poll-question-vote-delegate-aggregate-close/10584/4)
 
 ### Potential Integration Surfaces
 

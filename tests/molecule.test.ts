@@ -48,6 +48,7 @@ function makePoll(overrides: Partial<PollData> = {}): PollData {
     is_closed: false,
     total_voters: 13n,
     creator_deposit: 500n * 100_000_000n,
+    // Codec-only compatibility data. Current protocol-valid polls require zero.
     pending_intent_count: 2n,
     counted_voter_lock_hashes: Array.from({ length: 13 }, (_, index) =>
       new Uint8Array(32).fill(index + 1)

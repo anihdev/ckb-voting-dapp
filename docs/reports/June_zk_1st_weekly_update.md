@@ -1,6 +1,6 @@
 # Builder Track Weekly Status Update
 
-**Name:** Anih Soma (AnihDev)  
+**Name:** Anih Soma (AnihDev)
 **Duration:** 1st June, 2026 - 7th June, 2026
 
 ## Focus of the Week
@@ -48,6 +48,6 @@ The conclusion is that the governance protocol should keep its current CKB-nativ
 
 ## Next Step
 
-The immediate next step is to implement Phase Z1 from `zk_plan.md`: define the public input encoding, intent batch digest, poll state digest, circuit version constants, and verifier key tracking before any contract changes are made.
+The immediate next step is to implement Phase Z1 from the private `docs/private/zk_plan.md` design record: define the public input encoding, intent batch digest, poll state digest, circuit version constants, and verifier key tracking before any contract changes are made.
 
 After that, the best external action is to contact Cecilia with the concrete integration ask above and request feedback on whether `groth16-ckb` is suitable for this aggregation proof shape.

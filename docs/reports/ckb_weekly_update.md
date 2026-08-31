@@ -1,7 +1,7 @@
 # Builder Track Weekly Status Update
 
 
-**Name:** Anih Soma (AnihDev)  
+**Name:** Anih Soma (AnihDev)
 **Duration:** 8th May, 2026 - 17th May, 2026
 
 
@@ -39,7 +39,7 @@ So I split the reviewers' remarks into two phases to for Easy tracking of what h
 - Concern: close/force-close timing needed concrete evidence.
   - Addressed by before-grace fail checks and after-grace pass-or-skip scenario gating.
 
-## Known Limits 
+## Known Limits
 
 - Current architecture is still constrained by voter-owned intent locks.
 - Aggregation remains serialized through poll cell transitions.

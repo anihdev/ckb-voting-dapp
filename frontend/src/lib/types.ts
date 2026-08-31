@@ -16,6 +16,17 @@ export type TallyFrontierSource =
   | "complete-merge"
   | "closed-poll";
 
+export interface ResultAssuranceV1 {
+  version: 1;
+  protocolCodeHash: string;
+  protocolHashType: string;
+  tallyIntegrity: "on_chain_verified";
+  laneCoverage: "partial" | "complete";
+  intentInclusion: "unproven";
+  authorityUniqueness: "counted_once";
+  eligibility: "open";
+}
+
 export interface TallyFrontierMetadata {
   source: TallyFrontierSource;
   coveredShardCount: number;
@@ -24,6 +35,49 @@ export interface TallyFrontierMetadata {
   selectedMergeResultIds: string[];
   selectedShardIds: number[];
   uncoveredShardIds: number[];
+}
+
+export type PollMaintenanceStateKind =
+  | "unsupported_current_code"
+  | "closed"
+  | "malformed_indexed_lane_set"
+  | "incomplete_indexed_lane_set"
+  | "awaiting_finalize_threshold"
+  | "ready_to_finalize"
+  | "mixed_partially_finalized"
+  | "ready_for_direct_close"
+  | "awaiting_merge"
+  | "merge_in_progress"
+  | "ready_for_merged_close";
+
+export type IndexedLaneDomainState =
+  | "all_live"
+  | "all_finalized"
+  | "mixed"
+  | "missing"
+  | "malformed";
+
+export interface PollMaintenanceState {
+  kind: PollMaintenanceStateKind;
+  indexedLaneDomain: IndexedLaneDomainState;
+  activeCurrentCodePoll: boolean;
+  missingLaneIds: number[];
+  earliestFinalizeEpoch: bigint;
+  earliestCreatorCloseEpoch: bigint;
+  earliestForceCloseEpoch: bigint;
+  closeEvidenceReady: boolean;
+  creatorCloseTimingReached: boolean;
+  creatorCloseEligible: boolean;
+  forceCloseTimingReached: boolean;
+  forceCloseEligible: boolean;
+  finalizeReady: boolean;
+  finalizationCompleted: boolean;
+  mergeRequired: boolean;
+  mergeReady: boolean;
+  mergeInProgress: boolean;
+  hasCompleteMergeResult: boolean;
+  canonicalCoveredShardCount: number;
+  canonicalCoverageComplete: boolean;
 }
 
 export interface Poll {
@@ -39,13 +93,13 @@ export interface Poll {
   totalVoters: bigint;
   creatorDeposit: bigint;
   pendingIntentCount: bigint;
-  protocolPendingIntentCount: bigint;
   tokenWeighted: boolean;
   udtTypeHash: string;
   shardCount: number;
   tallyShards: TallyShard[];
   tallyMergeResults: TallyMergeResult[];
   tallyFrontier: TallyFrontierMetadata;
+  resultAssurance: ResultAssuranceV1 | null;
   totalVotes: bigint;
   authorityOptions: VoteAuthorityOption[];
   /** Indexer-derived estimate; contract validation remains authoritative. */
@@ -171,14 +225,6 @@ export interface TxState {
   txHash: string | null;
   error: string | null;
   scope: TxScope | null;
-  /** Progress for multi-transaction runs such as finalizing every tally lane. */
-  batch: TxBatchProgress | null;
-}
-
-export interface TxBatchProgress {
-  label: string;
-  completed: number;
-  total: number;
 }
 
 export interface SeedPollConfig {

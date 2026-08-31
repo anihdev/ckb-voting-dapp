@@ -25,7 +25,9 @@ export const TALLY_SHARD_MIN_SHANNONS = 61n * SHANNONS_PER_CKB;
 export const TALLY_MERGE_RESULT_MIN_SHANNONS = 61n * SHANNONS_PER_CKB;
 export const MAX_INTENTS_PER_AGG = 50;
 export const MAX_TALLY_SHARDS = 256;
-export const MAX_SHARDS_PER_FINALIZE = 8;
+// Current-code polls are capped below the historical codec ceiling.
+export const MAX_ACTIVE_TALLY_SHARDS = 16;
+export const MAX_SHARDS_PER_FINALIZE = 16;
 export const MAX_DIRECT_CLOSE_SHARDS = 8;
 export const MAX_SHARDS_PER_MERGE = 8;
 export const MERGE_COVERAGE_BYTES = 32;
@@ -41,5 +43,6 @@ export const MAX_OPTION_BYTES = 64;
 export const MIN_DURATION_EPOCHS = 1n;
 export const MAX_DURATION_EPOCHS = 1000n;
 export const ZERO_HASH_HEX = `0x${"00".repeat(32)}`;
+export const FINALIZATION_GRACE_EPOCHS = 1n;
 export const FORCE_CLOSE_GRACE_EPOCHS = 10n;
 export const MAX_DEADLINE_EPOCH = (1n << 24n) - FORCE_CLOSE_GRACE_EPOCHS - 2n;

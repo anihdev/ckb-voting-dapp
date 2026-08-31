@@ -23,7 +23,6 @@ function pollFixture(): Poll {
     totalVoters: 0n,
     creatorDeposit: 500n * 100_000_000n,
     pendingIntentCount: 0n,
-    protocolPendingIntentCount: 0n,
     tokenWeighted: false,
     udtTypeHash: `0x${"00".repeat(32)}`,
     shardCount: 8,
@@ -38,6 +37,7 @@ function pollFixture(): Poll {
       selectedShardIds: [],
       uncoveredShardIds: [],
     },
+    resultAssurance: null,
     totalVotes: 0n,
     authorityOptions: [
       {
@@ -60,7 +60,7 @@ function pollFixture(): Poll {
   };
 }
 
-const idleTxState: TxState = { status: "idle", txHash: null, error: null, scope: null, batch: null };
+const idleTxState: TxState = { status: "idle", txHash: null, error: null, scope: null };
 const action = async () => "0x01";
 const finalizationCheck = async () => ({
   timelyPendingIntentCount: 0,
@@ -84,8 +84,7 @@ function renderPoll(
       onVote: action,
       onAggregate: action,
       onCheckFinalizationReadiness: finalizationCheck,
-      onFinalizeShards: action,
-      onFinalizeAllShards: action,
+      onFinalizeTallyShards: action,
       onMergeShards: action,
       onClose: action,
       onForceClose: action,
@@ -109,8 +108,7 @@ function renderPollWithTxState(txState: TxState, overrides: Partial<Poll> = {}):
       onVote: action,
       onAggregate: action,
       onCheckFinalizationReadiness: finalizationCheck,
-      onFinalizeShards: action,
-      onFinalizeAllShards: action,
+      onFinalizeTallyShards: action,
       onMergeShards: action,
       onClose: action,
       onForceClose: action,
@@ -138,8 +136,7 @@ function renderPollWithDelegate(
       onVote: action,
       onAggregate: action,
       onCheckFinalizationReadiness: finalizationCheck,
-      onFinalizeShards: action,
-      onFinalizeAllShards: action,
+      onFinalizeTallyShards: action,
       onMergeShards: action,
       onClose: action,
       onForceClose: action,
@@ -252,7 +249,6 @@ describe("poll-card presentation", () => {
       txHash: `0x${"cc".repeat(32)}`,
       error: null,
       scope: { kind: "delegation" },
-      batch: null,
     });
 
     expect(markup).not.toContain(`0x${"cc".repeat(32)}`);
@@ -265,7 +261,6 @@ describe("poll-card presentation", () => {
       txHash: `0x${"ee".repeat(32)}`,
       error: null,
       scope: { kind: "delegation" },
-      batch: null,
     });
 
     // Scoped rendering hides the foreign transaction, but the hook allows only
@@ -353,7 +348,6 @@ describe("poll-card presentation", () => {
       txHash,
       error: null,
       scope: { kind: "poll", pollId: pollFixture().id },
-      batch: null,
     });
 
     expect(markup).toContain("poll-transaction-feedback");
@@ -385,6 +379,41 @@ describe("poll-card presentation", () => {
     expect(remainingBatch).toContain("About 1 aggregation transaction remains");
     expect(remainingMultipleBatches).toContain(">Aggregate Next Batch</button>");
     expect(remainingMultipleBatches).toContain("About 2 aggregation transactions remain");
+  });
+
+  test("hides merge when the indexed frontier is incomplete", () => {
+    const markup = renderPoll(
+      VOTER,
+      {
+        shardCount: 9,
+        tallyMergeResults: [
+          {
+            id: "merge-01",
+            pollId: `0x${"11".repeat(32)}`,
+            outPoint: { txHash: `0x${"44".repeat(32)}`, index: 0 },
+            coverage: `0x${"ff"}00000000000000000000000000000000000000000000000000000000000000`,
+            voteCounts: [8n, 0n, 0n],
+            totalVoters: 8n,
+            mergeLevel: 1,
+            version: 1,
+            capacity: 61n * 100_000_000n,
+          },
+        ],
+        tallyFrontier: {
+          source: "merge-frontier",
+          coveredShardCount: 8,
+          shardCount: 9,
+          coverageComplete: false,
+          selectedMergeResultIds: ["merge-01"],
+          selectedShardIds: [],
+          uncoveredShardIds: [8],
+        },
+      },
+      true
+    );
+
+    expect(markup).not.toContain("Merge Shards");
+    expect(markup).toContain("Incomplete lane set");
   });
 
   test("offers delegation only to a connected non-creator on an open poll", () => {
@@ -442,7 +471,6 @@ describe("poll-card presentation", () => {
       txHash: `0x${"dd".repeat(32)}`,
       error: null,
       scope: { kind: "poll", pollId: `0x${"11".repeat(32)}` },
-      batch: null,
     });
 
     // Reading the card must never depend on a transaction finishing.

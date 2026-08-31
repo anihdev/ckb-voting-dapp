@@ -56,9 +56,9 @@ export class TransactionUnconfirmedError extends Error {
 /**
  * Message shown when a second state-changing action is attempted while one is
  * already running. Every governance action funds itself from the same wallet
- * change cell, and a multi-transaction run such as batch lane finalization
- * holds the lock for its whole sequence, so overlapping runs would double-spend
- * the change cell and clobber the tracked transaction.
+ * change cell, and any staged governance maintenance flow must hold the lock for
+ * its whole sequence, so overlapping runs would double-spend the change cell
+ * and clobber the tracked transaction.
  */
 export const CONCURRENT_TRANSACTION_MESSAGE =
   "Another governance transaction is already in progress. Wait for it to finish or fail before starting another.";
@@ -82,10 +82,10 @@ export interface TransactionExclusionGuard {
  *
  * The flag is plain mutable state rather than React state because the check
  * must be atomic within a single tick: two clicks in the same frame would both
- * read a stale `false` from a state value that has not re-rendered yet. A
- * multi-transaction run (batch lane finalization) holds the guard for its whole
- * sequence, and it is released on every exit path — success, rejection,
- * confirmation timeout, and thrown builder or signing errors — by the `finally`.
+ * read a stale `false` from a state value that has not re-rendered yet. Any
+ * staged governance maintenance flow holds the guard for its whole sequence,
+ * and it is released on every exit path — success, rejection, confirmation
+ * timeout, and thrown builder or signing errors — by the `finally`.
  */
 export function createTransactionExclusionGuard(): TransactionExclusionGuard {
   let held = false;

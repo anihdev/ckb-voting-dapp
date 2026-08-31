@@ -6,6 +6,9 @@
  */
 
 import {
+  FINALIZATION_GRACE_EPOCHS,
+  FORCE_CLOSE_GRACE_EPOCHS,
+  MAX_ACTIVE_TALLY_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_INTENTS_PER_AGG,
@@ -16,14 +19,21 @@ import { hexToBytes } from "./molecule";
 import {
   DelegationRecord,
   FinalizationReadinessCheck,
+  IndexedLaneDomainState,
   Poll,
+  PollMaintenanceState,
   PollOutcome,
+  ResultAssuranceV1,
   TallyFrontierSource,
   TallyMergeResult,
   TallyShard,
   VoteAuthorityOption,
   VoteIntent,
 } from "./types";
+import {
+  GOVERNANCE_CODE_HASH,
+  GOVERNANCE_SCRIPT_HASH_TYPE,
+} from "./ckb";
 
 export const FINALIZE_PENDING_INTENTS_WARNING =
   "Pending intents are still indexed. Finalizing can leave them uncounted; they remain refundable after close.";
@@ -144,20 +154,22 @@ export function formatApproxWallClockDuration(totalHours: number): string {
 }
 
 /**
- * Estimates time until the first epoch in which close is valid.
- * The protocol requires current_epoch > deadline, so the close window starts
- * at deadline + 1 rather than at the beginning of the deadline epoch.
+ * Estimates time until the first epoch in which creator-close or finalization
+ * becomes valid.
+ * The hardened protocol gives aggregation one full grace epoch and then uses a
+ * strictly-after helper, so the first valid integer epoch is deadline + 2.
  */
 export function estimatePollCloseHours(
   deadline: bigint,
   position: EpochPosition
 ): number {
-  if (position.epoch > deadline) return 0;
+  const earliestCloseEpoch = deadline + FINALIZATION_GRACE_EPOCHS + 1n;
+  if (position.epoch >= earliestCloseEpoch) return 0;
   if (position.length <= 0n || position.index < 0n || position.index >= position.length) {
-    return Number(deadline + 1n - position.epoch) * CKB_EPOCH_TARGET_HOURS;
+    return Number(earliestCloseEpoch - position.epoch) * CKB_EPOCH_TARGET_HOURS;
   }
 
-  const wholeEpochs = Number(deadline + 1n - position.epoch);
+  const wholeEpochs = Number(earliestCloseEpoch - position.epoch);
   const currentFraction = Number(position.index) / Number(position.length);
   return Math.max(0, (wholeEpochs - currentFraction) * CKB_EPOCH_TARGET_HOURS);
 }
@@ -364,6 +376,40 @@ export interface CloseIntentRefundSelection<T> {
   maxRefunds: number;
 }
 
+function readScriptCodeHash(script: unknown): string | null {
+  const value = (script as any)?.codeHash ?? (script as any)?.code_hash;
+  return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value)
+    ? value.toLowerCase()
+    : null;
+}
+
+function readScriptHashType(script: unknown): string | null {
+  const value = (script as any)?.hashType ?? (script as any)?.hash_type;
+  return typeof value === "string" && value.length > 0 ? value.toLowerCase() : null;
+}
+
+export function derivePollResultAssurance(
+  poll: Pick<Poll, "id" | "tallyFrontier">,
+  indexedPollTypeScript: unknown
+): ResultAssuranceV1 | null {
+  const protocolCodeHash = readScriptCodeHash(indexedPollTypeScript);
+  const protocolHashType = readScriptHashType(indexedPollTypeScript);
+  if (!protocolCodeHash || !protocolHashType) return null;
+  if (protocolCodeHash !== GOVERNANCE_CODE_HASH.toLowerCase()) return null;
+  if (protocolHashType !== GOVERNANCE_SCRIPT_HASH_TYPE.toLowerCase()) return null;
+
+  return {
+    version: 1,
+    protocolCodeHash,
+    protocolHashType,
+    tallyIntegrity: "on_chain_verified",
+    laneCoverage: poll.tallyFrontier.coverageComplete ? "complete" : "partial",
+    intentInclusion: "unproven",
+    authorityUniqueness: "counted_once",
+    eligibility: "open",
+  };
+}
+
 export interface ProtocolTimelineStep {
   op: string;
   label: string;
@@ -485,6 +531,134 @@ function compareOptionalEpochDesc(left: bigint | null, right: bigint | null): nu
   if (left !== null && right === null) return -1;
   if (left === null && right !== null) return 1;
   return 0;
+}
+
+function normalizeHexString(value: string): string {
+  return value.toLowerCase();
+}
+
+function deriveIndexedLaneDomainState(
+  poll: Pick<Poll, "id" | "shardCount" | "tallyShards">
+): {
+  state: IndexedLaneDomainState;
+  missingLaneIds: number[];
+  validLaneIds: number[];
+} {
+  const expectedPollId = normalizeHexString(poll.id);
+  const laneIds = new Set<number>();
+  let anyFinalized = false;
+  let anyLive = false;
+
+  for (const shard of poll.tallyShards) {
+    if (normalizeHexString(shard.pollId) !== expectedPollId) {
+      return { state: "malformed", missingLaneIds: [], validLaneIds: [] };
+    }
+    if (shard.shardCount !== poll.shardCount) {
+      return { state: "malformed", missingLaneIds: [], validLaneIds: [] };
+    }
+    if (!Number.isInteger(shard.shardId) || shard.shardId < 0 || shard.shardId >= poll.shardCount) {
+      return { state: "malformed", missingLaneIds: [], validLaneIds: [] };
+    }
+    if (laneIds.has(shard.shardId)) {
+      return { state: "malformed", missingLaneIds: [], validLaneIds: [] };
+    }
+    laneIds.add(shard.shardId);
+    if (shard.finalized) anyFinalized = true;
+    else anyLive = true;
+  }
+
+  const missingLaneIds = Array.from({ length: poll.shardCount }, (_, shardId) => shardId).filter(
+    (shardId) => !laneIds.has(shardId)
+  );
+  if (missingLaneIds.length > 0) {
+    return {
+      state: "missing",
+      missingLaneIds,
+      validLaneIds: [...laneIds].sort((left, right) => left - right),
+    };
+  }
+  if (!anyFinalized) {
+    return {
+      state: "all_live",
+      missingLaneIds: [],
+      validLaneIds: [...laneIds].sort((left, right) => left - right),
+    };
+  }
+  if (!anyLive) {
+    return {
+      state: "all_finalized",
+      missingLaneIds: [],
+      validLaneIds: [...laneIds].sort((left, right) => left - right),
+    };
+  }
+  return {
+    state: "mixed",
+    missingLaneIds: [],
+    validLaneIds: [...laneIds].sort((left, right) => left - right),
+  };
+}
+
+function deriveSelectedMergeCoverage(
+  poll: Pick<Poll, "id" | "shardCount" | "tallyFrontier" | "tallyMergeResults" | "tallyShards">
+): {
+  malformed: boolean;
+  coverage: Uint8Array;
+  coveredShardCount: number;
+  complete: boolean;
+} {
+  const coverage = emptyCoverage();
+  const selectedResults = poll.tallyFrontier.selectedMergeResultIds.map((resultId) =>
+    poll.tallyMergeResults.find((candidate) => candidate.id === resultId) ?? null
+  );
+  if (selectedResults.some((result) => result === null)) {
+    return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+  }
+
+  for (const result of selectedResults) {
+    if (!result || normalizeHexString(result.pollId) !== normalizeHexString(poll.id)) {
+      return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+    }
+    let normalizedCoverage: Uint8Array;
+    try {
+      normalizedCoverage = normalizeCoverage(result.coverage);
+    } catch {
+      return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+    }
+    if (!coverageWithinShardCount(normalizedCoverage, poll.shardCount)) {
+      return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+    }
+    if (!coverageDisjoint(coverage, normalizedCoverage)) {
+      return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+    }
+    coverageOr(coverage, normalizedCoverage);
+  }
+
+  const liveShardById = new Map<number, TallyShard>();
+  for (const shard of poll.tallyShards) {
+    if (
+      normalizeHexString(shard.pollId) !== normalizeHexString(poll.id) ||
+      shard.shardCount !== poll.shardCount ||
+      !Number.isInteger(shard.shardId) ||
+      shard.shardId < 0 ||
+      shard.shardId >= poll.shardCount ||
+      liveShardById.has(shard.shardId)
+    ) {
+      return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+    }
+    liveShardById.set(shard.shardId, shard);
+  }
+
+  for (const shardId of poll.tallyFrontier.selectedShardIds) {
+    const shard = liveShardById.get(shardId);
+    if (!shard || coverageHas(coverage, shardId)) {
+      return { malformed: true, coverage, coveredShardCount: 0, complete: false };
+    }
+    coverageSet(coverage, shardId);
+  }
+
+  const coveredShardCount = tallyMergeCoverageCount(coverage);
+  const complete = tallyMergeCoverageComplete(coverage, poll.shardCount);
+  return { malformed: false, coverage, coveredShardCount, complete };
 }
 
 /**
@@ -770,12 +944,7 @@ export function canDelegateForPoll(
 }
 
 export function canFinalizeTallyShardFromUi(poll: Poll, currentEpoch: bigint): boolean {
-  return (
-    !poll.isClosed &&
-    currentEpoch > poll.deadline &&
-    poll.shardCount > 0 &&
-    poll.tallyShards.some((shard) => !shard.finalized)
-  );
+  return derivePollMaintenanceState(poll, currentEpoch).finalizeReady;
 }
 
 export function getFinalizeShardConfirmationMessage(
@@ -783,7 +952,7 @@ export function getFinalizeShardConfirmationMessage(
   readinessCheck?: FinalizationReadinessCheck
 ): string {
   const base =
-    "Finalization freezes the selected tally lane state after the deadline. Finalized lanes cannot be aggregated again and are required before small-poll direct close or large-poll merge.";
+    "Finalization freezes the complete ordered tally lane set after the aggregation grace. Finalized lanes cannot be aggregated again and are required before small-poll direct close or large-poll merge.";
 
   if (readinessCheck) {
     return formatFinalizationReadinessCheck(readinessCheck);
@@ -926,22 +1095,148 @@ export function computeCanonicalTallyFrontier(input: {
   };
 }
 
+export function derivePollMaintenanceState(
+  poll: Poll,
+  currentEpoch: bigint
+): PollMaintenanceState {
+  const activeCurrentCodePoll =
+    poll.shardCount > 0 && poll.shardCount <= MAX_ACTIVE_TALLY_SHARDS;
+  const mergeRequired = activeCurrentCodePoll && poll.shardCount > MAX_DIRECT_CLOSE_SHARDS;
+  const laneDomain = deriveIndexedLaneDomainState(poll);
+  const mergeCoverage = deriveSelectedMergeCoverage(poll);
+  const earliestFinalizeEpoch = poll.deadline + FINALIZATION_GRACE_EPOCHS + 1n;
+  const earliestCreatorCloseEpoch = earliestFinalizeEpoch;
+  const earliestForceCloseEpoch = poll.deadline + FORCE_CLOSE_GRACE_EPOCHS + 1n;
+  const creatorCloseTimingReached = currentEpoch >= earliestCreatorCloseEpoch;
+  const forceCloseTimingReached = currentEpoch >= earliestForceCloseEpoch;
+  const mergeSelectionCount = poll.tallyFrontier.selectedMergeResultIds.length;
+  const selectedFrontierComponentCount =
+    poll.tallyFrontier.selectedMergeResultIds.length + poll.tallyFrontier.selectedShardIds.length;
+  const sourceUsesMergeResults =
+    poll.tallyFrontier.source === "merge-frontier" ||
+    poll.tallyFrontier.source === "complete-merge";
+  const liveLaneSetFullyFinalized = poll.tallyShards.every((shard) => shard.finalized);
+  const hasCompleteMergeResult = poll.tallyMergeResults.some((result) => {
+    try {
+      return (
+        normalizeHexString(result.pollId) === normalizeHexString(poll.id) &&
+        tallyMergeCoverageComplete(result.coverage, poll.shardCount)
+      );
+    } catch {
+      return false;
+    }
+  });
+  const directCloseReady =
+    activeCurrentCodePoll &&
+    !mergeRequired &&
+    laneDomain.state === "all_finalized";
+  const validPartialMergeProgress =
+    mergeRequired &&
+    liveLaneSetFullyFinalized &&
+    !mergeCoverage.malformed &&
+    mergeCoverage.complete &&
+    selectedFrontierComponentCount >= 2 &&
+    poll.tallyFrontier.source === "merge-frontier" &&
+    mergeCoverage.coveredShardCount > 0 &&
+    !hasCompleteMergeResult &&
+    laneDomain.state !== "malformed" &&
+    laneDomain.state !== "mixed";
+  const closeEvidenceReady = directCloseReady || hasCompleteMergeResult;
+
+  const malformedFrontierSource =
+    (poll.tallyFrontier.source === "closed-poll" && !poll.isClosed) ||
+    (poll.tallyFrontier.source === "live-shards" && mergeSelectionCount > 0) ||
+    (poll.tallyFrontier.source === "merge-frontier" && mergeSelectionCount === 0) ||
+    (poll.tallyFrontier.source === "merge-frontier" && hasCompleteMergeResult) ||
+    (poll.tallyFrontier.source === "complete-merge" && mergeSelectionCount !== 1) ||
+    (mergeRequired && hasCompleteMergeResult && poll.tallyFrontier.source !== "complete-merge") ||
+    (sourceUsesMergeResults && mergeCoverage.coveredShardCount !== poll.tallyFrontier.coveredShardCount) ||
+    (sourceUsesMergeResults && mergeCoverage.complete !== poll.tallyFrontier.coverageComplete) ||
+    (!mergeRequired && sourceUsesMergeResults) ||
+    (!mergeRequired && poll.tallyMergeResults.length > 0);
+  const malformedMergeState =
+    mergeRequired &&
+    ((sourceUsesMergeResults && mergeCoverage.malformed) ||
+      (poll.tallyFrontier.source === "complete-merge" && !hasCompleteMergeResult));
+
+  let kind: PollMaintenanceState["kind"];
+  if (poll.isClosed) {
+    kind = "closed";
+  } else if (!activeCurrentCodePoll) {
+    kind = "unsupported_current_code";
+  } else if (
+    laneDomain.state === "malformed" ||
+    malformedFrontierSource ||
+    malformedMergeState
+  ) {
+    kind = "malformed_indexed_lane_set";
+  } else if (hasCompleteMergeResult) {
+    kind = "ready_for_merged_close";
+  } else if (directCloseReady) {
+    kind = "ready_for_direct_close";
+  } else if (validPartialMergeProgress) {
+    kind = "merge_in_progress";
+  } else if (mergeRequired && laneDomain.state === "all_finalized") {
+    kind = "awaiting_merge";
+  } else if (laneDomain.state === "mixed") {
+    kind = "mixed_partially_finalized";
+  } else if (laneDomain.state === "all_live") {
+    kind = currentEpoch >= earliestFinalizeEpoch
+      ? "ready_to_finalize"
+      : "awaiting_finalize_threshold";
+  } else {
+    kind = "incomplete_indexed_lane_set";
+  }
+
+  const finalizeReady = kind === "ready_to_finalize";
+  const finalizationCompleted = [
+    "ready_for_direct_close",
+    "awaiting_merge",
+    "merge_in_progress",
+    "ready_for_merged_close",
+    "closed",
+  ].includes(kind);
+  const mergeReady = kind === "awaiting_merge" || kind === "merge_in_progress";
+  const mergeInProgress = kind === "merge_in_progress";
+  const creatorCloseEligible =
+    activeCurrentCodePoll && !poll.isClosed && closeEvidenceReady && creatorCloseTimingReached;
+  const forceCloseEligible =
+    activeCurrentCodePoll && !poll.isClosed && closeEvidenceReady && forceCloseTimingReached;
+
+  return {
+    kind,
+    indexedLaneDomain: laneDomain.state,
+    activeCurrentCodePoll,
+    missingLaneIds: laneDomain.missingLaneIds,
+    earliestFinalizeEpoch,
+    earliestCreatorCloseEpoch,
+    earliestForceCloseEpoch,
+    closeEvidenceReady,
+    creatorCloseTimingReached,
+    creatorCloseEligible,
+    forceCloseTimingReached,
+    forceCloseEligible,
+    finalizeReady,
+    finalizationCompleted,
+    mergeRequired,
+    mergeReady,
+    mergeInProgress,
+    hasCompleteMergeResult,
+    canonicalCoveredShardCount: poll.tallyFrontier.coveredShardCount,
+    canonicalCoverageComplete: poll.tallyFrontier.coverageComplete,
+  };
+}
+
 export function selectCloseTimeIntentRefunds<T>(
   candidates: Array<CloseIntentRefundCandidate<T>>,
   options: {
     pollTypeHash: string;
-    trackedPendingLowerBound: bigint;
     maxRefunds?: number;
   }
 ): CloseIntentRefundSelection<T> {
   const maxRefunds = options.maxRefunds ?? MAX_CLOSE_INTENT_REFUNDS;
   if (!Number.isInteger(maxRefunds) || maxRefunds < 0) {
     throw new Error("Close-time refund cap must be a non-negative integer");
-  }
-  if (options.trackedPendingLowerBound > BigInt(maxRefunds)) {
-    throw new Error(
-      `Tracked pending intents exceed the frontend close-time refund cap (${maxRefunds}). Aggregate or refund in a smaller lifecycle path before close.`
-    );
   }
 
   const pollTypeHash = options.pollTypeHash.toLowerCase();
@@ -951,11 +1246,6 @@ export function selectCloseTimeIntentRefunds<T>(
       if (left.aggregated !== right.aggregated) return left.aggregated ? 1 : -1;
       return (left.sortKey ?? "").localeCompare(right.sortKey ?? "");
     });
-
-  const pending = scoped.filter((candidate) => !candidate.aggregated);
-  if (BigInt(pending.length) < options.trackedPendingLowerBound) {
-    throw new Error("Close requires at least the pending intents tracked on the poll state");
-  }
 
   const included = scoped.slice(0, maxRefunds);
   const includedSet = new Set(included);
@@ -992,7 +1282,8 @@ export function getPollTallyProgress(poll: Poll): {
     poll.shardCount > 0 &&
     indexedShardCount === poll.shardCount &&
     finalizedShardCount === poll.shardCount;
-  const requiresMerge = poll.shardCount > MAX_DIRECT_CLOSE_SHARDS;
+  const activeCurrentCodePoll = poll.shardCount <= MAX_ACTIVE_TALLY_SHARDS;
+  const requiresMerge = activeCurrentCodePoll && poll.shardCount > MAX_DIRECT_CLOSE_SHARDS;
   const hasCompleteMergeResult =
     requiresMerge &&
     poll.tallyMergeResults.some((result) => {
@@ -1011,7 +1302,7 @@ export function getPollTallyProgress(poll: Poll): {
     requiresMerge,
     hasCompleteMergeResult,
     closeStateReady:
-      (!requiresMerge && allShardsFinalized) || (requiresMerge && hasCompleteMergeResult),
+      activeCurrentCodePoll && ((!requiresMerge && allShardsFinalized) || (requiresMerge && hasCompleteMergeResult)),
   };
 }
 
@@ -1050,19 +1341,21 @@ export function buildProtocolTimeline(
       {
         op: "CREATE_TALLY_SHARD",
         label: "Finalize lanes",
-        detail: "Freeze each tally lane after the deadline.",
+        detail: "Freeze the complete ordered tally-lane set after the aggregation grace.",
         state: "pending",
       },
       {
         op: "CLOSE_POLL",
         label: "Close or recover",
-        detail: "Creator closes after deadline; anyone can force-close after grace.",
+        detail: "Creator closes after the one-epoch aggregation grace; anyone can force-close after grace.",
         state: "pending",
       },
     ];
   }
 
   const progress = getPollTallyProgress(poll);
+  const maintenanceState = derivePollMaintenanceState(poll, currentEpoch);
+  const activeCurrentCodePoll = maintenanceState.activeCurrentCodePoll;
   const votingSupported = isPollVotingSupported(poll);
   const isExpired = currentEpoch > poll.deadline;
   const isOpen = !poll.isClosed && !isExpired;
@@ -1092,25 +1385,44 @@ export function buildProtocolTimeline(
         : // A closed poll that counted nothing never aggregated and never will;
           // its close transaction already consumed the lane cells.
           "skipped"
-      : hasPending && progress.allShardsFinalized
+      : hasPending && maintenanceState.finalizationCompleted
         ? "ended"
         : hasPending
           ? "live"
-        : hasAggregated
-          ? "completed"
-          : "pending";
+          : hasAggregated
+            ? "completed"
+            : "pending";
 
-  const finalizeState: ProtocolTimelineStep["state"] = poll.isClosed || progress.allShardsFinalized
-    ? "completed"
-    : isExpired
-      ? "live"
-      : "pending";
+  const finalizeState: ProtocolTimelineStep["state"] =
+    poll.isClosed || maintenanceState.finalizationCompleted
+      ? "completed"
+      : maintenanceState.finalizeReady
+        ? "live"
+        : "pending";
 
   const closeState: ProtocolTimelineStep["state"] = poll.isClosed
     ? "completed"
-    : isExpired && progress.closeStateReady
+    : maintenanceState.creatorCloseEligible || maintenanceState.forceCloseEligible
       ? "live"
       : "pending";
+
+  const finalizeDetail = poll.isClosed
+    ? "Every lane was finalized before this poll closed."
+    : maintenanceState.kind === "ready_for_direct_close"
+      ? "Every lane is finalized and direct-close evidence is ready."
+      : maintenanceState.kind === "awaiting_merge"
+        ? "Every lane is finalized. Merge work is still required before close."
+        : maintenanceState.kind === "merge_in_progress"
+          ? "Every remaining indexed lane is finalized, and a valid partial merge frontier is indexed. More merge work is still required before close."
+          : maintenanceState.kind === "ready_for_merged_close"
+            ? "A complete merge result is indexed. Lane finalization is complete and close evidence is ready."
+            : maintenanceState.kind === "mixed_partially_finalized"
+              ? "Indexed lanes are partially finalized. This mixed state is shown read-only until the indexed lane set is corrected."
+              : maintenanceState.kind === "incomplete_indexed_lane_set"
+                ? "The complete live lane set is not fully indexed yet, so finalization stays unavailable."
+                : maintenanceState.kind === "malformed_indexed_lane_set"
+                  ? "Indexed lane data is malformed for this poll, so finalization stays unavailable."
+                  : `${progress.finalizedShardCount.toString()}/${poll.shardCount.toString()} lanes finalized. Current-code polls finalize the complete ordered lane set in one transaction after the aggregation grace.`;
 
   const steps: ProtocolTimelineStep[] = [
     {
@@ -1153,9 +1465,7 @@ export function buildProtocolTimeline(
       // A close transaction consumes the lane cells, so a closed poll indexes
       // zero of them. Reporting the live count there would read "0/8 finalized"
       // next to a completed state, so describe the outcome instead.
-      detail: poll.isClosed
-        ? "Every lane was finalized before this poll closed."
-        : `${progress.finalizedShardCount.toString()}/${poll.shardCount.toString()} lanes finalized. Up to 8 ordered lanes can finalize in one transaction.`,
+      detail: finalizeDetail,
       state: finalizeState,
     },
   ];
@@ -1164,12 +1474,20 @@ export function buildProtocolTimeline(
     steps.push({
       op: "MERGE_TALLY_SHARDS",
       label: "Merge lanes",
-      detail: progress.hasCompleteMergeResult
-        ? "A complete merge result is indexed."
-        : `Polls above ${MAX_DIRECT_CLOSE_SHARDS.toString()} lanes need one complete merge result before close.`,
-      state: poll.isClosed || progress.hasCompleteMergeResult
+      detail: !activeCurrentCodePoll
+        ? `Current-code merge applies only through ${MAX_ACTIVE_TALLY_SHARDS.toString()} active lanes; larger historical polls require their original contract.`
+        : maintenanceState.kind === "ready_for_merged_close"
+          ? "A complete merge result is indexed, so close evidence is ready."
+          : maintenanceState.kind === "merge_in_progress"
+            ? "A valid partial merge frontier is indexed, and every remaining live lane is already finalized. More merge work is still required before close."
+            : maintenanceState.kind === "malformed_indexed_lane_set"
+              ? "Indexed lane or merge evidence is malformed, so merge maintenance stays read-only until the indexed state is corrected."
+              : maintenanceState.kind === "incomplete_indexed_lane_set"
+                ? "The finalized lane set or canonical merge frontier is still incomplete in the current indexer view."
+                : `Polls with 9-${MAX_ACTIVE_TALLY_SHARDS.toString()} lanes need one complete merge result before close.`,
+      state: poll.isClosed || maintenanceState.kind === "ready_for_merged_close"
         ? "completed"
-        : isExpired && progress.finalizedShardCount > 0
+        : maintenanceState.kind === "merge_in_progress" || maintenanceState.kind === "awaiting_merge"
           ? "live"
           : "pending",
     });
@@ -1180,11 +1498,17 @@ export function buildProtocolTimeline(
     label: "Close or recover",
     detail: poll.isClosed
       ? "Poll is closed and deposits were returned by the close transaction."
-      : isExpired
-        ? progress.closeStateReady
-          ? "Tally state is ready; close can run now."
-          : "Close is blocked until every lane is finalized."
-        : `Close becomes valid after epoch ${poll.deadline.toString()}.`,
+      : !activeCurrentCodePoll
+        ? `Current-code close support stops above ${MAX_ACTIVE_TALLY_SHARDS.toString()} lanes; larger historical polls require their original contract.`
+        : !maintenanceState.creatorCloseTimingReached
+          ? `Creator close becomes valid after epoch ${maintenanceState.earliestCreatorCloseEpoch.toString()}. Permissionless force-close becomes valid after epoch ${maintenanceState.earliestForceCloseEpoch.toString()}.`
+          : maintenanceState.closeEvidenceReady
+            ? maintenanceState.forceCloseTimingReached
+              ? "Close evidence is ready, and the later permissionless force-close threshold is also open now."
+              : "Close evidence is ready. Creator close can run now, and permissionless force-close opens later if the poll still remains open."
+            : maintenanceState.forceCloseTimingReached
+              ? "The later force-close timing threshold is open, but finalization or merge evidence is still required before this poll can close."
+              : "The creator-close timing window is open, but finalization or merge evidence is still required.",
     state: closeState,
   });
 

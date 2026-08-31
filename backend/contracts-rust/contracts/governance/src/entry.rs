@@ -1,8 +1,7 @@
 //! Governance contract entry — validates and routes protocol operations.
 //!
 //! This file contains the top-level dispatch and the main validation
-//! routines used by each on-chain operation. Comments are written to be
-//! human-friendly and explain the purpose of checks and transitions.
+//! routines used by each on-chain operation.
 
 use alloc::vec::Vec;
 
@@ -177,6 +176,11 @@ fn same_index_protocol_type_update_matches_current_lock(
 
 fn current_lock_can_defer_to_same_index_protocol_type_update() -> Result<bool, Error> {
     let current_script = load_current_script()?;
+    if current_script.args.first().copied() == Some(OP_MERGE_TALLY_SHARDS) {
+        if merge_lock_can_defer_to_many_input_single_output_type_update(&current_script)? {
+            return Ok(true);
+        }
+    }
     let mut saw_current_lock = false;
     let mut index = 0usize;
     loop {
@@ -281,6 +285,47 @@ fn expected_tally_merge_script(poll_type_hash: &[u8; 32]) -> Result<EncodedScrip
         hash_type: current_script.hash_type,
         args,
     })
+}
+/// The merge lock can defer to a single output type script if all inputs
+/// are the same tally merge script and the output is the same tally merge script.
+fn merge_lock_can_defer_to_many_input_single_output_type_update(
+    current_script: &EncodedScript,
+) -> Result<bool, Error> {
+    let poll_type_hash = parse_tally_merge_scope(current_script)?;
+    let canonical_output_lock = load_output_script(0)?;
+    let canonical_output_type = match load_output_type_script(0) {
+        Ok(script) => script,
+        Err(Error::Validation) | Err(Error::IndexOutOfBound) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if !compare_scripts(&canonical_output_lock, current_script)
+        || !compare_scripts(&canonical_output_type, current_script)
+    {
+        return Ok(false);
+    }
+    assert_tally_merge_script_policy(
+        &canonical_output_lock,
+        &canonical_output_type,
+        &poll_type_hash,
+    )?;
+
+    let mut saw_current_lock = false;
+    let mut index = 0usize;
+    loop {
+        match load_cell_data(index, Source::Input) {
+            Ok(_) => {
+                let input_lock = load_input_script(index)?;
+                if compare_scripts(current_script, &input_lock) {
+                    saw_current_lock = true;
+                    let input_type = load_input_type_script(index)?;
+                    assert_tally_merge_script_policy(&input_lock, &input_type, &poll_type_hash)?;
+                }
+                index += 1;
+            }
+            Err(SysError::IndexOutOfBound) => return Ok(saw_current_lock),
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 fn parse_tally_merge_scope(script: &EncodedScript) -> Result<[u8; 32], Error> {
@@ -438,6 +483,8 @@ fn poll_close_has_creator_authorization(poll: &PollData) -> Result<bool, Error> 
 fn require_poll_close_since(poll: &PollData, creator_authorized: bool) -> Result<(), Error> {
     let threshold = if creator_authorized {
         poll.deadline
+            .checked_add(FINALIZATION_GRACE_EPOCHS)
+            .ok_or(Error::Validation)?
     } else {
         poll.deadline
             .checked_add(FORCE_CLOSE_GRACE_EPOCHS)
@@ -728,6 +775,11 @@ fn validate_tally_merge_lifecycle() -> Result<(), Error> {
             validate_merge_tally_shards(&output)
         }
         (Some(input), None) => {
+            // Merge results use the governance script as both lock and type, but
+            // CKB lock groups are input-only while the merge type group owns the
+            // single output. I allowed many merge-locked inputs to defer to that one
+            // canonical merge result output without weakening same-index rules for
+            // poll, intent, or tally-shard paths.
             if current_lock_can_defer_to_same_index_protocol_type_update()? {
                 return Ok(());
             }
@@ -975,7 +1027,10 @@ fn validate_create_poll() -> Result<(), Error> {
         Error::Validation,
     )?;
     assert_condition(poll.shard_count > 0, Error::Validation)?;
-    assert_condition(poll.shard_count <= MAX_TALLY_SHARDS, Error::Validation)?;
+    assert_condition(
+        poll.shard_count <= MAX_ACTIVE_TALLY_SHARDS,
+        Error::Validation,
+    )?;
     assert_condition(!poll.is_closed, Error::Validation)?;
     assert_condition(!poll.token_weighted, Error::Validation)?;
     assert_condition(
@@ -1370,6 +1425,7 @@ fn validate_finalize_tally_shard_batch(current_global_index: usize) -> Result<()
     let current_script = load_current_script()?;
     let mut lane_count = 0usize;
     let mut expected_poll_hash: Option<[u8; 32]> = None;
+    let mut expected_shard_count: Option<u32> = None;
     let mut previous_shard_id: Option<u32> = None;
     let mut current_group_seen = false;
     let mut index = 0usize;
@@ -1463,8 +1519,16 @@ fn validate_finalize_tally_shard_batch(current_global_index: usize) -> Result<()
         } else {
             expected_poll_hash = Some(poll_hash);
         }
+        if let Some(expected) = expected_shard_count {
+            assert_condition(before_lane.shard_count == expected, Error::Validation)?;
+        } else {
+            expected_shard_count = Some(before_lane.shard_count);
+        }
         if let Some(previous) = previous_shard_id {
-            assert_condition(shard_id > previous, Error::Validation)?;
+            let expected_next = previous.checked_add(1).ok_or(Error::Validation)?;
+            assert_condition(shard_id == expected_next, Error::Validation)?;
+        } else {
+            assert_condition(shard_id == 0, Error::Validation)?;
         }
         previous_shard_id = Some(shard_id);
 
@@ -1474,16 +1538,30 @@ fn validate_finalize_tally_shard_batch(current_global_index: usize) -> Result<()
             Error::Validation,
         )?;
         assert_condition(
+            before_lane.shard_count <= MAX_ACTIVE_TALLY_SHARDS,
+            Error::Validation,
+        )?;
+        assert_condition(
             before_lane.vote_counts.len() == poll.options.len(),
             Error::Validation,
         )?;
-        require_input_since_strictly_after(index, poll.deadline)?;
+        require_input_since_strictly_after(
+            index,
+            poll.deadline
+                .checked_add(FINALIZATION_GRACE_EPOCHS)
+                .ok_or(Error::Validation)?,
+        )?;
         index += 1;
     }
 
     assert_condition(lane_count > 0, Error::Validation)?;
     assert_condition(current_group_seen, Error::Validation)?;
     let poll_hash = expected_poll_hash.ok_or(Error::Validation)?;
+    let shard_count = expected_shard_count.ok_or(Error::Validation)?;
+    assert_condition(
+        usize::try_from(shard_count).map_err(|_| Error::Validation)? == lane_count,
+        Error::Validation,
+    )?;
     assert_no_matching_poll_input(&poll_hash)?;
 
     // No extra current-code tally output may be hidden after the protocol
@@ -1616,6 +1694,10 @@ fn validate_consume_final_merge_result_on_close(
         Error::Validation,
     )?;
     assert_condition(
+        before_poll.shard_count <= MAX_ACTIVE_TALLY_SHARDS,
+        Error::Validation,
+    )?;
+    assert_condition(
         coverage_complete(&result.coverage, before_poll.shard_count)?,
         Error::Validation,
     )?;
@@ -1670,6 +1752,10 @@ fn validate_merge_tally_shards(output: &[u8]) -> Result<(), Error> {
     let poll = ensure_poll_dep_unclosed(&result.poll_type_hash)?;
     assert_condition(
         poll.shard_count > MAX_DIRECT_CLOSE_SHARDS,
+        Error::Validation,
+    )?;
+    assert_condition(
+        poll.shard_count <= MAX_ACTIVE_TALLY_SHARDS,
         Error::Validation,
     )?;
     validate_merge_result_shape(&result, &poll, &script_poll_type_hash)?;
@@ -1777,7 +1863,7 @@ fn validate_merge_tally_shards(output: &[u8]) -> Result<(), Error> {
         index += 1;
     }
 
-    assert_condition(merge_inputs > 0, Error::Validation)?;
+    assert_condition(merge_inputs >= 2, Error::Validation)?;
     assert_condition(merge_inputs <= MAX_SHARDS_PER_MERGE, Error::Validation)?;
     assert_condition(result.coverage == expected_coverage, Error::Validation)?;
     assert_condition(
@@ -2014,6 +2100,10 @@ fn validate_merged_close_result(
         before.shard_count > MAX_DIRECT_CLOSE_SHARDS,
         Error::Validation,
     )?;
+    assert_condition(
+        before.shard_count <= MAX_ACTIVE_TALLY_SHARDS,
+        Error::Validation,
+    )?;
     let input_type = load_input_type_script(result_input_index)?;
     let input_lock = load_input_script(result_input_index)?;
     let input_capacity = load_input_capacity(result_input_index)?;
@@ -2210,7 +2300,7 @@ fn validate_close_poll() -> Result<(), Error> {
     let mut input_index = first_after_auth_input
         .checked_add(consumed_tally_inputs)
         .ok_or(Error::Validation)?;
-    let mut refunded_pending_intents = 0u64;
+    assert_condition(before.pending_intent_count == 0, Error::Validation)?;
     loop {
         let input = match load_cell_data(input_index, Source::Input) {
             Ok(data) => data,
@@ -2233,24 +2323,11 @@ fn validate_close_poll() -> Result<(), Error> {
             )?;
             assert_condition(return_capacity >= VOTER_DEPOSIT_SHANNONS, Error::Validation)?;
             assert_condition(return_capacity == input_capacity, Error::Validation)?;
-            if !intent.aggregated {
-                refunded_pending_intents = refunded_pending_intents
-                    .checked_add(1)
-                    .ok_or(Error::Validation)?;
-            }
             output_index += 1;
         }
 
         input_index += 1;
     }
-
-    // Strict recovery invariant: every pending intent tracked on the poll must
-    // be consumed and refunded during close. Treat poll.pending_intent_count as
-    // a lower-bound until exact accounting is promoted to a hard invariant.
-    assert_condition(
-        refunded_pending_intents >= before.pending_intent_count,
-        Error::Validation,
-    )?;
 
     Ok(())
 }

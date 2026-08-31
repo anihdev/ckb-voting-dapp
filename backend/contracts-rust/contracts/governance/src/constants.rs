@@ -23,7 +23,10 @@ pub const MAX_QUESTION_LEN: usize = 256;
 pub const MAX_OPTION_LEN: usize = 64;
 pub const MAX_INTENTS_PER_AGG: usize = 50;
 pub const MAX_TALLY_SHARDS: u32 = 256;
-pub const MAX_SHARDS_PER_FINALIZE: usize = 8;
+// New polls under the hardened code hash may not exceed this many active lanes.
+// Historical cells still decode against MAX_TALLY_SHARDS above.
+pub const MAX_ACTIVE_TALLY_SHARDS: u32 = 16;
+pub const MAX_SHARDS_PER_FINALIZE: usize = 16;
 pub const MERGE_COVERAGE_BYTES: usize = 32;
 pub const MAX_SHARDS_PER_MERGE: usize = 8;
 pub const TALLY_SHARD_CODEC_VERSION: u8 = 2;
@@ -34,9 +37,11 @@ pub const COUNTED_VOTER_PRESENT_VALUE: [u8; 32] = [1u8; 32];
 // acceptable for small polls. Larger shard sets must use MERGE_TALLY_SHARDS.
 pub const MAX_DIRECT_CLOSE_SHARDS: u32 = 8;
 pub const TALLY_MERGE_RESULT_MIN_SHANNONS: u64 = 61 * SHANNONS_PER_CKB;
+pub const FINALIZATION_GRACE_EPOCHS: u64 = 1;
 
 // CKB absolute-epoch `since` stores the epoch number in 24 bits. Poll
-// deadlines must leave room for the strictly-after-deadline lower bound.
+// deadlines must leave room for the latest enforced threshold. Force-close is
+// still later than finalization/creator-close, so it remains the tight bound.
 pub const MAX_DEADLINE_EPOCH: u64 = (1u64 << 24) - FORCE_CLOSE_GRACE_EPOCHS - 2;
 
 pub const SHANNONS_PER_CKB: u64 = 100_000_000;

@@ -10,16 +10,15 @@ import { FinalizationReadinessCheck, Poll, TxState } from "../lib/types";
 import { TxStatus } from "./TxStatus";
 import { ActionConfirmDialog } from "./ActionConfirmDialog";
 import {
-  FORCE_CLOSE_GRACE_EPOCHS,
+  MAX_ACTIVE_TALLY_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_INTENTS_PER_AGG,
-  MAX_SHARDS_PER_FINALIZE,
 } from "../lib/constants";
 import {
   canDelegateForPoll,
-  canFinalizeTallyShardFromUi,
   CREATOR_VOTING_DISABLED_MESSAGE,
+  derivePollMaintenanceState,
   derivePollOutcome,
   EpochPosition,
   estimatePollCloseHours,
@@ -47,8 +46,7 @@ interface Props {
   onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
   onCheckFinalizationReadiness: (poll: Poll) => Promise<FinalizationReadinessCheck>;
-  onFinalizeShards: (poll: Poll) => Promise<string>;
-  onFinalizeAllShards: (poll: Poll) => Promise<string>;
+  onFinalizeTallyShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
@@ -126,8 +124,7 @@ export function VoteOnPoll({
   onVote,
   onAggregate,
   onCheckFinalizationReadiness,
-  onFinalizeShards,
-  onFinalizeAllShards,
+  onFinalizeTallyShards,
   onMergeShards,
   onClose,
   onForceClose,
@@ -174,21 +171,21 @@ export function VoteOnPoll({
   // Shown on neither a needs-close nor a closed poll, and never while
   // disconnected, so the button cannot advertise a rejected action.
   const canDelegate = canDelegateForPoll(poll, voterLockHash, currentEpoch);
-  const forceCloseGraceEndEpoch = poll.deadline + FORCE_CLOSE_GRACE_EPOCHS;
-  const forceCloseOpen = currentEpoch > forceCloseGraceEndEpoch;
   const indexedShardCount = poll.tallyShards.length;
   const finalizedShardCount = poll.tallyShards.filter((shard) => shard.finalized).length;
   const missingShardCount = poll.shardCount > indexedShardCount ? poll.shardCount - indexedShardCount : 0;
   const mergeResultCount = poll.tallyMergeResults.length;
   const tallyProgress = getPollTallyProgress(poll);
-  const directCloseTooLarge = tallyProgress.requiresMerge;
+  const maintenanceState = derivePollMaintenanceState(poll, currentEpoch);
+  const currentCodeActivePoll = maintenanceState.activeCurrentCodePoll;
+  const directCloseTooLarge = maintenanceState.mergeRequired;
   const allShardsFinalized = tallyProgress.allShardsFinalized;
-  const hasCompleteMergeResult = tallyProgress.hasCompleteMergeResult;
-  const closeStateReady = tallyProgress.closeStateReady;
-  const remainingShardCount = tallyProgress.unfinalizedShardCount;
-  const finalizeTransactionCount = Math.ceil(remainingShardCount / MAX_SHARDS_PER_FINALIZE);
+  const hasCompleteMergeResult = maintenanceState.hasCompleteMergeResult;
+  const closeStateReady = maintenanceState.closeEvidenceReady;
   const tallyCoverageComplete = poll.tallyFrontier.coverageComplete;
-  const canDescribeTallyAsFinal = poll.isClosed || closeStateReady;
+  const earliestCreatorCloseEpoch = maintenanceState.earliestCreatorCloseEpoch;
+  const earliestForceCloseEpoch = maintenanceState.earliestForceCloseEpoch;
+  const forceCloseOpen = maintenanceState.forceCloseTimingReached;
   const tallyCoverageText =
     poll.tallyFrontier.shardCount > 0
       ? `${poll.tallyFrontier.coveredShardCount.toString()}/${poll.tallyFrontier.shardCount.toString()} lanes indexed`
@@ -316,12 +313,8 @@ export function VoteOnPoll({
     await executeAction("aggregate", () => onAggregate(poll), "Aggregate failed");
   };
 
-  const handleFinalizeShards = async () => {
-    await executeAction("finalize", () => onFinalizeShards(poll), "Finalize shard failed");
-  };
-
-  const handleFinalizeAllShards = async () => {
-    await executeAction("finalize", () => onFinalizeAllShards(poll), "Finalize lanes failed");
+  const handleFinalizeTallyShards = async () => {
+    await executeAction("finalize", () => onFinalizeTallyShards(poll), "Finalize lanes failed");
   };
 
   const handleMergeShards = async () => {
@@ -360,7 +353,7 @@ export function VoteOnPoll({
     setPendingConfirmAction(action);
   };
 
-  const prepareFinalizationConfirmation = async (mode: "single" | "remaining") => {
+  const prepareFinalizationConfirmation = async () => {
     if (isBusy) return;
 
     setFinalizationCheckInFlight(true);
@@ -384,23 +377,13 @@ export function VoteOnPoll({
       ? getFinalizeShardConfirmationMessage(poll, readinessCheck)
       : "The indexed intent check could not complete. Finalizing now can leave timely intents permanently uncounted.";
 
-    if (mode === "single") {
-      requestConfirmation({
-        title: "Confirm Shard Finalization",
-        message,
-        confirmLabel: needsCaution ? "Finalize Anyway" : "Finalize Last Lane",
-        execute: handleFinalizeShards,
-      });
-      return;
-    }
-
     requestConfirmation({
       title: "Confirm Lane Finalization",
       message,
       confirmLabel: needsCaution
         ? "Finalize Anyway"
-        : "Finalize Lanes",
-      execute: handleFinalizeAllShards,
+        : "Finalize Complete Lane Set",
+      execute: handleFinalizeTallyShards,
     });
   };
 
@@ -432,26 +415,21 @@ export function VoteOnPoll({
     poll.aggregationBatchCount > 0;
   const canFinalizeShards =
     hasWallet &&
-    canFinalizeTallyShardFromUi(poll, currentEpoch) &&
+    maintenanceState.finalizeReady &&
     !allShardsFinalized;
   const canMergeShards =
     hasWallet &&
+    currentCodeActivePoll &&
     !poll.isClosed &&
-    isExpired &&
-    directCloseTooLarge &&
-    !hasCompleteMergeResult &&
-    (finalizedShardCount > 0 || mergeResultCount > 1);
+    maintenanceState.mergeReady &&
+    !maintenanceState.hasCompleteMergeResult;
   const canClose =
     Boolean(voterLockHash) &&
-    !poll.isClosed &&
-    isExpired &&
     isCreator &&
-    closeStateReady;
+    maintenanceState.creatorCloseEligible;
   const canForceClose =
     hasWallet &&
-    !poll.isClosed &&
-    forceCloseOpen &&
-    closeStateReady;
+    maintenanceState.forceCloseEligible;
   const canRefundClosedIntent =
     hasWallet &&
     poll.isClosed &&
@@ -856,35 +834,13 @@ export function VoteOnPoll({
                 </button>
               )}
 
-              {/* Flow: one remaining lane uses the single-lane builder; larger
-                  sets use explicitly signed batches of at most eight lanes. */}
-              {canFinalizeShards && remainingShardCount === 1 && (
+              {canFinalizeShards && (
                 <button
                   onClick={() => {
-                    void prepareFinalizationConfirmation("single");
+                    void prepareFinalizationConfirmation();
                   }}
                   disabled={isBusy}
-                  title="Check indexed intents, then prepare the last tally lane for finalization"
-                  className="btn-quiet w-full sm:w-auto"
-                >
-                  {(activeAction === "finalize" || finalizationCheckInFlight) && (
-                    <span className="button-spinner" aria-hidden="true" />
-                  )}
-                  {finalizationCheckInFlight
-                    ? "Checking intents..."
-                    : activeAction === "finalize"
-                      ? "Finalizing..."
-                      : "Finalize Last Lane"}
-                </button>
-              )}
-
-              {canFinalizeShards && remainingShardCount > 1 && (
-                <button
-                  onClick={() => {
-                    void prepareFinalizationConfirmation("remaining");
-                  }}
-                  disabled={isBusy}
-                  title={`Check indexed intents, then prepare ${remainingShardCount.toString()} ordered lanes for ${finalizeTransactionCount.toString()} finalization transaction${finalizeTransactionCount === 1 ? "" : "s"}`}
+                  title={`Check indexed intents, then prepare the complete ordered ${poll.shardCount.toString()}-lane set for one finalization transaction after epoch ${maintenanceState.earliestFinalizeEpoch.toString()}`}
                   className="btn-primary w-full sm:w-auto"
                 >
                   {(activeAction === "finalize" || finalizationCheckInFlight) && (
@@ -893,8 +849,8 @@ export function VoteOnPoll({
                   {finalizationCheckInFlight
                     ? "Checking intents..."
                     : activeAction === "finalize"
-                      ? `Finalizing ${remainingShardCount.toString()} lanes...`
-                      : "Finalize Lanes"}
+                      ? `Finalizing ${poll.shardCount.toString()} lanes...`
+                      : "Finalize Complete Lane Set"}
                 </button>
               )}
 
@@ -991,12 +947,6 @@ export function VoteOnPoll({
 
       {(scopedTxState && scopedTxState.status !== "idle") || localError ? (
         <div className="poll-transaction-feedback">
-          {scopedTxState?.batch && (
-            <div className="mb-2 text-xs subtle">
-              {scopedTxState.batch.label}: {scopedTxState.batch.completed.toString()} of{" "}
-              {scopedTxState.batch.total.toString()} lanes confirmed. Each batch of up to {MAX_SHARDS_PER_FINALIZE.toString()} lanes is signed once.
-            </div>
-          )}
           {lastCompletedAction === "aggregate" && scopedTxState?.status === "success" && (
             <div className="mb-2 text-xs" style={{ color: "var(--teal)" }}>
               {poll.aggregationBatchCount > 0
@@ -1052,8 +1002,8 @@ export function VoteOnPoll({
               <div className="poll-detail-label">Creator lifecycle</div>
               <div>
                 {votingSupported
-                  ? "Creator close is available after the deadline when tally state is ready. Tally-lane aggregation, finalization, merge, force-close after grace, and omitted-intent refunds are maintenance actions any connected wallet can run with enough CKB."
-                  : "Creator close remains available after the deadline when recovery state is ready. Finalization, merge, force-close after grace, and omitted-intent refunds remain recovery actions; aggregation is disabled."}
+                  ? "Creator close is available after the one-epoch aggregation grace when tally state is ready. Tally-lane aggregation, atomic complete-set finalization, merge, force-close after grace, and omitted-intent refunds are maintenance actions any connected wallet can run with enough CKB."
+                  : "Creator close remains available after the one-epoch aggregation grace when recovery state is ready. Finalization, merge, force-close after grace, and omitted-intent refunds remain recovery actions; aggregation is disabled."}
               </div>
             </div>
           )}
@@ -1062,11 +1012,17 @@ export function VoteOnPoll({
             <div className="poll-detail-row">
               <div className="poll-detail-label">Close window</div>
               <div>
-                {!isExpired
-                  ? `Close becomes valid after deadline (epoch > ${poll.deadline.toString()}). Permissionless force-close opens once epoch > ${forceCloseGraceEndEpoch.toString()}.`
-                  : !forceCloseOpen
-                    ? `Creator-auth close is active now. Permissionless force-close opens once epoch > ${forceCloseGraceEndEpoch.toString()}.`
-                    : "The grace period has elapsed. Anyone can force-close now so deposits are not locked indefinitely."}
+                {!currentCodeActivePoll
+                  ? `Current-code lifecycle actions stop at ${MAX_ACTIVE_TALLY_SHARDS.toString()} active lanes. Larger historical polls require their original contract and deployment metadata for maintenance.`
+                  : !maintenanceState.creatorCloseTimingReached
+                    ? `Creator close becomes valid after epoch ${earliestCreatorCloseEpoch.toString()}. Permissionless force-close becomes valid after epoch ${earliestForceCloseEpoch.toString()}.`
+                    : maintenanceState.closeEvidenceReady
+                      ? maintenanceState.forceCloseTimingReached
+                        ? "Close evidence is ready, and the later permissionless force-close threshold is open now."
+                        : `Creator-auth close is active now. Permissionless force-close becomes valid after epoch ${earliestForceCloseEpoch.toString()}.`
+                      : maintenanceState.forceCloseTimingReached
+                        ? "The later force-close timing threshold is open, but finalization or merge evidence is still required before this poll can close."
+                        : "The creator-close timing window is open, but finalization or merge evidence is still required."}
               </div>
             </div>
           )}
@@ -1110,9 +1066,9 @@ export function VoteOnPoll({
                   {uncoveredPreview ? ` Uncovered lane ids: ${uncoveredPreview}${uncoveredSuffix}.` : ""}
                 </div>
               )}
-              {!canDescribeTallyAsFinal && tallyCoverageComplete && (
+              {!poll.isClosed && tallyCoverageComplete && (
                 <div className="mt-1 subtle">
-                  Indexed tally coverage is complete, but the result is not final until lifecycle close readiness or poll closure.
+                  Indexed tally coverage is complete, but the result remains `intent_inclusion: unproven` and is not final until the poll is actually closed.
                 </div>
               )}
             </div>
@@ -1136,28 +1092,64 @@ export function VoteOnPoll({
             </div>
           )}
 
-          {isExpired && poll.shardCount > 0 && !directCloseTooLarge && !allShardsFinalized && (
+          {maintenanceState.kind === "mixed_partially_finalized" && (
             <div className="poll-detail-row poll-detail-warning">
-              <div className="poll-detail-label">Close readiness</div>
-              <div>Close is disabled until every indexed tally lane is finalized. Finalization freezes its tally state for close.</div>
+              <div className="poll-detail-label">Mixed lane state</div>
+              <div>
+                Indexed lanes are partially finalized. This mixed state is shown read-only until the indexed lane set is corrected.
+              </div>
             </div>
           )}
 
-          {isExpired && poll.shardCount > 0 && poll.pendingIntentCount > 0n && (
+          {maintenanceState.kind === "incomplete_indexed_lane_set" && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Incomplete lane set</div>
+              <div>
+                The complete live lane set is not fully indexed yet, so finalization and close remain unavailable.
+                {maintenanceState.missingLaneIds.length > 0
+                  ? ` Missing lane ids: ${maintenanceState.missingLaneIds.join(", ")}.`
+                  : ""}
+              </div>
+            </div>
+          )}
+
+          {maintenanceState.kind === "malformed_indexed_lane_set" && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Malformed lane evidence</div>
+              <div>
+                Indexed lane or merge evidence is malformed for this poll, so maintenance actions stay read-only until the indexed state is corrected.
+              </div>
+            </div>
+          )}
+
+          {!poll.isClosed && poll.pendingIntentCount > 0n && (
             <div className="poll-detail-row poll-detail-warning">
               <div className="poll-detail-label">Completeness warning</div>
               <div>Pending intents are still indexed. Finalizing can leave them uncounted; they remain refundable after close.</div>
             </div>
           )}
 
-          {isExpired && directCloseTooLarge && (
+          {!poll.isClosed && poll.shardCount > 0 && maintenanceState.creatorCloseTimingReached && !maintenanceState.closeEvidenceReady && (
+            <div className="poll-detail-row poll-detail-warning">
+              <div className="poll-detail-label">Close readiness</div>
+              <div>
+                The creator-close timing window is open, but finalization or merge evidence is still required before this poll can close.
+              </div>
+            </div>
+          )}
+
+          {!poll.isClosed && maintenanceState.mergeRequired && (
             <div className={`poll-detail-row ${hasCompleteMergeResult ? "" : "poll-detail-warning"}`}>
               <div className="poll-detail-label">Merge requirement</div>
               <div>
                 Direct close is limited to {MAX_DIRECT_CLOSE_SHARDS.toString()} tally lanes.
-                {hasCompleteMergeResult
-                  ? " A complete merge result is indexed, so close can use the merge-result path."
-                  : " This poll requires a complete merge result before close."}
+                {!currentCodeActivePoll
+                  ? " This poll is beyond the current-code active cap and needs its historical contract path for maintenance."
+                  : maintenanceState.kind === "ready_for_merged_close"
+                    ? " A complete merge result is indexed, so close evidence is ready."
+                    : maintenanceState.kind === "merge_in_progress"
+                      ? " A valid partial merge frontier is indexed, and more merge work is still required before close."
+                      : " This poll requires one complete merge result before close."}
               </div>
             </div>
           )}

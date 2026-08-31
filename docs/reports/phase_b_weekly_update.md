@@ -1,6 +1,6 @@
 # Builder Track Weekly Status Update
 
-**Name:** Anih Soma (AnihDev)  
+**Name:** Anih Soma (AnihDev)
 **Duration:** 18th May, 2026 - 25th May, 2026
 
 ## Focus of the Week

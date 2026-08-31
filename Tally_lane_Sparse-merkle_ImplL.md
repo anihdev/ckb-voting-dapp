@@ -1,7 +1,9 @@
 # Tally Lane Sparse-Merkle Implementation
 
-**Status:** implemented, locally validated, and deployed to CKB testnet;
-controlled multi-actor lifecycle rehearsal remains pending.
+**Status:** historical August 5, 2026 fixed-root lane implementation record.
+The current repository keeps the sparse-Merkle lane model but later hardens
+current-code finalization to one-transaction full-set finalization for `1..16`
+active lanes after one aggregation-grace epoch.
 
 **Date:** August 5, 2026.
 
@@ -25,9 +27,11 @@ so I replaced the vector with a constant-size authenticated set commitment.
 
 The second issue was operational. A default poll creates eight lanes and every
 lane, including an empty one, must be frozen before close. The former frontend
-submitted eight transactions and required eight wallet approvals. I retained
-the complete-lane requirement but added bounded finalization of up to eight
-ordered lanes in one transaction.
+submitted eight transactions and required eight wallet approvals. At the August
+5 deployment checkpoint I retained the complete-lane requirement but added
+bounded finalization of up to eight ordered lanes in one transaction. Later
+hardening widened current-code active support to `1..16` lanes and now requires
+the complete ordered lane set to finalize together in one transaction.
 
 ## What A Merkle Tree Means Here
 
@@ -85,7 +89,9 @@ The contract, host tests, browser provider, and deploy tooling pin the same
 - aggregation proof version: `1`;
 - proof byte limit: 64 KiB;
 - aggregation batch limit: 50 intents;
-- finalization batch limit: 8 lanes.
+- historical August 5 deployment finalization batch limit: 8 lanes.
+  The current repository later raises active finalization support to 16 lanes
+  and requires the complete ordered current-code lane set in one transaction.
 
 The v2 lane payload is:
 
@@ -229,17 +235,18 @@ serialization and does not claim vote completeness.
   implementation compiled for browser and Node adapters.
 - [Frontend provider](frontend/src/lib/tallySmt.ts): reconstruction, root check,
   and transition proof generation.
-- [Transaction builders](frontend/src/lib/ckb.ts): aggregation witness and
-  one-to-eight-lane finalization layouts.
-- [Lifecycle hook](frontend/src/hooks/usePolls.ts): marker discovery and bounded
-  finalization batches.
+- [Transaction builders](frontend/src/lib/ckb.ts): aggregation witness plus the
+  current one-transaction full-set finalization layouts for `1..16` active
+  lanes.
+- [Lifecycle hook](frontend/src/hooks/usePolls.ts): marker discovery, advisory
+  readiness scans, and current complete-lane-set finalization selection.
 - [CKB-VM tests](backend/contracts-rust/integration-tests/tests/governance_vm.rs):
   protocol behavior, adversarial proof/finalization cases, and integrated cycles.
 
 ## Verification Evidence
 
 The integrated CKB-VM tests enforce a project ceiling of 50,000,000 cycles.
-Current local measurements are:
+Historical August 5 local measurements were:
 
 | Scenario | CKB-VM cycles |
 | --- | ---: |
@@ -284,10 +291,11 @@ These boundaries remain separate from the planned represented-principal
 
 ## Versioning And Deployment
 
-This contract binary and lane codec were deployed as a new testnet code cell in
-[`0x5a3ecd82...06ae9d5`](https://pudge.explorer.nervos.org/transaction/0x5a3ecd82853538347a3a6b48ef110f368062979f6cb88bbb9d4bcbb7306ae9d5),
+The current hardened contract binary and lane codec were deployed as a new
+testnet code cell in
+[`0xc82294a1...e5fbd97e`](https://pudge.explorer.nervos.org/transaction/0xc82294a1503e51a0d668ab94554eaa60f972a0dd0f2cb14ddf573510e5fbd97e),
 with `data1` code hash
-`0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`.
+`0x2300964979e336dc8196c61a177846e7249091ba7db5a9bfd7db834048f7f6ef`.
 Existing cells remain bound to their historical code dependency and are not
 silently reinterpreted or migrated. Deployment/configuration is verified; the
 complete multi-actor lifecycle rehearsal remains pending. Retired opcodes

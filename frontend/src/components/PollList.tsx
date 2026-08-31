@@ -28,8 +28,7 @@ interface Props {
   onVote: (poll: Poll, optionIndex: number, authorityId?: string) => Promise<string>;
   onAggregate: (poll: Poll) => Promise<string>;
   onCheckFinalizationReadiness: (poll: Poll) => Promise<FinalizationReadinessCheck>;
-  onFinalizeShards: (poll: Poll) => Promise<string>;
-  onFinalizeAllShards: (poll: Poll) => Promise<string>;
+  onFinalizeTallyShards: (poll: Poll) => Promise<string>;
   onMergeShards: (poll: Poll) => Promise<string>;
   onClose: (poll: Poll) => Promise<string>;
   onForceClose: (poll: Poll) => Promise<string>;
@@ -54,8 +53,7 @@ export function PollList({
   onVote,
   onAggregate,
   onCheckFinalizationReadiness,
-  onFinalizeShards,
-  onFinalizeAllShards,
+  onFinalizeTallyShards,
   onMergeShards,
   onClose,
   onForceClose,
@@ -233,8 +231,7 @@ export function PollList({
               onVote={onVote}
               onAggregate={onAggregate}
               onCheckFinalizationReadiness={onCheckFinalizationReadiness}
-              onFinalizeShards={onFinalizeShards}
-              onFinalizeAllShards={onFinalizeAllShards}
+              onFinalizeTallyShards={onFinalizeTallyShards}
               onMergeShards={onMergeShards}
               onClose={onClose}
               onForceClose={onForceClose}

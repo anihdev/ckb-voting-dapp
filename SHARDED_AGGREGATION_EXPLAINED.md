@@ -4,12 +4,18 @@ This note explains why I moved the voting protocol from poll-cell aggregation to
 
 It is written as a design explanation for reviewers, contributors, and future implementation sessions. It is not a new protocol spec. For the full current protocol spec, see `README.md` and the contract code.
 
-The current worktree uses a v2 fixed-root tally-lane codec. Each lane stores a
-constant-size sparse-Merkle root that records represented voters already counted,
-instead of growing one 32-byte hash per voter. That binary is deployed on CKB
-testnet under code hash
-`0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`.
-The complete multi-actor lifecycle rehearsal remains pending.
+The current repository uses a v2 fixed-root tally-lane codec. Each lane stores
+a constant-size sparse-Merkle root that records represented voters already
+counted, instead of growing one 32-byte hash per voter. Current-code polls
+support `1..16` active lanes, finalize the complete ordered lane set in one
+transaction after a one-epoch aggregation grace, and close directly at `<=8`
+lanes or through bounded merge at `9..16` lanes. The current hardened testnet
+deployment is transaction
+[`0xc82294a1...e5fbd97e`](https://pudge.explorer.nervos.org/transaction/0xc82294a1503e51a0d668ab94554eaa60f972a0dd0f2cb14ddf573510e5fbd97e),
+with `data1` code hash
+`0x2300964979e336dc8196c61a177846e7249091ba7db5a9bfd7db834048f7f6ef`.
+Its controlled connected-wallet and real-node lifecycle rehearsal remains
+pending.
 
 ## Where The Problem Started
 
@@ -172,7 +178,7 @@ After:
   only aggregators working on the same shard contend with each other
 ```
 
-If a poll has 8 shards, there can be up to 8 independent aggregation lanes. If a poll has 32 shards, there can be up to 32 lanes. More shards create more parallelism, but also make close/merge more complex, so the project now uses bounded close and merge rules.
+If a poll has 8 shards, there can be up to 8 independent aggregation lanes. Current-code polls now cap active `shard_count` at 16, so the live new-poll range is `1..16` lanes; larger shard counts are historical old-code-hash territory rather than active current-code maintenance. More shards create more parallelism, but also make close/merge more complex, which is why the current code keeps bounded finalization and merge rules.
 
 ## Current Protocol Flow
 
@@ -198,8 +204,9 @@ CREATE_TALLY_SHARD aggregation
   -> timely intents can aggregate after the deadline until shard finalization
 
 CREATE_TALLY_SHARD finalization
-  -> consumes 1..8 ordered same-poll lanes per transaction
-  -> every lane input carries absolute epoch since strictly after deadline
+  -> consumes the complete ordered active lane set in one transaction
+  -> current-code polls support 1..16 active lanes
+  -> every lane input carries the same absolute epoch since at or above deadline + 2
   -> finalization freezes those lane tallies without changing roots or counts
 
 Small poll close
@@ -208,11 +215,12 @@ Small poll close
   -> final result is derived from shard data
 
 Large poll close
-  -> if shard_count > MAX_DIRECT_CLOSE_SHARDS
+  -> if 9 <= shard_count <= 16 under the current code hash
   -> MERGE_TALLY_SHARDS consumes finalized shards or previous merge results
   -> creates bounded merge result cells
   -> repeat until one complete merge result covers all shards
   -> CLOSE_POLL consumes poll cell plus complete merge result
+  -> larger shard counts remain historical old-code-hash compatibility only
 
 Post-close omitted intent refund
   -> omitted live intent cells can be refunded after close
@@ -222,6 +230,11 @@ Immediate late intent refund
   -> an intent created after the deadline cannot be aggregated
   -> its authenticated creation epoch enables exact full-capacity refund
 ```
+
+Current producible polls keep `pending_intent_count` reserved zero. Visible
+pending, late, unresolved, and refundable intent counts come from advisory
+RPC/indexer discovery and fresh poll-scoped scans; they inform maintenance
+warnings but do not become consensus gates.
 
 Local implementation references:
 

@@ -9,7 +9,9 @@ import {
   countAggregationBatches,
   computeCanonicalTallyFrontier,
   CREATOR_VOTING_DISABLED_MESSAGE,
+  derivePollMaintenanceState,
   derivePollOutcome,
+  derivePollResultAssurance,
   deriveVoteAuthorityOptions,
   describeIndexerQueryError,
   epochSpanInUnit,
@@ -39,6 +41,10 @@ import {
   validatePollDurationSelection,
 } from "../frontend/src/lib/protocolUi";
 import { bytesToHex } from "../frontend/src/lib/molecule";
+import {
+  GOVERNANCE_CODE_HASH,
+  GOVERNANCE_SCRIPT_HASH_TYPE,
+} from "../frontend/src/lib/ckb";
 import {
   DelegationRecord,
   Poll,
@@ -102,7 +108,6 @@ function makePoll(overrides: Partial<Poll> = {}): Poll {
     totalVoters: 0n,
     creatorDeposit: 500n * 100_000_000n,
     pendingIntentCount: 0n,
-    protocolPendingIntentCount: 0n,
     tokenWeighted: false,
     udtTypeHash: `0x${"00".repeat(32)}`,
     shardCount: 4,
@@ -117,6 +122,7 @@ function makePoll(overrides: Partial<Poll> = {}): Poll {
       selectedShardIds: [],
       uncoveredShardIds: [0, 1, 2, 3],
     },
+    resultAssurance: null,
     totalVotes: 0n,
     authorityOptions: [],
     aggregationBatchCount: 0,
@@ -444,9 +450,9 @@ describe("poll lifecycle UI", () => {
   });
 
   test("estimates the close window from the fractional tip epoch", () => {
-    expect(estimatePollCloseHours(100n, { epoch: 100n, index: 50n, length: 100n })).toBe(2);
-    expect(estimatePollCloseHours(100n, { epoch: 99n, index: 50n, length: 100n })).toBe(6);
-    expect(estimatePollCloseHours(100n, { epoch: 101n, index: 0n, length: 100n })).toBe(0);
+    expect(estimatePollCloseHours(100n, { epoch: 100n, index: 50n, length: 100n })).toBe(6);
+    expect(estimatePollCloseHours(100n, { epoch: 99n, index: 50n, length: 100n })).toBe(10);
+    expect(estimatePollCloseHours(100n, { epoch: 102n, index: 0n, length: 100n })).toBe(0);
     expect(formatApproxWallClockDuration(6)).toBe("about 6 hours");
   });
 
@@ -462,14 +468,16 @@ describe("poll lifecycle UI", () => {
     expect(getPollFilterCounts(polls, 50n)).toEqual({ open: 1, needsClose: 1, archived: 1, all: 3 });
   });
 
-  test("allows post-deadline finalization and warns about indexed pending intents", () => {
+  test("allows post-grace finalization and warns about indexed pending intents", () => {
     const poll = makePoll({
       pendingIntentCount: 2n,
-      tallyShards: [makeShard({ shardId: 0 }), makeShard({ id: "shard-1", shardId: 1, finalized: true })],
+      shardCount: 2,
+      tallyShards: [makeShard({ shardId: 0, shardCount: 2 }), makeShard({ id: "shard-1", shardId: 1, shardCount: 2 })],
     });
 
     expect(canFinalizeTallyShardFromUi(poll, 100n)).toBe(false);
-    expect(canFinalizeTallyShardFromUi(poll, 101n)).toBe(true);
+    expect(canFinalizeTallyShardFromUi(poll, 101n)).toBe(false);
+    expect(canFinalizeTallyShardFromUi(poll, 102n)).toBe(true);
     expect(getFinalizeShardConfirmationMessage(poll)).toContain(FINALIZE_PENDING_INTENTS_WARNING);
   });
 
@@ -534,27 +542,30 @@ describe("poll lifecycle UI", () => {
     expect(timeline.some((step) => step.label.toLowerCase().includes("delegat"))).toBe(false);
   });
 
-  test("reports bounded multi-lane finalization", () => {
-    const timeline = buildProtocolTimeline(
-      makePoll({
-        shardCount: 2,
-        tallyShards: [makeShard({ shardId: 0, finalized: true }), makeShard({ id: "shard-1", shardId: 1 })],
-      }),
-      101n
-    );
+  test("fails closed on a mixed partially finalized lane set", () => {
+    const poll = makePoll({
+      shardCount: 2,
+      tallyShards: [
+        makeShard({ shardId: 0, finalized: true, shardCount: 2 }),
+        makeShard({ id: "shard-1", shardId: 1, shardCount: 2 }),
+      ],
+    });
+    const maintenance = derivePollMaintenanceState(poll, 102n);
+    const timeline = buildProtocolTimeline(poll, 102n);
     const finalizeStep = timeline.find((step) => step.label === "Finalize lanes");
 
-    expect(finalizeStep?.detail).toContain("1/2 lanes finalized");
-    expect(finalizeStep?.detail).toContain("Up to 8 ordered lanes");
-    expect(finalizeStep?.detail).toContain("one transaction");
+    expect(maintenance.kind).toBe("mixed_partially_finalized");
+    expect(canFinalizeTallyShardFromUi(poll, 102n)).toBe(false);
+    expect(finalizeStep?.detail).toContain("partially finalized");
+    expect(finalizeStep?.detail).toContain("read-only");
   });
 
-  test("marks aggregation ended when finalized lanes leave indexed intents uncounted", () => {
+  test("marks aggregation ended once finalized lanes leave indexed intents uncounted", () => {
     const timeline = buildProtocolTimeline(
       makePoll({
         pendingIntentCount: 2n,
         shardCount: 1,
-        tallyShards: [makeShard({ finalized: true })],
+        tallyShards: [makeShard({ finalized: true, shardCount: 1 })],
       }),
       101n
     );
@@ -590,12 +601,14 @@ describe("poll lifecycle UI", () => {
   test("marks weighted polls unsupported while retaining recovery finalization", () => {
     const weighted = makePoll({
       tokenWeighted: true,
-      tallyShards: [makeShard()],
+      shardCount: 1,
+      tallyShards: [makeShard({ shardCount: 1 })],
     });
 
     expect(isPollVotingSupported(weighted)).toBe(false);
     expect(UNSUPPORTED_WEIGHTED_POLL_LABEL).toBe("Weighted voting disabled; recovery only");
-    expect(canFinalizeTallyShardFromUi(weighted, weighted.deadline + 1n)).toBe(true);
+    expect(canFinalizeTallyShardFromUi(weighted, weighted.deadline + 1n)).toBe(false);
+    expect(canFinalizeTallyShardFromUi(weighted, weighted.deadline + 2n)).toBe(true);
   });
 
   test("does not advertise weighted vote or aggregation operations as live", () => {
@@ -767,6 +780,298 @@ describe("canonical tally frontier", () => {
   });
 });
 
+describe("result assurance and maintenance classification", () => {
+  test("derives assurance provenance from the indexed poll type script", () => {
+    const poll = makePoll({
+      tallyFrontier: {
+        source: "complete-merge",
+        coveredShardCount: 4,
+        shardCount: 4,
+        coverageComplete: true,
+        selectedMergeResultIds: ["merge-0"],
+        selectedShardIds: [],
+        uncoveredShardIds: [],
+      },
+    });
+
+    const assurance = derivePollResultAssurance(poll, {
+      codeHash: GOVERNANCE_CODE_HASH,
+      hashType: GOVERNANCE_SCRIPT_HASH_TYPE,
+    });
+    expect(assurance).toMatchObject({
+      version: 1,
+      protocolCodeHash: GOVERNANCE_CODE_HASH,
+      protocolHashType: GOVERNANCE_SCRIPT_HASH_TYPE,
+      laneCoverage: "complete",
+    });
+    expect(derivePollResultAssurance(poll, {
+      codeHash: `0x${"00".repeat(31)}11`,
+      hashType: GOVERNANCE_SCRIPT_HASH_TYPE,
+    })).toBeNull();
+    expect(derivePollResultAssurance(poll, {
+      codeHash: GOVERNANCE_CODE_HASH,
+      hashType: "type",
+    })).toBeNull();
+    expect(derivePollResultAssurance(poll, {
+      codeHash: GOVERNANCE_CODE_HASH,
+    })).toBeNull();
+  });
+
+  test("classifies a fresh complete live lane set as not close-ready", () => {
+    const poll = makePoll({
+      shardCount: 2,
+      tallyShards: [
+        makeShard({ shardId: 0, shardCount: 2 }),
+        makeShard({ id: "shard-1", shardId: 1, shardCount: 2 }),
+      ],
+    });
+    const maintenance = derivePollMaintenanceState(poll, 100n);
+
+    expect(maintenance.kind).toBe("awaiting_finalize_threshold");
+    expect(maintenance.closeEvidenceReady).toBe(false);
+    expect(maintenance.creatorCloseEligible).toBe(false);
+  });
+
+  test("enables finalization only at deadline plus two", () => {
+    const poll = makePoll({
+      shardCount: 2,
+      tallyShards: [
+        makeShard({ shardId: 0, shardCount: 2 }),
+        makeShard({ id: "shard-1", shardId: 1, shardCount: 2 }),
+      ],
+    });
+
+    expect(derivePollMaintenanceState(poll, 101n).kind).toBe("awaiting_finalize_threshold");
+    expect(derivePollMaintenanceState(poll, 102n).kind).toBe("ready_to_finalize");
+  });
+
+  test("classifies fully finalized small polls as direct-close evidence", () => {
+    const poll = makePoll({
+      shardCount: 2,
+      tallyShards: [
+        makeShard({ shardId: 0, finalized: true, shardCount: 2 }),
+        makeShard({ id: "shard-1", shardId: 1, finalized: true, shardCount: 2 }),
+      ],
+    });
+    const maintenance = derivePollMaintenanceState(poll, 102n);
+
+    expect(maintenance.kind).toBe("ready_for_direct_close");
+    expect(maintenance.closeEvidenceReady).toBe(true);
+    expect(maintenance.creatorCloseEligible).toBe(true);
+    expect(maintenance.forceCloseEligible).toBe(false);
+  });
+
+  test("classifies fully finalized 9..16 lane polls as awaiting merge", () => {
+    const poll = makePoll({
+      shardCount: 9,
+      tallyShards: Array.from({ length: 9 }, (_, shardId) =>
+        makeShard({ id: `shard-${shardId}`, shardId, shardCount: 9, finalized: true })
+      ),
+      tallyFrontier: {
+        source: "live-shards",
+        coveredShardCount: 9,
+        shardCount: 9,
+        coverageComplete: true,
+        selectedMergeResultIds: [],
+        selectedShardIds: Array.from({ length: 9 }, (_, shardId) => shardId),
+        uncoveredShardIds: [],
+      },
+    });
+
+    expect(derivePollMaintenanceState(poll, 102n).kind).toBe("awaiting_merge");
+  });
+
+  test("classifies valid complete frontier merge progress as finalized merge work", () => {
+    const poll = makePoll({
+      shardCount: 9,
+      tallyShards: [makeShard({ shardId: 8, shardCount: 9, finalized: true })],
+      tallyMergeResults: [
+        makeMerge({
+          id: "merge-01",
+          pollId: POLL_ID,
+          coverage: coverage(0, 1, 2, 3, 4, 5, 6, 7),
+        }),
+      ],
+      tallyFrontier: {
+        source: "merge-frontier",
+        coveredShardCount: 9,
+        shardCount: 9,
+        coverageComplete: true,
+        selectedMergeResultIds: ["merge-01"],
+        selectedShardIds: [8],
+        uncoveredShardIds: [],
+      },
+    });
+    const maintenance = derivePollMaintenanceState(poll, 102n);
+
+    expect(maintenance.kind).toBe("merge_in_progress");
+    expect(maintenance.mergeReady).toBe(true);
+    expect(maintenance.finalizationCompleted).toBe(true);
+    expect(maintenance.closeEvidenceReady).toBe(false);
+  });
+
+  test("fails closed when a partial merge frontier is incomplete", () => {
+    const poll = makePoll({
+      shardCount: 9,
+      tallyShards: [],
+      tallyMergeResults: [
+        makeMerge({
+          id: "merge-01",
+          pollId: POLL_ID,
+          coverage: coverage(0, 1, 2, 3, 4, 5, 6, 7),
+        }),
+      ],
+      tallyFrontier: {
+        source: "merge-frontier",
+        coveredShardCount: 8,
+        shardCount: 9,
+        coverageComplete: false,
+        selectedMergeResultIds: ["merge-01"],
+        selectedShardIds: [],
+        uncoveredShardIds: [8],
+      },
+    });
+    const maintenance = derivePollMaintenanceState(poll, 102n);
+
+    expect(maintenance.kind).toBe("incomplete_indexed_lane_set");
+    expect(maintenance.mergeReady).toBe(false);
+  });
+
+  test("fails closed when the indexed live lane domain is incomplete", () => {
+    const poll = makePoll({
+      shardCount: 9,
+      tallyShards: Array.from({ length: 8 }, (_, shardId) =>
+        makeShard({ id: `shard-${shardId}`, shardId, shardCount: 9 })
+      ),
+      tallyFrontier: {
+        source: "live-shards",
+        coveredShardCount: 8,
+        shardCount: 9,
+        coverageComplete: false,
+        selectedMergeResultIds: [],
+        selectedShardIds: Array.from({ length: 8 }, (_, shardId) => shardId),
+        uncoveredShardIds: [8],
+      },
+    });
+    const maintenance = derivePollMaintenanceState(poll, 111n);
+
+    expect(maintenance.kind).toBe("incomplete_indexed_lane_set");
+    expect(maintenance.finalizeReady).toBe(false);
+    expect(maintenance.mergeReady).toBe(false);
+    expect(maintenance.creatorCloseEligible).toBe(false);
+    expect(maintenance.forceCloseEligible).toBe(false);
+  });
+
+  test("classifies a complete merge as close evidence", () => {
+    const poll = makePoll({
+      shardCount: 9,
+      tallyShards: [],
+      tallyMergeResults: [
+        makeMerge({
+          id: "merge-complete",
+          pollId: POLL_ID,
+          coverage: coverage(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        }),
+      ],
+      tallyFrontier: {
+        source: "complete-merge",
+        coveredShardCount: 9,
+        shardCount: 9,
+        coverageComplete: true,
+        selectedMergeResultIds: ["merge-complete"],
+        selectedShardIds: [],
+        uncoveredShardIds: [],
+      },
+    });
+    const maintenance = derivePollMaintenanceState(poll, 102n);
+
+    expect(maintenance.kind).toBe("ready_for_merged_close");
+    expect(maintenance.closeEvidenceReady).toBe(true);
+  });
+
+  test("fails closed on malformed lane and merge metadata", () => {
+    const duplicateLane = derivePollMaintenanceState(
+      makePoll({
+        shardCount: 2,
+        tallyShards: [
+          makeShard({ shardId: 0, shardCount: 2 }),
+          makeShard({ id: "dup", shardId: 0, shardCount: 2 }),
+        ],
+      }),
+      102n
+    );
+    expect(duplicateLane.kind).toBe("malformed_indexed_lane_set");
+
+    const wrongPollLane = derivePollMaintenanceState(
+      makePoll({
+        shardCount: 2,
+        tallyShards: [
+          makeShard({ shardId: 0, shardCount: 2 }),
+          makeShard({ id: "wrong-poll", pollId: `0x${"22".repeat(32)}`, shardId: 1, shardCount: 2 }),
+        ],
+      }),
+      102n
+    );
+    expect(wrongPollLane.kind).toBe("malformed_indexed_lane_set");
+
+    const malformedMerge = derivePollMaintenanceState(
+      makePoll({
+        shardCount: 9,
+        tallyShards: [makeShard({ shardId: 8, shardCount: 9, finalized: true })],
+        tallyMergeResults: [
+          makeMerge({
+            id: "merge-01",
+            pollId: POLL_ID,
+            coverage: coverage(0, 1, 2, 3, 4, 5, 6, 7),
+          }),
+        ],
+        tallyFrontier: {
+          source: "merge-frontier",
+          coveredShardCount: 9,
+          shardCount: 9,
+          coverageComplete: true,
+          selectedMergeResultIds: ["merge-01", "merge-missing"],
+          selectedShardIds: [8],
+          uncoveredShardIds: [],
+        },
+      }),
+      102n
+    );
+    expect(malformedMerge.kind).toBe("malformed_indexed_lane_set");
+  });
+
+  test("keeps creator close and force-close thresholds distinct", () => {
+    const poll = makePoll({
+      shardCount: 2,
+      tallyShards: [
+        makeShard({ shardId: 0, finalized: true, shardCount: 2 }),
+        makeShard({ id: "shard-1", shardId: 1, finalized: true, shardCount: 2 }),
+      ],
+    });
+
+    expect(derivePollMaintenanceState(poll, 101n).creatorCloseEligible).toBe(false);
+    expect(derivePollMaintenanceState(poll, 102n).creatorCloseEligible).toBe(true);
+    expect(derivePollMaintenanceState(poll, 110n).forceCloseEligible).toBe(false);
+    expect(derivePollMaintenanceState(poll, 111n).forceCloseEligible).toBe(true);
+  });
+
+  test("exposes no current-code maintenance actions above 16 lanes", () => {
+    const poll = makePoll({ shardCount: 17 });
+    const maintenance = derivePollMaintenanceState(poll, 200n);
+
+    expect(maintenance.kind).toBe("unsupported_current_code");
+    expect(maintenance.finalizeReady).toBe(false);
+    expect(maintenance.creatorCloseEligible).toBe(false);
+    expect(maintenance.forceCloseEligible).toBe(false);
+  });
+
+  test("keeps closed polls closed", () => {
+    const maintenance = derivePollMaintenanceState(makePoll({ isClosed: true }), 200n);
+    expect(maintenance.kind).toBe("closed");
+    expect(maintenance.finalizationCompleted).toBe(true);
+  });
+});
+
 describe("close-time refund selection", () => {
   test("prefers pending intents, filters another poll, and leaves overflow refundable", () => {
     const candidates = [
@@ -777,7 +1082,6 @@ describe("close-time refund selection", () => {
     ];
     const selection = selectCloseTimeIntentRefunds(candidates, {
       pollTypeHash: POLL_ID,
-      trackedPendingLowerBound: 2n,
       maxRefunds: 2,
     });
 
@@ -786,17 +1090,22 @@ describe("close-time refund selection", () => {
     expect(selection.omittedAggregatedCount).toBe(1);
   });
 
-  test("rejects missing tracked pending intents and an impossible cap", () => {
-    const onePending = [{ cell: "pending", pollTypeHash: POLL_ID, aggregated: false }];
-    expect(() => selectCloseTimeIntentRefunds(onePending, {
+  test("filters by poll, keeps pending first, and respects the refund cap", () => {
+    const candidates = [
+      { cell: "aggregated", pollTypeHash: POLL_ID, aggregated: true, sortKey: "002" },
+      { cell: "wrong-poll", pollTypeHash: `0x${"22".repeat(32)}`, aggregated: false, sortKey: "000" },
+      { cell: "pending-b", pollTypeHash: POLL_ID, aggregated: false, sortKey: "001" },
+      { cell: "pending-a", pollTypeHash: POLL_ID, aggregated: false, sortKey: "000" },
+    ];
+    const selection = selectCloseTimeIntentRefunds(candidates, {
       pollTypeHash: POLL_ID,
-      trackedPendingLowerBound: 2n,
-      maxRefunds: 2,
-    })).toThrow("at least the pending intents tracked");
-    expect(() => selectCloseTimeIntentRefunds(onePending, {
-      pollTypeHash: POLL_ID,
-      trackedPendingLowerBound: 2n,
       maxRefunds: 1,
-    })).toThrow("exceed the frontend close-time refund cap");
+    });
+
+    expect(selection.included.map((candidate) => candidate.cell)).toEqual(["pending-a"]);
+    expect(selection.omitted.map((candidate) => candidate.cell)).toEqual(["pending-b", "aggregated"]);
+    expect(selection.includedPendingCount).toBe(1);
+    expect(selection.omittedPendingCount).toBe(1);
+    expect(selection.omittedAggregatedCount).toBe(1);
   });
 });

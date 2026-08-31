@@ -5,7 +5,7 @@ import { describe, expect, test } from "vitest";
 import { DelegationRecord, Poll, TxState } from "../lib/types";
 import { DelegatePower } from "./DelegatePower";
 
-const idleTxState: TxState = { status: "idle", txHash: null, error: null, scope: null, batch: null };
+const idleTxState: TxState = { status: "idle", txHash: null, error: null, scope: null };
 const noop = async () => "0x01";
 
 const VIEWER = `0x${"aa".repeat(32)}`;
@@ -27,7 +27,6 @@ function pollFixture(overrides: Partial<Poll> = {}): Poll {
     totalVoters: 0n,
     creatorDeposit: 500n * 100_000_000n,
     pendingIntentCount: 0n,
-    protocolPendingIntentCount: 0n,
     tokenWeighted: false,
     udtTypeHash: `0x${"00".repeat(32)}`,
     shardCount: 8,
@@ -42,6 +41,7 @@ function pollFixture(overrides: Partial<Poll> = {}): Poll {
       selectedShardIds: [],
       uncoveredShardIds: [],
     },
+    resultAssurance: null,
     totalVotes: 0n,
     authorityOptions: [],
     aggregationBatchCount: 0,
@@ -131,7 +131,6 @@ describe("delegation panel", () => {
         txHash: foreignHash,
         error: null,
         scope: { kind: "poll", pollId: "0xdead" },
-        batch: null,
       },
     });
 

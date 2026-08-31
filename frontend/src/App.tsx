@@ -74,8 +74,7 @@ function InnerApp() {
     createPoll,
     castVote,
     aggregatePoll,
-    finalizeShards,
-    finalizeAllShards,
+    finalizeTallyShards,
     mergeShards,
     closePoll,
     forceClose,
@@ -398,8 +397,7 @@ function InnerApp() {
             }
             onAggregate={aggregatePoll}
             onCheckFinalizationReadiness={checkFinalizationReadiness}
-            onFinalizeShards={finalizeShards}
-            onFinalizeAllShards={finalizeAllShards}
+            onFinalizeTallyShards={finalizeTallyShards}
             onMergeShards={mergeShards}
             onClose={closePoll}
             onForceClose={forceClose}

@@ -20,24 +20,32 @@ import {
   buildForceCloseTx,
   buildGovernanceTypeScript,
   buildIntentLockScript,
+  buildMergeTallyShardsTx,
   buildPollLockScript,
   buildRefundLateIntentTx,
+  buildTallyMergeResultTypeScript,
   buildTallyShardTypeScript,
   hashScript,
+  MAX_ACTIVE_TALLY_SHARDS,
 } from "./ckb";
 import {
   bytesToHex,
   decodePollData,
+  decodeTallyMergeResultData,
   decodeTallyShardData,
   EncodedScript,
   encodePollData,
+  encodeTallyMergeResultData,
   encodeTallyShardData,
   encodeVoteIntentData,
 } from "./molecule";
 import {
   CREATOR_DEPOSIT_SHANNONS,
+  FORCE_CLOSE_GRACE_EPOCHS,
+  MAX_SHARDS_PER_MERGE,
   OP,
   SHANNONS_PER_CKB,
+  TALLY_MERGE_RESULT_MIN_SHANNONS,
   TALLY_SHARD_MIN_SHANNONS,
   VOTER_DEPOSIT_SHANNONS,
 } from "./constants";
@@ -202,6 +210,96 @@ function intentCell(
   );
 }
 
+function setPollShardCount(pollCell: any, shardCount: number): void {
+  const poll = decodePollData(ccc.bytesFrom(pollCell.outputData));
+  pollCell.outputData = ccc.hexFrom(encodePollData({ ...poll, shard_count: shardCount }));
+}
+
+function tallyLaneCell(input: {
+  pollTypeHash: string;
+  shardCount: number;
+  shardId: number;
+  byte: number;
+  dataPollTypeHash?: string;
+  dataShardCount?: number;
+  finalized?: boolean;
+  voteCounts?: bigint[];
+  totalVoters?: bigint;
+  countedVoterRoot?: Uint8Array;
+  lockScript?: any;
+  typeScript?: any;
+  capacity?: bigint;
+}): any {
+  const canonicalScript = buildTallyShardTypeScript(input.pollTypeHash, input.shardId);
+  const lockScript = input.lockScript ?? canonicalScript;
+  const typeScript = input.typeScript ?? canonicalScript;
+  const data = encodeTallyShardData({
+    version: 2,
+    poll_type_hash: ccc.bytesFrom(input.dataPollTypeHash ?? input.pollTypeHash),
+    shard_id: input.shardId,
+    shard_count: input.dataShardCount ?? input.shardCount,
+    vote_counts: input.voteCounts ?? [BigInt(input.shardId), BigInt(input.shardId + 1)],
+    total_voters: input.totalVoters ?? BigInt(input.shardId + 1),
+    counted_voter_root:
+      input.countedVoterRoot ?? new Uint8Array(32).fill((input.shardId + 1) & 0xff),
+    finalized: input.finalized ?? false,
+  });
+
+  return liveCell(
+    input.byte,
+    lockScript,
+    typeScript,
+    input.capacity ?? TALLY_SHARD_MIN_SHANNONS,
+    ccc.hexFrom(data)
+  );
+}
+
+function mutateCellOutputData(cell: any, mutate: (bytes: Uint8Array) => void): any {
+  const bytes = new Uint8Array(ccc.bytesFrom(cell.outputData));
+  mutate(bytes);
+  return {
+    ...cell,
+    outputData: ccc.hexFrom(bytes),
+  };
+}
+
+function mergeResultCell(input: {
+  pollTypeHash: string;
+  shardIds: number[];
+  byte: number;
+  mergeLevel?: number;
+  voteCounts?: bigint[];
+  totalVoters?: bigint;
+  capacity?: bigint;
+  lockScript?: any;
+  typeScript?: any;
+  version?: number;
+}): any {
+  const mergeScript = buildTallyMergeResultTypeScript(input.pollTypeHash);
+  const lockScript = input.lockScript ?? mergeScript;
+  const typeScript = input.typeScript ?? mergeScript;
+  const coverage = new Uint8Array(32);
+  for (const shardId of input.shardIds) {
+    coverage[Math.floor(shardId / 8)] |= 1 << (shardId % 8);
+  }
+  const data = encodeTallyMergeResultData({
+    poll_type_hash: ccc.bytesFrom(input.pollTypeHash),
+    coverage,
+    vote_counts: input.voteCounts ?? [BigInt(input.shardIds.length), 0n],
+    total_voters: input.totalVoters ?? BigInt(input.shardIds.length),
+    merge_level: input.mergeLevel ?? 1,
+    version: input.version ?? 1,
+  });
+
+  return liveCell(
+    input.byte,
+    lockScript,
+    typeScript,
+    input.capacity ?? TALLY_MERGE_RESULT_MIN_SHANNONS,
+    ccc.hexFrom(data)
+  );
+}
+
 describe("timing-sensitive CCC builders", () => {
   let completionIndex = 0;
 
@@ -302,6 +400,25 @@ describe("timing-sensitive CCC builders", () => {
     })).rejects.toThrow("Weighted polls are unsupported");
   });
 
+  test("poll builder accepts 16 lanes and rejects 17", async () => {
+    const built = fixture();
+    const tx = await buildCreatePollTx(built.signer, {
+      question: "Current-code active cap",
+      options: ["Yes", "No"],
+      deadlineEpoch: DEADLINE + 21n,
+      shardCount: MAX_ACTIVE_TALLY_SHARDS,
+    });
+    const poll = decodePollData(ccc.bytesFrom(tx.outputsData[0]));
+    expect(poll.shard_count).toBe(MAX_ACTIVE_TALLY_SHARDS);
+
+    await expect(buildCreatePollTx(built.signer, {
+      question: "Over active cap",
+      options: ["Yes", "No"],
+      deadlineEpoch: DEADLINE + 21n,
+      shardCount: MAX_ACTIVE_TALLY_SHARDS + 1,
+    })).rejects.toThrow(`between 1 and ${MAX_ACTIVE_TALLY_SHARDS}`);
+  });
+
   test("poll builder serializes the canonical zero UDT hash", async () => {
     const built = fixture();
     const tx = await buildCreatePollTx(built.signer, {
@@ -339,7 +456,7 @@ describe("timing-sensitive CCC builders", () => {
       pollCell: built.pollCell,
       shardCell: built.shardCell(false),
     });
-    expect(BigInt(finalizeTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 1n));
+    expect(BigInt(finalizeTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 2n));
 
     const closeTx = await buildClosePollTx(built.signer, {
       pollCell: built.pollCell,
@@ -381,7 +498,7 @@ describe("timing-sensitive CCC builders", () => {
       shardCell: finalized.shardCell(false),
     });
     expect(outPointKey(finalizeTx.inputs[0])).toBe(`${txHash(0x32)}:0`);
-    expect(BigInt(finalizeTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 1n));
+    expect(BigInt(finalizeTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 2n));
 
     const creator = fixture();
     const closeTx = await buildClosePollTx(creator.signer, {
@@ -394,7 +511,7 @@ describe("timing-sensitive CCC builders", () => {
       `${txHash(0x34)}:0`,
       `${txHash(0x33)}:0`,
     ]);
-    expect(BigInt(closeTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 1n));
+    expect(BigInt(closeTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 2n));
 
     const force = fixture();
     const forceTx = await buildForceCloseTx(force.signer, {
@@ -406,53 +523,169 @@ describe("timing-sensitive CCC builders", () => {
       `${txHash(0x31)}:0`,
       `${txHash(0x33)}:0`,
     ]);
-    expect(BigInt(forceTx.inputs[0].since)).toBe(absoluteEpochSince(DEADLINE + 11n));
+    expect(BigInt(forceTx.inputs[0].since)).toBe(
+      absoluteEpochSince(DEADLINE + FORCE_CLOSE_GRACE_EPOCHS + 1n)
+    );
   });
 
-  test("batch finalization sorts lanes and pins one since-bearing protocol prefix", async () => {
-    const built = fixture();
-    const poll = decodePollData(ccc.bytesFrom(built.pollCell.outputData));
-    built.pollCell.outputData = ccc.hexFrom(encodePollData({ ...poll, shard_count: 2 }));
+  test("batch finalization sorts 1, 8, and 16-lane sets and pins the protocol prefix", async () => {
+    for (const shardCount of [1, 8, 16]) {
+      const built = fixture();
+      setPollShardCount(built.pollCell, shardCount);
+      const laneCells = Array.from({ length: shardCount }, (_, index) =>
+        tallyLaneCell({
+          pollTypeHash: built.pollTypeHash,
+          shardCount,
+          shardId: index,
+          byte: 0x35 + index,
+        })
+      );
 
-    const lane = (shardId: number, byte: number) => {
-      const script = buildTallyShardTypeScript(built.pollTypeHash, shardId);
-      const data = encodeTallyShardData({
-        version: 2,
-        poll_type_hash: ccc.bytesFrom(built.pollTypeHash),
-        shard_id: shardId,
-        shard_count: 2,
-        vote_counts: [0n, 0n],
-        total_voters: 0n,
-        counted_voter_root: new Uint8Array(32),
-        finalized: false,
+      const tx = await buildFinalizeTallyShardsTx(built.signer, {
+        pollCell: built.pollCell,
+        shardCells: [...laneCells].reverse(),
       });
-      return liveCell(byte, script, script, TALLY_SHARD_MIN_SHANNONS, ccc.hexFrom(data));
-    };
 
-    const tx = await buildFinalizeTallyShardsTx(built.signer, {
-      pollCell: built.pollCell,
-      shardCells: [lane(1, 0x36), lane(0, 0x35)],
-    });
-
-    expect(tx.inputs.slice(0, 2).map(outPointKey)).toEqual([
-      `${txHash(0x35)}:0`,
-      `${txHash(0x36)}:0`,
-    ]);
-    expect(tx.inputs.slice(0, 2).map((input: any) => BigInt(input.since))).toEqual([
-      absoluteEpochSince(DEADLINE + 1n),
-      absoluteEpochSince(DEADLINE + 1n),
-    ]);
-    expect(tx.outputsData.slice(0, 2).map((data: string) =>
-      decodeTallyShardData(ccc.bytesFrom(data)).finalized
-    )).toEqual([true, true]);
+      expect(tx.inputs.slice(0, shardCount).map(outPointKey)).toEqual(
+        laneCells.map((cell) => `${cell.outPoint.txHash}:0`)
+      );
+      expect(tx.inputs.slice(0, shardCount).map((input: any) => BigInt(input.since))).toEqual(
+        Array.from({ length: shardCount }, () => absoluteEpochSince(DEADLINE + 2n))
+      );
+      expect(tx.outputsData.slice(0, shardCount).map((data: string) =>
+        decodeTallyShardData(ccc.bytesFrom(data)).finalized
+      )).toEqual(Array.from({ length: shardCount }, () => true));
+    }
   });
 
-  test("batch finalization rejects more than eight lane cells", async () => {
+  test("batch finalization rejects malformed lane sets before signing", async () => {
     const built = fixture();
+    setPollShardCount(built.pollCell, 16);
+
     await expect(buildFinalizeTallyShardsTx(built.signer, {
       pollCell: built.pollCell,
       shardCells: Array.from({ length: 9 }, () => ({})),
-    })).rejects.toThrow("at most 8 lanes");
+    })).rejects.toThrow("complete indexed active lane set");
+
+    const completeLaneCells = Array.from({ length: 16 }, (_, index) =>
+      tallyLaneCell({
+        pollTypeHash: built.pollTypeHash,
+        shardCount: 16,
+        shardId: index,
+        byte: 0x40 + index,
+      })
+    );
+
+    await expect(buildFinalizeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: [...completeLaneCells.slice(0, 15), completeLaneCells[14]],
+    })).rejects.toThrow("exact ordered lane ids");
+
+    await expect(buildFinalizeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: completeLaneCells.filter((_, index) => index !== 7),
+    })).rejects.toThrow("complete indexed active lane set");
+
+    const outOfRangeBuilt = fixture();
+    setPollShardCount(outOfRangeBuilt.pollCell, 2);
+    const outOfRangeLane = mutateCellOutputData(
+      tallyLaneCell({
+        pollTypeHash: outOfRangeBuilt.pollTypeHash,
+        shardCount: 2,
+        shardId: 1,
+        byte: 0x71,
+      }),
+      (bytes) => {
+        bytes[33] = 2;
+      }
+    );
+    await expect(buildFinalizeTallyShardsTx(outOfRangeBuilt.signer, {
+      pollCell: outOfRangeBuilt.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: outOfRangeBuilt.pollTypeHash,
+          shardCount: 2,
+          shardId: 0,
+          byte: 0x70,
+        }),
+        outOfRangeLane,
+      ],
+    })).rejects.toThrow("shard_id must be inside shard_count");
+
+    const wrongPollBuilt = fixture();
+    setPollShardCount(wrongPollBuilt.pollCell, 1);
+    await expect(buildFinalizeTallyShardsTx(wrongPollBuilt.signer, {
+      pollCell: wrongPollBuilt.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: wrongPollBuilt.pollTypeHash,
+          dataPollTypeHash: txHash(0xaa),
+          shardCount: 1,
+          shardId: 0,
+          byte: 0x71,
+        }),
+      ],
+    })).rejects.toThrow("does not belong to the selected poll");
+
+    const wrongCountBuilt = fixture();
+    setPollShardCount(wrongCountBuilt.pollCell, 1);
+    await expect(buildFinalizeTallyShardsTx(wrongCountBuilt.signer, {
+      pollCell: wrongCountBuilt.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: wrongCountBuilt.pollTypeHash,
+          shardCount: 1,
+          dataShardCount: 2,
+          shardId: 0,
+          byte: 0x72,
+        }),
+      ],
+    })).rejects.toThrow("count does not match poll configuration");
+
+    const alreadyFinalizedBuilt = fixture();
+    setPollShardCount(alreadyFinalizedBuilt.pollCell, 1);
+    await expect(buildFinalizeTallyShardsTx(alreadyFinalizedBuilt.signer, {
+      pollCell: alreadyFinalizedBuilt.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: alreadyFinalizedBuilt.pollTypeHash,
+          shardCount: 1,
+          shardId: 0,
+          byte: 0x73,
+          finalized: true,
+        }),
+      ],
+    })).rejects.toThrow("already finalized");
+
+    const wrongLockBuilt = fixture();
+    setPollShardCount(wrongLockBuilt.pollCell, 1);
+    await expect(buildFinalizeTallyShardsTx(wrongLockBuilt.signer, {
+      pollCell: wrongLockBuilt.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: wrongLockBuilt.pollTypeHash,
+          shardCount: 1,
+          shardId: 0,
+          byte: 0x74,
+          lockScript: buildTallyShardTypeScript(wrongLockBuilt.pollTypeHash, 1),
+        }),
+      ],
+    })).rejects.toThrow("lock does not match governance policy");
+
+    const wrongTypeBuilt = fixture();
+    setPollShardCount(wrongTypeBuilt.pollCell, 1);
+    await expect(buildFinalizeTallyShardsTx(wrongTypeBuilt.signer, {
+      pollCell: wrongTypeBuilt.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: wrongTypeBuilt.pollTypeHash,
+          shardCount: 1,
+          shardId: 0,
+          byte: 0x75,
+          typeScript: buildTallyShardTypeScript(wrongTypeBuilt.pollTypeHash, 1),
+        }),
+      ],
+    })).rejects.toThrow("type does not match governance policy");
   });
 
   test("batch finalization rejects fee completion that tampers with a later lane since", async () => {
@@ -489,6 +722,66 @@ describe("timing-sensitive CCC builders", () => {
       pollCell: built.pollCell,
       shardCells: lanes,
     })).rejects.toThrow("protocol input since changed");
+  });
+
+  test("merge builder rejects singleton frontier inputs and preserves multi-input success", async () => {
+    const built = fixture();
+    setPollShardCount(built.pollCell, 9);
+
+    await expect(buildMergeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: built.pollTypeHash,
+          shardCount: 9,
+          shardId: 0,
+          byte: 0x80,
+          finalized: true,
+        }),
+      ],
+    })).rejects.toThrow("Merge requires at least two disjoint tally frontier inputs");
+
+    await expect(buildMergeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      mergeResultCells: [
+        mergeResultCell({
+          pollTypeHash: built.pollTypeHash,
+          shardIds: [0, 1],
+          byte: 0x81,
+        }),
+      ],
+    })).rejects.toThrow("Merge requires at least two disjoint tally frontier inputs");
+
+    const tx = await buildMergeTallyShardsTx(built.signer, {
+      pollCell: built.pollCell,
+      shardCells: [
+        tallyLaneCell({
+          pollTypeHash: built.pollTypeHash,
+          shardCount: 9,
+          shardId: 8,
+          byte: 0x82,
+          finalized: true,
+          voteCounts: [4n, 0n],
+          totalVoters: 4n,
+        }),
+      ],
+      mergeResultCells: [
+        mergeResultCell({
+          pollTypeHash: built.pollTypeHash,
+          shardIds: [0, 1, 2, 3, 4, 5, 6, 7],
+          byte: 0x83,
+          voteCounts: [8n, 1n],
+          totalVoters: 9n,
+        }),
+      ],
+    });
+
+    expect(tx.inputs.slice(0, 2).map(outPointKey)).toEqual([
+      `${txHash(0x82)}:0`,
+      `${txHash(0x83)}:0`,
+    ]);
+    const merged = decodeTallyMergeResultData(ccc.bytesFrom(tx.outputsData[0]));
+    expect(merged.merge_level).toBe(2);
   });
 
   test("large close builders reject stale shard arguments before merge-result close", async () => {

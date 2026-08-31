@@ -12,7 +12,6 @@ import {
   buildAggregateTallyShardTx,
   buildClosePollTx,
   buildForceCloseTx,
-  buildFinalizeTallyShardTx,
   buildFinalizeTallyShardsTx,
   buildMergeTallyShardsTx,
   buildCreatePollTx,
@@ -29,7 +28,6 @@ import {
   hashScript,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_INTENTS_PER_AGG,
-  MAX_SHARDS_PER_FINALIZE,
   MAX_SHARDS_PER_MERGE,
   OP,
   signAndSendTx,
@@ -57,6 +55,7 @@ import {
 import {
   countAggregationBatches,
   computeCanonicalTallyFrontier,
+  derivePollResultAssurance,
   deriveVoteAuthorityOptions,
   selectCloseTimeIntentRefunds,
   summarizeFinalizationReadiness,
@@ -123,7 +122,6 @@ function coverageAddsMissing(selected: Uint8Array, candidate: Uint8Array, shardC
 function buildCloseIntentRefundSelection(input: {
   cells: any[];
   pollId: string;
-  trackedPendingLowerBound: bigint;
 }) {
   const candidates = input.cells.map((cell) => {
     const decoded = decodeVoteIntentData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
@@ -137,7 +135,6 @@ function buildCloseIntentRefundSelection(input: {
 
   return selectCloseTimeIntentRefunds(candidates, {
     pollTypeHash: input.pollId,
-    trackedPendingLowerBound: input.trackedPendingLowerBound,
   });
 }
 
@@ -163,7 +160,6 @@ export function usePolls(
     txHash: null,
     error: null,
     scope: null,
-    batch: null,
   });
   const [actionInFlight, setActionInFlight] = useState(false);
   const trackedTxHashRef = useRef<string | null>(null);
@@ -171,9 +167,9 @@ export function usePolls(
   //
   // Scoping the *rendered* transaction status per surface removed the
   // accidental global lock that a single shared busy flag used to provide, so
-  // this restores it explicitly. Held for the whole of a multi-transaction run
-  // (batch lane finalization) so no other action can spend the wallet change
-  // cell or overwrite `trackedTxHashRef` mid-sequence.
+  // this restores it explicitly. Held for the whole of any staged governance
+  // maintenance flow so no other action can spend the wallet change cell or
+  // overwrite `trackedTxHashRef` mid-sequence.
   const [exclusionGuard] = useState(createTransactionExclusionGuard);
   const [fetchGate] = useState(() =>
     createContextAwareRequestGate<PollFetchContext>(
@@ -253,8 +249,7 @@ export function usePolls(
             isClosed: pollData.is_closed,
             totalVoters: pollData.total_voters,
             creatorDeposit: pollData.creator_deposit,
-            pendingIntentCount: pollData.pending_intent_count,
-            protocolPendingIntentCount: pollData.pending_intent_count,
+            pendingIntentCount: 0n,
             tokenWeighted: pollData.token_weighted,
             udtTypeHash: bytesToHex(pollData.udt_type_hash),
             shardCount: pollData.shard_count,
@@ -271,6 +266,7 @@ export function usePolls(
                 ? Array.from({ length: pollData.shard_count }, (_, shardId) => shardId)
                 : [],
             },
+            resultAssurance: null,
             totalVotes,
             authorityOptions: [],
             aggregationBatchCount: 0,
@@ -381,6 +377,10 @@ export function usePolls(
           selectedShardIds: tallyFrontier.selectedShardIds,
           uncoveredShardIds: tallyFrontier.uncoveredShardIds,
         };
+        poll.resultAssurance = derivePollResultAssurance(
+          poll,
+          nextPollCells[poll.id]?.cellOutput?.type ?? nextPollCells[poll.id]?.output?.type
+        );
 
         const intentScript = buildGovernanceTypeScript(OP.CREATE_VOTE_INTENT, poll.id);
         const nextIntentCellsForPoll: any[] = [];
@@ -499,8 +499,8 @@ export function usePolls(
           delegations: nextDelegations,
           viewerLockHash: currentLockHashHex,
         });
-        // UI action gates should follow indexer-observed pending intents until
-        // poll.pending_intent_count is promoted to strict on-chain accounting.
+        // UI action gates should follow indexer-observed timely pending intents.
+        // This count is advisory discovery data, never strict on-chain accounting.
         poll.pendingIntentCount = BigInt(timelyPendingIntents.length);
         poll.outstandingIntentCount = timelyPendingIntents.length;
         poll.lateIntentCount = latePendingIntents.length;
@@ -638,7 +638,7 @@ export function usePolls(
       const validationError = validateCreatePollInput(params);
       if (validationError) throw new Error(validationError);
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "createPoll" }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "createPoll" } });
       try {
         // Duration is a builder/UI policy. The transaction commits the exact
         // absolute epoch chosen from this observed tip; the VM cannot prove an
@@ -689,7 +689,7 @@ export function usePolls(
       const pollCell = pollCells[poll.id];
       if (!pollCell) throw new Error("Poll cell is not currently indexed");
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const tx = await buildCreateVoteIntentTx(signer, {
           pollTypeHash: poll.id,
@@ -725,12 +725,11 @@ export function usePolls(
         return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
       });
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const closeIntentSelection = buildCloseIntentRefundSelection({
           cells: intentCells[poll.id] ?? [],
           pollId: poll.id,
-          trackedPendingLowerBound: poll.protocolPendingIntentCount,
         });
         const tx = await buildClosePollTx(signer, {
           pollCell,
@@ -766,12 +765,11 @@ export function usePolls(
         return tallyMergeCoverageComplete(result.coverage, poll.shardCount);
       });
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const closeIntentSelection = buildCloseIntentRefundSelection({
           cells: intentCells[poll.id] ?? [],
           pollId: poll.id,
-          trackedPendingLowerBound: poll.protocolPendingIntentCount,
         });
         const tx = await buildForceCloseTx(signer, {
           pollCell,
@@ -826,7 +824,7 @@ export function usePolls(
       const intentCell = refundableIntentCandidates[0]?.cell;
       if (!intentCell) throw new Error("No live omitted intent cell is indexed for refund");
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const tx = await buildRefundClosedIntentTx(signer, {
           pollCell,
@@ -865,7 +863,7 @@ export function usePolls(
       );
       if (!intentCell) throw new Error("Late intent cell is no longer live");
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const tx = await buildRefundLateIntentTx(signer, { pollCell, intentCell });
         setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
@@ -949,7 +947,7 @@ export function usePolls(
         }
       });
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const tx = await buildAggregateTallyShardTx(signer, {
           pollCell,
@@ -972,48 +970,7 @@ export function usePolls(
     [intentCells, intents, pollCells, signer, tallyShardCells, trackSubmittedTransaction]
   );
 
-  const finalizeShards = useCallback(
-    async (poll: Poll) => {
-      if (!signer) throw new Error("Wallet not connected");
-
-      const pollCell = pollCells[poll.id];
-      if (!pollCell) throw new Error("Poll cell is not currently indexed");
-
-      const shardCells = tallyShardCells[poll.id] ?? [];
-      if (poll.shardCount <= 0) throw new Error("Poll is not configured for tally shards");
-      if (shardCells.length !== poll.shardCount) {
-        throw new Error("Finalize requires the complete indexed shard set");
-      }
-
-      const nextShardCell = shardCells.find((cell) => {
-        const shardData = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
-        return !shardData.finalized;
-      });
-      if (!nextShardCell) throw new Error("All indexed shards are already finalized");
-
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
-      try {
-        const tx = await buildFinalizeTallyShardTx(signer, {
-          pollCell,
-          shardCell: nextShardCell,
-        });
-        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
-        const txHash = await signAndSendTx(signer, tx);
-        await trackSubmittedTransaction(txHash);
-
-        return txHash;
-      } catch (error: any) {
-        if (!(error instanceof TransactionUnconfirmedError)) {
-          setTxState((prev) => ({ ...prev, status: "error", txHash: null, error: error.message ?? String(error) }));
-        }
-        throw error;
-      }
-    },
-    [pollCells, signer, tallyShardCells, trackSubmittedTransaction]
-  );
-
-  /** Finalize ordered lane batches; each batch is one transaction/signature. */
-  const finalizeAllShards = useCallback(
+  const finalizeTallyShards = useCallback(
     async (poll: Poll) => {
       if (!signer) throw new Error("Wallet not connected");
 
@@ -1031,44 +988,37 @@ export function usePolls(
         return !shardData.finalized;
       });
       if (pendingShardCells.length === 0) throw new Error("All indexed shards are already finalized");
-
-      const scope: TxScope = { kind: "poll", pollId: poll.id };
-      const total = pendingShardCells.length;
-      const submitted: string[] = [];
-
-      for (let offset = 0; offset < pendingShardCells.length; offset += MAX_SHARDS_PER_FINALIZE) {
-        const shardBatch = pendingShardCells.slice(offset, offset + MAX_SHARDS_PER_FINALIZE);
-        const batch = { label: "Finalizing tally lanes", completed: offset, total };
-        setTxState({ status: "building", txHash: null, error: null, scope, batch });
-        try {
-          // Flow: one bounded transaction freezes up to eight lanes. A poll
-          // with more lanes proceeds through later explicitly signed batches.
-          const tx = await buildFinalizeTallyShardsTx(signer, {
-            pollCell,
-            shardCells: shardBatch,
-          });
-          setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
-          const txHash = await signAndSendTx(signer, tx);
-          submitted.push(txHash);
-          await trackSubmittedTransaction(txHash);
-        } catch (error: any) {
-          if (!(error instanceof TransactionUnconfirmedError)) {
-            setTxState((prev) => ({
-              ...prev,
-              status: "error",
-              txHash: null,
-              error: `${error.message ?? String(error)} (finalized ${offset.toString()} of ${total.toString()} lanes; rerun to continue)`,
-            }));
-          }
-          throw error;
-        }
+      if (pendingShardCells.length !== shardCells.length) {
+        throw new Error("Mixed partially finalized lane sets are unsupported; refresh indexed state or use the historical contract path");
       }
 
-      setTxState((prev) => ({
-        ...prev,
-        batch: { label: "Finalizing tally lanes", completed: total, total },
-      }));
-      return submitted[submitted.length - 1] ?? "";
+      const scope: TxScope = { kind: "poll", pollId: poll.id };
+      setTxState({
+        status: "building",
+        txHash: null,
+        error: null,
+        scope,
+      });
+      try {
+        const tx = await buildFinalizeTallyShardsTx(signer, {
+          pollCell,
+          shardCells,
+        });
+        setTxState((prev) => ({ ...prev, status: "signing", txHash: null, error: null }));
+        const txHash = await signAndSendTx(signer, tx);
+        await trackSubmittedTransaction(txHash);
+        return txHash;
+      } catch (error: any) {
+        if (!(error instanceof TransactionUnconfirmedError)) {
+          setTxState((prev) => ({
+            ...prev,
+            status: "error",
+            txHash: null,
+            error: error.message ?? String(error),
+          }));
+        }
+        throw error;
+      }
     },
     [pollCells, signer, tallyShardCells, trackSubmittedTransaction]
   );
@@ -1090,7 +1040,7 @@ export function usePolls(
         throw new Error("No finalized shard or merge result cells are indexed");
       }
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "poll", pollId: poll.id } });
       try {
         const selectedShardCells: any[] = [];
         const selectedResultCells: any[] = [];
@@ -1129,8 +1079,12 @@ export function usePolls(
           selectedShardCells.push(cell);
           coverageSetShard(selectedCoverage, shard.shard_id);
         }
-        if (selectedShardCells.length + selectedResultCells.length === 0) {
+        const selectedMergeInputCount = selectedShardCells.length + selectedResultCells.length;
+        if (selectedMergeInputCount === 0) {
           throw new Error("No disjoint shard or merge result inputs are available");
+        }
+        if (selectedMergeInputCount < 2) {
+          throw new Error("Merge requires at least two disjoint tally frontier inputs");
         }
 
         const tx = await buildMergeTallyShardsTx(signer, {
@@ -1171,7 +1125,7 @@ export function usePolls(
         throw new Error("Delegation can only be created for an open poll before its deadline");
       }
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "delegation" }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "delegation" } });
       try {
         const tx = await buildDelegateTx(signer, {
           delegateLockHash: params.delegateLockHash,
@@ -1200,7 +1154,7 @@ export function usePolls(
       const delegationCell = delegationCells[delegationId];
       if (!delegationCell) throw new Error("Delegation cell is not currently indexed");
 
-      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "delegation" }, batch: null });
+      setTxState({ status: "building", txHash: null, error: null, scope: { kind: "delegation" } });
       try {
         const tx = await buildRevokeDelegationTx(signer, {
           delegationCell,
@@ -1253,8 +1207,7 @@ export function usePolls(
       createPoll: guardExclusive(createPoll),
       castVote: guardExclusive(castVote),
       aggregatePoll: guardExclusive(aggregatePoll),
-      finalizeShards: guardExclusive(finalizeShards),
-      finalizeAllShards: guardExclusive(finalizeAllShards),
+      finalizeTallyShards: guardExclusive(finalizeTallyShards),
       mergeShards: guardExclusive(mergeShards),
       closePoll: guardExclusive(closePoll),
       createDelegation: guardExclusive(createDelegation),
@@ -1269,8 +1222,7 @@ export function usePolls(
       closePoll,
       createDelegation,
       createPoll,
-      finalizeAllShards,
-      finalizeShards,
+      finalizeTallyShards,
       forceClose,
       guardExclusive,
       mergeShards,

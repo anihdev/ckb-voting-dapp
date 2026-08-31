@@ -58,23 +58,6 @@ Thumbs.db
 *~
 .vercel/
 
-# Documentation
-*.md
-!README.md
-!CLAUDE.md
-z_contracts/
-!ckb_weekly_update.md
-!phase_b_weekly_update.md
-!June_contention_2nd_weekly_update.md
-!June_zk_1st_weekly_update.md
-!June_dao_builder_sdk_3rd_weekly_update.md
-!June_sdk2_4th_weekly_update.md
-!August_2nd_weekly_update.md
-!August_3rd_weekly_update.md
-!August_4th_weekly_update.md
-!CHANGELOG.md
-!SHARDED_AGGREGATION_EXPLAINED.md
-!OFFICIAL_DAO_BUILDER_SDK_GRANT_PROPOSAL.md
-!Governance_Ui_Clarity.md
-!Tally_lane_Sparse-merkle_ImplL.md
-# !FINALIZATION_ASSURANCE_IMPLEMENTATION_RECORD.md
+# Private maintainer documentation
+/docs/private/
+/AGENTS.md

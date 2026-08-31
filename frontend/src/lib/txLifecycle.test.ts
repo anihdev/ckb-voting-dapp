@@ -159,13 +159,13 @@ describe("transaction exclusion guard", () => {
     await expect(guard.guard(async () => "next")()).resolves.toBe("next");
   });
 
-  test("holds across a multi-transaction run until the whole sequence ends", async () => {
+  test("holds across a staged governance maintenance flow until the whole sequence ends", async () => {
     const guard = createTransactionExclusionGuard();
     const steps = [deferred<void>(), deferred<void>(), deferred<void>()];
     const heldDuringRun: boolean[] = [];
 
-    // Stands in for a bounded maintenance run: one guarded call, N signed batches.
-    const batch = guard.guard(async () => {
+    // Stands in for one guarded action that advances through several staged steps.
+    const stagedRun = guard.guard(async () => {
       for (const step of steps) {
         await step.promise;
         heldDuringRun.push(guard.isHeld());
@@ -174,11 +174,11 @@ describe("transaction exclusion guard", () => {
     });
     const other = guard.guard(async () => "other");
 
-    const run = batch();
+    const run = stagedRun();
     await Promise.resolve();
 
     for (const step of steps) {
-      // No other action may start between lane signatures.
+      // No other state-changing action may start between staged confirmations.
       await expect(other()).rejects.toThrow(ConcurrentTransactionError);
       step.resolve();
       await Promise.resolve();
@@ -190,13 +190,13 @@ describe("transaction exclusion guard", () => {
     await expect(other()).resolves.toBe("other");
   });
 
-  test("releases the guard when a mid-batch transaction throws", async () => {
+  test("releases the guard when a staged maintenance step throws", async () => {
     const guard = createTransactionExclusionGuard();
-    const partialBatch = guard.guard(async () => {
-      throw new Error("finalized 2 of 8 lanes; rerun to continue");
+    const stagedRun = guard.guard(async () => {
+      throw new Error("maintenance step failed; rerun to continue");
     });
 
-    await expect(partialBatch()).rejects.toThrow("finalized 2 of 8 lanes");
+    await expect(stagedRun()).rejects.toThrow("maintenance step failed");
     expect(guard.isHeld()).toBe(false);
   });
 });

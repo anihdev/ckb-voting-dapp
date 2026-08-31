@@ -102,8 +102,8 @@ Use the narrowest authoritative layer. CKB-VM tests ([governance_vm.rs](backend/
 
 `ckb-testtool` does not run the node's full `CapacityVerifier` or `SinceVerifier`, so VM success is not a transaction-admission claim; host occupied-capacity tests and real-node rehearsal still matter.
 
-Current baseline: 63 governance CKB-VM tests, 139 focused TypeScript/React/deploy tests.
+Current baseline: 72 governance CKB-VM tests, 167 focused TypeScript/React/deploy tests.
 
 ## Repo notes
 
-`.gitignore` excludes `*.md` except an explicit allowlist, so an unlisted Markdown file stays untracked until it is added to that allowlist. Weekly-update files are dated snapshots and never override current code. The worktree is often dirty with in-progress changes — inspect it before editing and do not revert unrelated work. Keep comments brief and explain only non-obvious protocol reasons. Prefer structured codecs and CKB/CCC APIs over ad hoc byte manipulation.
+Private maintainer Markdown belongs under the ignored `docs/private/` directory; the root `AGENTS.md` entry is ignored separately. Public Markdown elsewhere remains trackable normally. Weekly-update files are dated snapshots and never override current code. The worktree is often dirty with in-progress changes — inspect it before editing and do not revert unrelated work. Keep comments brief and explain only non-obvious protocol reasons. Prefer structured codecs and CKB/CCC APIs over ad hoc byte manipulation.

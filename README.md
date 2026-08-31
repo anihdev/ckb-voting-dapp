@@ -68,10 +68,12 @@ Independent intent creation removes the direct voter-vs-voter shared-input bottl
 2. `CREATE_VOTE_INTENT` creates an independent governance-locked intent cell. The poll creator cannot submit an intent directly, delegate their own vote, or submit on behalf of another voter.
 3. `CREATE_TALLY_SHARD` consumes timely pending intents for one shard, updates that shard, and creates aggregated intent markers.
 4. Timely intents may be aggregated after the deadline until their shard is finalized.
-5. `CREATE_TALLY_SHARD` finalization freezes between one and eight ordered
-   same-poll shards per transaction after the deadline.
+5. `CREATE_TALLY_SHARD` finalization freezes the complete ordered active lane set
+   in one transaction after the one-epoch aggregation grace. New current-code
+   polls support `1..16` active lanes, and every finalized lane input carries the
+   same validated absolute-epoch `since`.
 6. Polls with at most eight shards close directly from the complete finalized shard set.
-7. Larger polls use bounded `MERGE_TALLY_SHARDS` transactions and close from one complete merge result.
+7. Polls with 9..16 shards use bounded `MERGE_TALLY_SHARDS` transactions and close from one complete merge result; larger shard counts are historical old-code-hash territory, not active current-code maintenance.
 8. Delegation/revocation and intent refunds are independent side flows.
 
 Shard assignment is deterministic:
@@ -102,11 +104,11 @@ A transaction may be signed before the deadline and committed afterward. It is l
 
 ### Finalization and close
 
-The exact protocol input at global input index 0 must carry a valid absolute epoch `since` lower bound:
+The protocol uses validated absolute epoch `since` lower bounds on the ordered protocol input prefix:
 
-- shard finalization: strictly after `deadline`;
-- creator close: strictly after `deadline`;
-- force-close: strictly after `deadline + FORCE_CLOSE_GRACE_EPOCHS`.
+- shard finalization: every lane input in the complete ordered lane-set prefix carries the same absolute epoch `since`, strictly after `deadline + FINALIZATION_GRACE_EPOCHS`, which is currently first satisfied at integer epoch `deadline + 2`;
+- creator close: the poll cell remains global input 0 and must be strictly after `deadline + FINALIZATION_GRACE_EPOCHS`, which is currently first satisfied at integer epoch `deadline + 2`;
+- force-close: the poll cell remains global input 0 and must be strictly after `deadline + FORCE_CLOSE_GRACE_EPOCHS`, which is currently first satisfied at integer epoch `deadline + 11`.
 
 The contract parses the raw `since` flags and epoch fraction and rejects missing/zero, relative, wrong-metric, reserved-flag, malformed-fraction, too-low, and overflowed values. CKB consensus enforces maturity as a lower bound. `ckb-testtool` script verification does not run the node's complete `SinceVerifier`, so a controlled testnet rehearsal remains required for actual maturity behavior.
 
@@ -133,6 +135,8 @@ Consequences:
 - no treasury action is automatically executed from a poll result.
 
 Permissionless maintenance means any valid transaction author is authorized. It does not guarantee an operator has an economic incentive to pay fees. The current testnet demo funds operator roles. Creator-funded bounties, Fiber reimbursement, or managed operators are future work.
+
+For current producible polls, `pending_intent_count` is a reserved-zero compatibility field rather than a live pending-intent counter or completeness signal. Visible pending, late, unresolved, and refundable intent counts come from advisory RPC/indexer discovery and fresh poll-scoped scans; they inform signer warnings and refund selection but do not become consensus gates.
 
 ### Counted-voter commitment
 
@@ -165,7 +169,7 @@ creator_lock
 is_closed
 total_voters
 creator_deposit
-pending_intent_count
+pending_intent_count      # reserved zero for current producible polls
 counted_voter_lock_hashes # retained legacy poll field; empty for sharded polls
 token_weighted
 udt_type_hash
@@ -235,9 +239,11 @@ Implemented:
 - post-deadline aggregation of timely intents;
 - fixed-size counted-voter sparse-Merkle commitments and versioned aggregation
   proofs;
-- bounded one-to-eight-lane finalization with contract-validated absolute epoch
-  `since` on every lane input;
-- bounded merge and direct/merged close;
+- bounded one-transaction full-set finalization for current-code polls with
+  `1..16` active lanes, with contract-validated absolute epoch `since` on every
+  lane input;
+- bounded direct close for `<=8` lanes and bounded merged close for `9..16`
+  lanes;
 - creator close and permissionless force-close;
 - exact capacity returns for shard, merge, and intent refund surfaces;
 - immediate late-intent and post-close omitted-intent refunds;
@@ -246,7 +252,7 @@ Implemented:
 - committed-state transaction tracking: broadcast actions remain confirming until CKB commitment, while timeouts remain explicitly unconfirmed;
 - CKB-VM tests for lifecycle, timing, malformed data, authorization, capacity, and bypass attempts.
 - integrated CKB-VM cycle coverage for 1, 10, 25, and 50-intent SMT
-  aggregation, a 1,024-existing-voter lane, and eight-lane finalization;
+  aggregation, a 1,024-existing-voter lane, and sixteen-lane full-set finalization;
 - reproducible local and CI validation with separate contract-build and host-test Rust toolchains.
 
 Incomplete or operationally limited:
@@ -264,7 +270,6 @@ Incomplete or operationally limited:
 ckb-voting-dapp/
 ├── README.md
 ├── SHARDED_AGGREGATION_EXPLAINED.md
-├── Governance_Ui_Clarity.md
 ├── OFFICIAL_DAO_BUILDER_SDK_GRANT_PROPOSAL.md
 ├── LICENSE
 ├── Makefile
@@ -401,14 +406,30 @@ They deliberately stop before post-deadline finalization and close.
 
 ## Deployment Status
 
+The approved hardened release was deployed as a new CKB testnet code cell on
+August 30, 2026. This establishes contract/frontend configuration alignment; it
+does not replace the still-pending connected-wallet, multi-actor real-node
+lifecycle rehearsal.
 
-- contract transaction: [`0x5a3ecd82...06ae9d5`](https://pudge.explorer.nervos.org/transaction/0x5a3ecd82853538347a3a6b48ef110f368062979f6cb88bbb9d4bcbb7306ae9d5);
+- contract transaction: [`0xc82294a1...e5fbd97e`](https://pudge.explorer.nervos.org/transaction/0xc82294a1503e51a0d668ab94554eaa60f972a0dd0f2cb14ddf573510e5fbd97e);
 - code-cell output index: `0`;
-- committed block: `21,983,614`;
-- deployed `data1` code hash: `0xb2c2ea67113fba954966700558ceb6121abb3935076c5165986d1586bcfbd954`;
-- release ELF: `125,376` bytes, SHA-256 `6c1c3437e158ec075af12840d89cc2d84a9ff88a1aa86e8fd242047636f5a039`;
+- committed block: `22,252,969`;
+- deployed `data1` code hash: `0x2300964979e336dc8196c61a177846e7249091ba7db5a9bfd7db834048f7f6ef`;
+- release ELF: `126,680` bytes, SHA-256 `e7ca4e140ccbe15381050316ff7affb64a889876a5d96b6b47e1568e13948aba`;
 - production frontend: [ckb-voting-dapp.vercel.app](https://ckb-voting-dapp.vercel.app);
-- Vercel deployment: `dpl_7MPbGfSZcyDPhmfomvJa8JVyvB9W`.
+- Vercel deployment: `dpl_FYbPSSF1iZA7PAdAXdd5ge6EsLVq`;
+- deployment URL: [ckb-voting-dapp-5mjwokk2y-anihdevs-projects.vercel.app](https://ckb-voting-dapp-5mjwokk2y-anihdevs-projects.vercel.app).
+
+The deployment script waited for three confirmations and reported the local
+and deployed code hashes as equal. Vercel reported the production deployment
+`READY` and promoted the public alias. A local production build using the same
+public environment values contains the new identifiers and excludes the August
+identifiers. The complete connected-wallet and real-node admission evidence is
+still outstanding.
+
+The August 5 code cell (`0x5a3ecd82...06ae9d5`, code hash
+`0xb2c2ea67...bcfbd954`) remains a historical testnet dependency and was not
+recycled.
 
 ## Indexing And UI
 
@@ -420,11 +441,11 @@ The frontend discovers cells with scoped type-script queries:
 - merge results by exact `MERGE_TALLY_SHARDS || poll_type_hash`;
 - delegations by the `DELEGATE` prefix.
 
-The UI distinguishes aggregated tally state, timely pending intents, late refundable intents, active revocation-based delegations, finalized shard coverage, merge progress, close readiness, and refund actions. During an open poll it highlights the connected represented voter's indexed choice but hides per-option counts, bars, and percentages until close. This is presentation-only, not ballot privacy: intent and tally cells remain publicly inspectable on CKB.
+The UI distinguishes aggregated tally state, timely pending intents, late refundable intents, active revocation-based delegations, finalized shard coverage, merge progress, close readiness, and refund actions. During an open poll it highlights the connected represented voter's indexed choice but hides per-option counts, bars, and percentages until close. Its result-assurance surface keeps claims separate: displayed tallies are on-chain-verified over the indexed frontier, lane coverage may be partial or complete, and intent inclusion remains unproven even when lane coverage is complete. This is presentation-only, not ballot privacy: intent and tally cells remain publicly inspectable on CKB.
 
 Aggregation copy follows indexed lane assignment. One transaction updates one deterministic tally lane and processes at most 50 timely intents, so underfilled intents from different lanes cannot be combined merely because their total is below 50. The first operation reads `Aggregate` even when several lane-bound transactions are estimated. After tally state has advanced, remaining work reads `Aggregate Next Batch`; Rust contract validation remains authoritative.
 
-Before opening a finalization confirmation, the reference UI performs a fresh exact-scope indexer scan of the poll's live intent cells. The popup gives one concise readiness result: a timely pending count, an inconclusive warning, or confirmation that no indexed timely work remains. A cautionary or unavailable result changes the action to `Finalize Anyway` but does not become a protocol gate. This preflight reduces accidental omission.
+Before opening a finalization confirmation, the reference UI performs a fresh exact-scope indexer scan of the poll's live intent cells. The popup gives one concise readiness result: a timely pending count, an inconclusive warning, or confirmation that no indexed timely work remains. A cautionary or unavailable result changes the action to `Finalize Anyway` but does not become a protocol gate. This preflight reduces accidental omission, but it remains advisory indexer discovery rather than proof of complete vote inclusion.
 
 ## Testing
 
@@ -437,8 +458,8 @@ The test suite executes the release RISC-V binary and covers, among other cases:
   lane with 1,024 existing represented-voter keys;
 - rejection of malformed proofs, wrong roots, duplicate/already-counted keys,
   and tally/marker mutations;
-- valid one-lane and eight-lane batch finalization plus ordering, scope, count,
-  output-shape, root, and per-input `since` failures;
+- valid one-lane and sixteen-lane full-set finalization plus ordering, scope,
+  count, output-shape, root, and per-input `since` failures;
 - late intent rejection from aggregation and exact full-capacity refund;
 - missing and wrong creation header deps;
 - malformed, relative, wrong-metric, too-low, and overflowed `since`;
@@ -461,4 +482,3 @@ The contract, frontend, deployment tooling, and proposed SDK work are available 
 - [Nervos sparse-merkle-tree](https://github.com/nervosnetwork/sparse-merkle-tree)
 - [Pinned sparse-merkle-tree revision](https://github.com/nervosnetwork/sparse-merkle-tree/tree/725cd69d95e3e34cd302e83d86178e959fc53687)
 - [Sharded aggregation explainer](SHARDED_AGGREGATION_EXPLAINED.md)
-- [Governance UI clarity pass](Governance_Ui_Clarity.md)

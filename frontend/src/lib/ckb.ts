@@ -10,6 +10,7 @@ import { ccc } from "@ckb-ccc/core";
 import {
   CREATOR_DEPOSIT_SHANNONS,
   DELEGATION_MIN_SHANNONS,
+  MAX_ACTIVE_TALLY_SHARDS,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_INTENTS_PER_AGG,
@@ -30,6 +31,7 @@ import {
   TALLY_MERGE_RESULT_MIN_SHANNONS,
   VOTER_DEPOSIT_SHANNONS,
   ZERO_HASH_HEX,
+  FINALIZATION_GRACE_EPOCHS,
   FORCE_CLOSE_GRACE_EPOCHS,
 } from "./constants";
 import {
@@ -53,6 +55,7 @@ import { buildTallySmtTransition } from "./tallySmt";
 const SCRIPT_HASH_TYPE = "data1";
 const ZERO_HASH_32 = `0x${"00".repeat(32)}`;
 
+export const GOVERNANCE_SCRIPT_HASH_TYPE = SCRIPT_HASH_TYPE;
 export const GOVERNANCE_CODE_HASH =
   (import.meta as any).env?.VITE_GOVERNANCE_CODE_HASH ??
   ZERO_HASH_32;
@@ -72,6 +75,7 @@ export {
   VOTER_DEPOSIT_SHANNONS,
   DELEGATION_MIN_SHANNONS,
   TALLY_SHARD_MIN_SHANNONS,
+  MAX_ACTIVE_TALLY_SHARDS,
   MAX_DIRECT_CLOSE_SHARDS,
   MAX_CLOSE_INTENT_REFUNDS,
   MAX_INTENTS_PER_AGG,
@@ -86,6 +90,7 @@ export {
   MIN_DURATION_EPOCHS,
   MAX_DURATION_EPOCHS,
   ZERO_HASH_HEX,
+  FINALIZATION_GRACE_EPOCHS,
   FORCE_CLOSE_GRACE_EPOCHS,
   MAX_DEADLINE_EPOCH,
 };
@@ -429,8 +434,8 @@ export async function buildCreatePollTx(
   const creatorLockHash = await getSignerLockHash(signer);
   const signerAddress = await getSignerAddressObj(signer);
   const shardCount = input.shardCount ?? 8;
-  if (!Number.isInteger(shardCount) || shardCount <= 0 || shardCount > MAX_TALLY_SHARDS) {
-    throw new Error(`shardCount must be between 1 and ${MAX_TALLY_SHARDS}`);
+  if (!Number.isInteger(shardCount) || shardCount <= 0 || shardCount > MAX_ACTIVE_TALLY_SHARDS) {
+    throw new Error(`shardCount must be between 1 and ${MAX_ACTIVE_TALLY_SHARDS} for newly created polls`);
   }
   if (input.deadlineEpoch <= currentEpoch) {
     throw new Error("deadlineEpoch must be after the currently observed tip epoch");
@@ -1163,7 +1168,12 @@ export async function buildMergeTallyShardsTx(
   if (pollData.shard_count <= MAX_DIRECT_CLOSE_SHARDS) {
     throw new Error("Merge result path is only required for large shard-count polls");
   }
-  if (mergeInputCount === 0) throw new Error("No shard or merge result inputs selected");
+  if (pollData.shard_count > MAX_ACTIVE_TALLY_SHARDS) {
+    throw new Error(`Current-code merge supports at most ${MAX_ACTIVE_TALLY_SHARDS} active lanes; older larger polls require their historical contract`);
+  }
+  if (mergeInputCount < 2) {
+    throw new Error("Merge requires at least two disjoint tally frontier inputs");
+  }
   if (mergeInputCount > MAX_SHARDS_PER_MERGE) {
     throw new Error(`Merge transaction can consume at most ${MAX_SHARDS_PER_MERGE} tally inputs`);
   }
@@ -1272,13 +1282,18 @@ export async function buildMergeTallyShardsTx(
 }
 
 /**
- * @notice Builds a shard finalization transaction after poll deadline.
- * @dev Finalization freezes one shard before small direct close or merge/result close.
+ * @notice Builds a shard finalization transaction after the aggregation grace.
+ * @dev The single-lane wrapper remains only for genuine one-lane polls; active
+ * multi-lane polls must use the exact complete-set builder.
  */
 export async function buildFinalizeTallyShardTx(
   signer: any,
   input: { pollCell: any; shardCell: any }
 ): Promise<any> {
+  const pollData = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
+  if (pollData.shard_count !== 1) {
+    throw new Error("Single-lane finalization is only valid for a one-lane poll; use the complete lane-set action instead");
+  }
   return buildFinalizeTallyShardsTx(signer, {
     pollCell: input.pollCell,
     shardCells: [input.shardCell],
@@ -1286,9 +1301,10 @@ export async function buildFinalizeTallyShardTx(
 }
 
 /**
- * @notice Finalizes one bounded batch of tally lanes in one transaction.
- * @dev Lanes occupy the ordered input/output prefix and every protocol input
- * carries the same absolute-epoch lower bound. The wallet signs this tx once.
+ * @notice Finalizes the exact ordered active lane set in one transaction.
+ * @dev All protocol lanes occupy the ordered input/output prefix and carry the
+ * same absolute-epoch lower bound. CCC may append only wallet fee inputs after
+ * the pinned prefix; the wallet signs this tx once.
  */
 export async function buildFinalizeTallyShardsTx(
   signer: any,
@@ -1300,8 +1316,16 @@ export async function buildFinalizeTallyShardsTx(
   const pollTypeHash = hashScript(pollOutput.type);
 
   if (pollData.is_closed) throw new Error("Poll is already closed");
-  if (currentEpoch <= pollData.deadline) throw new Error("Tally lanes cannot be finalized before poll deadline");
-  if (input.shardCells.length === 0) throw new Error("No unfinalized tally lanes selected");
+  if (pollData.shard_count <= 0 || pollData.shard_count > MAX_ACTIVE_TALLY_SHARDS) {
+    throw new Error(`Finalization supports current-code polls with 1-${MAX_ACTIVE_TALLY_SHARDS} active lanes`);
+  }
+  const earliestFinalizeEpoch = pollData.deadline + FINALIZATION_GRACE_EPOCHS + 1n;
+  if (currentEpoch < earliestFinalizeEpoch) {
+    throw new Error(`Tally lanes cannot be finalized before epoch ${earliestFinalizeEpoch.toString()}`);
+  }
+  if (input.shardCells.length !== pollData.shard_count) {
+    throw new Error("Finalization requires the complete indexed active lane set in one transaction");
+  }
   if (input.shardCells.length > MAX_SHARDS_PER_FINALIZE) {
     throw new Error(`Finalization can consume at most ${MAX_SHARDS_PER_FINALIZE} lanes per transaction`);
   }
@@ -1311,17 +1335,18 @@ export async function buildFinalizeTallyShardsTx(
     const rightData = decodeTallyShardData((ccc as any).bytesFrom(right.outputData ?? "0x"));
     return leftData.shard_id - rightData.shard_id;
   });
-  const seenShardIds = new Set<number>();
-  const lanes = ordered.map((cell) => {
+
+  const lanes = ordered.map((cell, expectedShardId) => {
     const shardData = decodeTallyShardData((ccc as any).bytesFrom(cell.outputData ?? "0x"));
     const shardScript = buildTallyShardTypeScript(pollTypeHash, shardData.shard_id);
-    if (seenShardIds.has(shardData.shard_id)) throw new Error("Duplicate tally lane selected");
-    seenShardIds.add(shardData.shard_id);
     if (bytesToHex(shardData.poll_type_hash).toLowerCase() !== pollTypeHash.toLowerCase()) {
       throw new Error("Tally lane does not belong to the selected poll");
     }
     if (shardData.shard_count !== pollData.shard_count) {
       throw new Error("Tally lane count does not match poll configuration");
+    }
+    if (shardData.shard_id !== expectedShardId) {
+      throw new Error("Finalization requires the exact ordered lane ids 0..shard_count-1");
     }
     if (shardData.finalized) throw new Error("Tally lane is already finalized");
     if (scriptKey(getCellLock(cell)) !== scriptKey(shardScript)) {
@@ -1332,7 +1357,7 @@ export async function buildFinalizeTallyShardsTx(
     }
     return { cell, shardData };
   });
-  const requiredSince = absoluteEpochSince(pollData.deadline + 1n);
+  const requiredSince = absoluteEpochSince(pollData.deadline + FINALIZATION_GRACE_EPOCHS + 1n);
   const tx = (ccc as any).Transaction.from({
     cellDeps: [
       buildGovernanceCellDep(),
@@ -1341,8 +1366,8 @@ export async function buildFinalizeTallyShardsTx(
         depType: "code",
       },
     ],
-    // Flow: all protocol lanes remain one ordered prefix; CCC may only append
-    // wallet fee inputs/change after these pinned cells.
+    // Flow: the full protocol lane set remains one ordered prefix; CCC may only
+    // append wallet fee inputs/change after these pinned cells.
     inputs: lanes.map(({ cell }) => ({ previousOutput: getOutPoint(cell) })),
     outputs: lanes.map(({ cell }) => ({
       lock: getCellLock(cell),
@@ -1383,12 +1408,16 @@ export async function buildClosePollTx(
   const pollOutput = getCellOutput(input.pollCell);
   const previousPoll = decodePollData((ccc as any).bytesFrom(input.pollCell.outputData ?? "0x"));
   const pollTypeHash = hashScript(pollOutput.type);
-  if (currentEpoch <= previousPoll.deadline) {
-    throw new Error("Poll cannot be closed before deadline");
+  const earliestCreatorCloseEpoch = previousPoll.deadline + FINALIZATION_GRACE_EPOCHS + 1n;
+  if (currentEpoch < earliestCreatorCloseEpoch) {
+    throw new Error(`Poll cannot be creator-closed before epoch ${earliestCreatorCloseEpoch.toString()}`);
   }
   const shardCells = input.shardCells ?? [];
   if (previousPoll.shard_count <= 0) {
     throw new Error("Non-sharded poll-cell aggregation is retired in this deployment");
+  }
+  if (previousPoll.shard_count > MAX_ACTIVE_TALLY_SHARDS) {
+    throw new Error(`Current-code creator close supports at most ${MAX_ACTIVE_TALLY_SHARDS} active lanes; older larger polls require their historical contract`);
   }
   const largeSharded = previousPoll.shard_count > MAX_DIRECT_CLOSE_SHARDS;
   if (largeSharded && shardCells.length > 0) {
@@ -1460,11 +1489,6 @@ export async function buildClosePollTx(
       return decoded;
     })(),
   }));
-  const pendingIntentCount = decodedIntents.filter(({ decoded }) => !decoded.aggregated).length;
-  if (BigInt(pendingIntentCount) < previousPoll.pending_intent_count) {
-    throw new Error("Close requires at least the pending intents tracked on the poll state");
-  }
-
   const creatorLock = denormalizeScript(previousPoll.creator_lock);
   const creatorAuthCell = await findSignerAuthCell(signer, [
     `${input.pollCell.outPoint.txHash}:${Number(input.pollCell.outPoint.index)}`,
@@ -1548,7 +1572,7 @@ export async function buildClosePollTx(
 
   await tx.completeInputsByCapacity(signer);
   assertPinnedInputs(tx, closePinnedKeys, "CLOSE_POLL creator close");
-  const requiredSince = absoluteEpochSince(previousPoll.deadline + 1n);
+  const requiredSince = absoluteEpochSince(previousPoll.deadline + FINALIZATION_GRACE_EPOCHS + 1n);
   setProtocolInputSince(
     tx,
     closePinnedKeys[0],
@@ -1582,6 +1606,9 @@ export async function buildForceCloseTx(
   const shardCells = input.shardCells ?? [];
   if (previousPoll.shard_count <= 0) {
     throw new Error("Non-sharded poll-cell aggregation is retired in this deployment");
+  }
+  if (previousPoll.shard_count > MAX_ACTIVE_TALLY_SHARDS) {
+    throw new Error(`Current-code force-close supports at most ${MAX_ACTIVE_TALLY_SHARDS} active lanes; older larger polls require their historical contract`);
   }
   const largeSharded = previousPoll.shard_count > MAX_DIRECT_CLOSE_SHARDS;
   if (largeSharded && shardCells.length > 0) {
@@ -1652,11 +1679,6 @@ export async function buildForceCloseTx(
       return decoded;
     })(),
   }));
-  const pendingIntentCount = decodedIntents.filter(({ decoded }) => !decoded.aggregated).length;
-  if (BigInt(pendingIntentCount) < previousPoll.pending_intent_count) {
-    throw new Error("Force-close requires at least the pending intents tracked on the poll state");
-  }
-
   const allowEpoch = previousPoll.deadline + FORCE_CLOSE_GRACE_EPOCHS;
   if (currentEpoch <= allowEpoch) {
     throw new Error("Force-close not yet allowed by epoch");

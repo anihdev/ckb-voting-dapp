@@ -23,7 +23,8 @@ use sparse_merkle_tree::{
 
 const MAX_CYCLES: u64 = 100_000_000;
 const MAX_AGGREGATION_CYCLES: u64 = 50_000_000;
-const MAX_SHARDS_PER_FINALIZE: usize = 8;
+const MAX_ACTIVE_TALLY_SHARDS: u32 = 16;
+const MAX_SHARDS_PER_FINALIZE: usize = 16;
 
 const OP_CREATE_POLL: u8 = 0x01;
 const OP_CREATE_VOTE_INTENT: u8 = 0x02;
@@ -43,6 +44,7 @@ const TALLY_MERGE_RESULT_MIN_SHANNONS: u64 = 61 * SHANNONS_PER_CKB;
 const MERGE_COVERAGE_BYTES: usize = 32;
 const MAX_SHARDS_PER_MERGE: usize = 8;
 const MAX_DIRECT_CLOSE_SHARDS: u32 = 8;
+const FINALIZATION_GRACE_EPOCHS: u64 = 1;
 const FORCE_CLOSE_GRACE_EPOCHS: u64 = 10;
 const POLL_CELL_SHANNONS: u64 = 900 * SHANNONS_PER_CKB;
 const SINCE_RELATIVE_FLAG: u64 = 1 << 63;
@@ -881,7 +883,11 @@ fn close_poll_tx(
     creator_auth_override: Option<OutPoint>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
     let threshold = if include_creator_auth {
-        fixture.open_poll.deadline
+        fixture
+            .open_poll
+            .deadline
+            .checked_add(FINALIZATION_GRACE_EPOCHS)
+            .expect("creator-close threshold")
     } else {
         fixture
             .open_poll
@@ -1110,6 +1116,25 @@ fn voter_for_shard(fixture: &mut PollFixture, shard_id: u32, seed_start: u8) -> 
     voter_for_shard_excluding(fixture, shard_id, seed_start, &[])
 }
 
+fn shard_id_has_voter(fixture: &mut PollFixture, shard_id: u32, seed_start: u8) -> bool {
+    for seed in seed_start..=u8::MAX {
+        let lock = fixture
+            .context
+            .build_script(&fixture.always_success_op, Bytes::from(vec![seed]))
+            .expect("voter lock");
+        let hash = script_hash(&lock);
+        if derive_tally_shard_id(
+            &fixture.poll_type_hash,
+            &hash,
+            fixture.open_poll.shard_count,
+        ) == shard_id
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn voter_for_other_shard(
     fixture: &mut PollFixture,
     shard_id: u32,
@@ -1200,56 +1225,24 @@ fn build_tally_shard_aggregation_tx(
     tx_with_headers(builder, header_hashes).build()
 }
 
-fn build_tally_shard_finalization_tx(
-    fixture: &mut PollFixture,
-    shard_op: OutPoint,
-    before_shard: TallyShardData,
-    after_shard: TallyShardData,
-    poll_dep: Option<OutPoint>,
-) -> ckb_testtool::ckb_types::core::TransactionView {
-    build_tally_shard_finalization_tx_with_since(
-        fixture,
-        shard_op,
-        before_shard,
-        after_shard,
-        poll_dep,
-        absolute_epoch_since(fixture.open_poll.deadline + 1),
-    )
-}
-
-fn build_tally_shard_finalization_tx_with_since(
-    fixture: &mut PollFixture,
-    shard_op: OutPoint,
-    before_shard: TallyShardData,
-    after_shard: TallyShardData,
-    poll_dep: Option<OutPoint>,
-    protocol_since: u64,
-) -> ckb_testtool::ckb_types::core::TransactionView {
-    let shard_script = shard_script_for_fixture(fixture, before_shard.shard_id);
-    tx_with_header(
-        TransactionBuilder::default()
-            .input(input_with_since(shard_op, protocol_since))
-            .output(output(
-                TALLY_SHARD_MIN_SHANNONS,
-                shard_script.clone(),
-                Some(shard_script),
-            ))
-            .output_data(encode_tally_shard(&after_shard).pack())
-            .cell_dep(cell_dep(fixture.governance_op.clone()))
-            .cell_dep(cell_dep(fixture.always_success_op.clone()))
-            .cell_dep(cell_dep(
-                poll_dep.unwrap_or_else(|| poll_dep_from_fixture(fixture, false)),
-            ))
-            .witness(blank_witness().pack()),
-        fixture.header_hash.clone(),
-    )
-    .build()
-}
-
 fn build_tally_shard_batch_finalization_tx(
     fixture: &mut PollFixture,
     lanes: Vec<(OutPoint, TallyShardData, TallyShardData, u64)>,
     poll_dep: Option<OutPoint>,
+) -> ckb_testtool::ckb_types::core::TransactionView {
+    build_tally_shard_batch_finalization_tx_with_output_overrides(
+        fixture,
+        lanes,
+        poll_dep,
+        Vec::new(),
+    )
+}
+
+fn build_tally_shard_batch_finalization_tx_with_output_overrides(
+    fixture: &mut PollFixture,
+    lanes: Vec<(OutPoint, TallyShardData, TallyShardData, u64)>,
+    poll_dep: Option<OutPoint>,
+    output_overrides: Vec<Option<(u64, Script, Option<Script>)>>,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
     let mut builder = TransactionBuilder::default()
         .cell_dep(cell_dep(fixture.governance_op.clone()))
@@ -1260,20 +1253,27 @@ fn build_tally_shard_batch_finalization_tx(
 
     // Flow: every selected lane occupies the same input/output index. Distinct
     // lane type groups each validate the complete ordered protocol prefix.
-    for (shard_op, before, after, protocol_since) in lanes {
+    for (index, (shard_op, before, after, protocol_since)) in lanes.into_iter().enumerate() {
         let shard_script = tally_shard_script_from_parts(
             &mut fixture.context,
             &fixture.governance_op,
             &before.poll_type_hash,
             before.shard_id,
         );
+        let (output_capacity, output_lock, output_type) = output_overrides
+            .get(index)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| {
+                (
+                    TALLY_SHARD_MIN_SHANNONS,
+                    shard_script.clone(),
+                    Some(shard_script),
+                )
+            });
         builder = builder
             .input(input_with_since(shard_op, protocol_since))
-            .output(output(
-                TALLY_SHARD_MIN_SHANNONS,
-                shard_script.clone(),
-                Some(shard_script),
-            ))
+            .output(output(output_capacity, output_lock, output_type))
             .output_data(encode_tally_shard(&after).pack())
             .witness(blank_witness().pack());
     }
@@ -1292,7 +1292,10 @@ fn close_poll_with_inputs_tx(
     creator_return_capacity: u64,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
     let threshold = if include_creator_auth {
-        poll_before.deadline
+        poll_before
+            .deadline
+            .checked_add(FINALIZATION_GRACE_EPOCHS)
+            .expect("creator-close threshold")
     } else {
         poll_before
             .deadline
@@ -1400,10 +1403,14 @@ fn close_poll_with_return_overrides_tx(
         fixture.poll_type.clone(),
         encode_poll(&poll_before),
     );
+    let threshold = poll_before
+        .deadline
+        .checked_add(FINALIZATION_GRACE_EPOCHS)
+        .expect("creator-close threshold");
     let mut builder = TransactionBuilder::default()
         .input(input_with_since(
             poll_op,
-            absolute_epoch_since(poll_before.deadline + 1),
+            absolute_epoch_since(threshold + 1),
         ))
         .output(output(
             POLL_CELL_SHANNONS,
@@ -1726,9 +1733,47 @@ fn shadow_same_index_type_update_tx(
 #[test]
 fn create_poll_type_id_and_complete_shards_pass() {
     let mut fixture = fixture(10);
-    let tx = create_poll_tx(&mut fixture, 2, None, false, false, false, [0u8; 32], None);
+    let tx = create_poll_tx(
+        &mut fixture,
+        MAX_ACTIVE_TALLY_SHARDS,
+        None,
+        false,
+        false,
+        false,
+        [0u8; 32],
+        None,
+    );
 
     verify_ok(&mut fixture.context, tx);
+}
+
+#[test]
+fn create_poll_enforces_active_lane_cap() {
+    let mut within_cap = fixture(10);
+    let valid = create_poll_tx(
+        &mut within_cap,
+        MAX_ACTIVE_TALLY_SHARDS,
+        None,
+        false,
+        false,
+        false,
+        [0u8; 32],
+        None,
+    );
+    verify_ok(&mut within_cap.context, valid);
+
+    let mut above_cap = fixture(10);
+    let invalid = create_poll_tx(
+        &mut above_cap,
+        MAX_ACTIVE_TALLY_SHARDS + 1,
+        None,
+        false,
+        false,
+        false,
+        [0u8; 32],
+        None,
+    );
+    assert_exit_code(&verify_err(&mut above_cap.context, invalid), 5);
 }
 
 #[test]
@@ -1817,7 +1862,7 @@ fn create_poll_rejects_nonzero_udt_type_hash() {
 #[test]
 fn protocol_poll_lock_and_creator_close_auth_are_enforced() {
     let mut fixture = create_poll_fixture(20, 2, true);
-    let close_epoch = fixture.open_poll.deadline + 1;
+    let close_epoch = fixture.open_poll.deadline + FINALIZATION_GRACE_EPOCHS + 1;
     set_fixture_epoch(&mut fixture, close_epoch);
 
     assert_eq!(
@@ -1838,7 +1883,7 @@ fn protocol_poll_lock_and_creator_close_auth_are_enforced() {
 #[test]
 fn poll_close_rejects_additional_same_type_output() {
     let mut fixture = create_poll_fixture(21, 2, true);
-    let close_epoch = fixture.open_poll.deadline + 1;
+    let close_epoch = fixture.open_poll.deadline + FINALIZATION_GRACE_EPOCHS + 1;
     set_fixture_epoch(&mut fixture, close_epoch);
     let tx = close_poll_tx(&mut fixture, true, None);
     let extra_output = tx.outputs().get(0).expect("closed poll output");
@@ -1855,7 +1900,7 @@ fn poll_close_rejects_additional_same_type_output() {
 #[test]
 fn non_creator_close_before_force_close_grace_fails() {
     let mut fixture = create_poll_fixture(20, 2, true);
-    let close_epoch = fixture.open_poll.deadline + 1;
+    let close_epoch = fixture.open_poll.deadline + FINALIZATION_GRACE_EPOCHS + 1;
     set_fixture_epoch(&mut fixture, close_epoch);
     let non_creator_lock = fixture
         .context
@@ -1885,13 +1930,17 @@ fn non_creator_force_close_after_grace_passes() {
 fn creator_close_rejects_invalid_since_values_and_threshold_overflow() {
     let mut fixture = create_poll_fixture(21, 2, true);
     let deadline = fixture.open_poll.deadline;
-    for protocol_since in invalid_since_values(deadline) {
+    for protocol_since in invalid_since_values(deadline + FINALIZATION_GRACE_EPOCHS) {
         let tx = close_poll_tx_with_since(&mut fixture, true, None, protocol_since);
         assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
     }
 
-    let valid =
-        close_poll_tx_with_since(&mut fixture, true, None, absolute_epoch_since(deadline + 1));
+    let valid = close_poll_tx_with_since(
+        &mut fixture,
+        true,
+        None,
+        absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+    );
     verify_ok(&mut fixture.context, valid);
 
     let mut overflow = create_poll_fixture(22, 2, true);
@@ -2893,23 +2942,26 @@ fn weighted_poll_cells_retain_finalize_close_and_refund_recovery() {
     let mut weighted_open = finalize.open_poll.clone();
     weighted_open.token_weighted = true;
     let weighted_poll_dep = poll_dep_from_data(&mut finalize, weighted_open);
-    let finalize_epoch = finalize.open_poll.deadline + 1;
+    let finalize_epoch = finalize.open_poll.deadline + FINALIZATION_GRACE_EPOCHS + 1;
     set_fixture_epoch(&mut finalize, finalize_epoch);
-    let before_shard = finalize.shard_data[0].clone();
-    let shard_op = finalize.shard_ops[0].clone();
-    let mut after_shard = before_shard.clone();
-    after_shard.finalized = true;
-    let tx = build_tally_shard_finalization_tx(
-        &mut finalize,
-        shard_op,
-        before_shard,
-        after_shard,
-        Some(weighted_poll_dep),
-    );
+    let lanes = (0..finalize.shard_ops.len())
+        .map(|index| {
+            let before = finalize.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                finalize.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(finalize.open_poll.deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut finalize, lanes, Some(weighted_poll_dep));
     verify_ok(&mut finalize.context, tx);
 
     let mut close = create_poll_fixture(133, 2, true);
-    let close_epoch = close.open_poll.deadline + 1;
+    let close_epoch = close.open_poll.deadline + FINALIZATION_GRACE_EPOCHS + 1;
     set_fixture_epoch(&mut close, close_epoch);
     let mut weighted_before = close.open_poll.clone();
     weighted_before.token_weighted = true;
@@ -3301,107 +3353,9 @@ fn tally_shard_aggregation_rejects_finalized_and_mutated_shards() {
 
 #[test]
 fn tally_shard_finalization_validates_deadline_and_immutables() {
-    let mut fixture = create_poll_fixture(100, 3, false);
-    let shard_op = fixture.shard_ops[0].clone();
-    let before = fixture.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
+    let mut fixture = create_poll_fixture(100, MAX_ACTIVE_TALLY_SHARDS, false);
     let deadline = fixture.open_poll.deadline;
-    set_fixture_epoch(&mut fixture, deadline + 1);
-    let valid = build_tally_shard_finalization_tx(
-        &mut fixture,
-        shard_op.clone(),
-        before.clone(),
-        after.clone(),
-        None,
-    );
-    verify_ok(&mut fixture.context, valid);
-
-    let mut early = create_poll_fixture(101, 3, false);
-    let shard_op = early.shard_ops[0].clone();
-    let before = early.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    let too_low_since = absolute_epoch_since(early.open_poll.deadline);
-    let early_tx = build_tally_shard_finalization_tx_with_since(
-        &mut early,
-        shard_op,
-        before,
-        after,
-        None,
-        too_low_since,
-    );
-    assert_exit_code(&verify_err(&mut early.context, early_tx), 5);
-
-    let mut mutated = create_poll_fixture(102, 3, false);
-    let shard_op = mutated.shard_ops[0].clone();
-    let before = mutated.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    after.vote_counts[0] = 1;
-    let deadline = mutated.open_poll.deadline;
-    set_fixture_epoch(&mut mutated, deadline + 1);
-    let mutated_tx = build_tally_shard_finalization_tx(&mut mutated, shard_op, before, after, None);
-    assert_exit_code(&verify_err(&mut mutated.context, mutated_tx), 5);
-
-    let mut wrong_dep = create_poll_fixture(103, 3, false);
-    let shard_op = wrong_dep.shard_ops[0].clone();
-    let before = wrong_dep.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    let deadline = wrong_dep.open_poll.deadline;
-    set_fixture_epoch(&mut wrong_dep, deadline + 1);
-    let mut poll = wrong_dep.open_poll.clone();
-    poll.shard_count = 2;
-    let dep = poll_dep_from_data(&mut wrong_dep, poll);
-    let wrong_dep_tx =
-        build_tally_shard_finalization_tx(&mut wrong_dep, shard_op, before, after, Some(dep));
-    assert_exit_code(&verify_err(&mut wrong_dep.context, wrong_dep_tx), 5);
-}
-
-#[test]
-fn tally_shard_finalization_rejects_invalid_since_values_and_threshold_overflow() {
-    let mut fixture = create_poll_fixture(106, 3, false);
-    let shard_op = fixture.shard_ops[0].clone();
-    let before = fixture.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    let deadline = fixture.open_poll.deadline;
-
-    for protocol_since in invalid_since_values(deadline) {
-        let tx = build_tally_shard_finalization_tx_with_since(
-            &mut fixture,
-            shard_op.clone(),
-            before.clone(),
-            after.clone(),
-            None,
-            protocol_since,
-        );
-        assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
-    }
-
-    let mut overflow = create_poll_fixture(107, 3, false);
-    overflow.open_poll.deadline = u64::MAX;
-    let shard_op = overflow.shard_ops[0].clone();
-    let before = overflow.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    let tx = build_tally_shard_finalization_tx_with_since(
-        &mut overflow,
-        shard_op,
-        before,
-        after,
-        None,
-        absolute_epoch_since(MAX_DEADLINE_EPOCH + 1),
-    );
-    assert_exit_code(&verify_err(&mut overflow.context, tx), 5);
-}
-
-#[test]
-fn tally_shard_batch_finalization_accepts_eight_ordered_lanes_in_one_transaction() {
-    let mut fixture = create_poll_fixture(108, MAX_SHARDS_PER_FINALIZE as u32, false);
-    let deadline = fixture.open_poll.deadline;
-    set_fixture_epoch(&mut fixture, deadline + 1);
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let lanes = (0..MAX_SHARDS_PER_FINALIZE)
         .map(|index| {
             let before = fixture.shard_data[index].clone();
@@ -3411,7 +3365,179 @@ fn tally_shard_batch_finalization_accepts_eight_ordered_lanes_in_one_transaction
                 fixture.shard_ops[index].clone(),
                 before,
                 after,
-                absolute_epoch_since(deadline + 1),
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let valid = build_tally_shard_batch_finalization_tx(&mut fixture, lanes, None);
+    verify_ok(&mut fixture.context, valid);
+
+    let mut early = create_poll_fixture(101, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = early.open_poll.deadline;
+    set_fixture_epoch(&mut early, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = early.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                early.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS),
+            )
+        })
+        .collect();
+    let early_tx = build_tally_shard_batch_finalization_tx(&mut early, lanes, None);
+    assert_exit_code(&verify_err(&mut early.context, early_tx), 5);
+
+    let mut mutated = create_poll_fixture(102, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = mutated.open_poll.deadline;
+    set_fixture_epoch(&mut mutated, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = mutated.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            if index == 0 {
+                after.vote_counts[0] = 1;
+            }
+            (
+                mutated.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let mutated_tx = build_tally_shard_batch_finalization_tx(&mut mutated, lanes, None);
+    assert_exit_code(&verify_err(&mut mutated.context, mutated_tx), 5);
+
+    let mut wrong_total = create_poll_fixture(117, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = wrong_total.open_poll.deadline;
+    set_fixture_epoch(&mut wrong_total, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = wrong_total.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            if index == 0 {
+                after.total_voters += 1;
+            }
+            (
+                wrong_total.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut wrong_total, lanes, None);
+    assert_exit_code(&verify_err(&mut wrong_total.context, tx), 5);
+
+    let mut wrong_shape = create_poll_fixture(118, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = wrong_shape.open_poll.deadline;
+    set_fixture_epoch(&mut wrong_shape, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = wrong_shape.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            if index == 0 {
+                after.vote_counts.push(0);
+            }
+            (
+                wrong_shape.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut wrong_shape, lanes, None);
+    assert_exit_code(&verify_err(&mut wrong_shape.context, tx), 5);
+
+    let mut wrong_dep = create_poll_fixture(103, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = wrong_dep.open_poll.deadline;
+    set_fixture_epoch(&mut wrong_dep, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = wrong_dep.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                wrong_dep.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let mut poll = wrong_dep.open_poll.clone();
+    poll.shard_count = MAX_ACTIVE_TALLY_SHARDS - 1;
+    let dep = poll_dep_from_data(&mut wrong_dep, poll);
+    let wrong_dep_tx = build_tally_shard_batch_finalization_tx(&mut wrong_dep, lanes, Some(dep));
+    assert_exit_code(&verify_err(&mut wrong_dep.context, wrong_dep_tx), 5);
+}
+
+#[test]
+fn tally_shard_finalization_rejects_invalid_since_values_and_threshold_overflow() {
+    let mut fixture = create_poll_fixture(106, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = fixture.open_poll.deadline;
+
+    for protocol_since in invalid_since_values(deadline + FINALIZATION_GRACE_EPOCHS) {
+        let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+            .map(|index| {
+                let before = fixture.shard_data[index].clone();
+                let mut after = before.clone();
+                after.finalized = true;
+                (
+                    fixture.shard_ops[index].clone(),
+                    before,
+                    after,
+                    protocol_since,
+                )
+            })
+            .collect();
+        let tx = build_tally_shard_batch_finalization_tx(&mut fixture, lanes, None);
+        assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+    }
+
+    let mut overflow = create_poll_fixture(107, MAX_ACTIVE_TALLY_SHARDS, false);
+    overflow.open_poll.deadline = u64::MAX;
+    replace_fixture_poll_input(&mut overflow);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = overflow.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                overflow.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(MAX_DEADLINE_EPOCH + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut overflow, lanes, None);
+    assert_exit_code(&verify_err(&mut overflow.context, tx), 5);
+}
+
+#[test]
+fn tally_shard_batch_finalization_accepts_sixteen_ordered_lanes_in_one_transaction() {
+    let mut fixture = create_poll_fixture(108, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = fixture.open_poll.deadline;
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = fixture.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                fixture.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
             )
         })
         .collect();
@@ -3421,18 +3547,19 @@ fn tally_shard_batch_finalization_accepts_eight_ordered_lanes_in_one_transaction
     let cycles = verify_ok(&mut fixture.context, tx);
     assert!(
         cycles <= MAX_AGGREGATION_CYCLES,
-        "eight-lane finalization used {cycles} cycles, above the project ceiling"
+        "sixteen-lane finalization used {cycles} cycles, above the project ceiling"
     );
-    println!("V2_BATCH_FINALIZE lanes=8 tx_bytes={tx_bytes} cycles={cycles}");
+    println!("V2_BATCH_FINALIZE lanes=16 tx_bytes={tx_bytes} cycles={cycles}");
 }
 
 #[test]
 fn tally_shard_batch_finalization_rejects_order_scope_and_batch_violations() {
-    let mut wrong_order = create_poll_fixture(109, 3, false);
+    let mut wrong_order = create_poll_fixture(109, MAX_ACTIVE_TALLY_SHARDS, false);
     let deadline = wrong_order.open_poll.deadline;
-    set_fixture_epoch(&mut wrong_order, deadline + 1);
+    set_fixture_epoch(&mut wrong_order, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let lanes = [1usize, 0]
         .into_iter()
+        .chain(2..MAX_SHARDS_PER_FINALIZE)
         .map(|index| {
             let before = wrong_order.shard_data[index].clone();
             let mut after = before.clone();
@@ -3441,16 +3568,16 @@ fn tally_shard_batch_finalization_rejects_order_scope_and_batch_violations() {
                 wrong_order.shard_ops[index].clone(),
                 before,
                 after,
-                absolute_epoch_since(deadline + 1),
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
             )
         })
         .collect();
     let tx = build_tally_shard_batch_finalization_tx(&mut wrong_order, lanes, None);
     assert_exit_code(&verify_err(&mut wrong_order.context, tx), 5);
 
-    let mut too_many = create_poll_fixture(110, (MAX_SHARDS_PER_FINALIZE + 1) as u32, false);
+    let mut too_many = create_poll_fixture(110, MAX_ACTIVE_TALLY_SHARDS + 1, false);
     let deadline = too_many.open_poll.deadline;
-    set_fixture_epoch(&mut too_many, deadline + 1);
+    set_fixture_epoch(&mut too_many, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let lanes = (0..=MAX_SHARDS_PER_FINALIZE)
         .map(|index| {
             let before = too_many.shard_data[index].clone();
@@ -3460,16 +3587,146 @@ fn tally_shard_batch_finalization_rejects_order_scope_and_batch_violations() {
                 too_many.shard_ops[index].clone(),
                 before,
                 after,
-                absolute_epoch_since(deadline + 1),
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
             )
         })
         .collect();
     let tx = build_tally_shard_batch_finalization_tx(&mut too_many, lanes, None);
     assert_exit_code(&verify_err(&mut too_many.context, tx), 5);
 
-    let mut mixed_poll = create_poll_fixture(111, 2, false);
+    let mut one_lane = create_poll_fixture(119, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = one_lane.open_poll.deadline;
+    set_fixture_epoch(&mut one_lane, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let before = one_lane.shard_data[0].clone();
+    let mut after = before.clone();
+    after.finalized = true;
+    let lanes = vec![(
+        one_lane.shard_ops[0].clone(),
+        before,
+        after,
+        absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+    )];
+    let tx = build_tally_shard_batch_finalization_tx(&mut one_lane, lanes, None);
+    assert_exit_code(&verify_err(&mut one_lane.context, tx), 5);
+
+    let mut incomplete = create_poll_fixture(111, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = incomplete.open_poll.deadline;
+    set_fixture_epoch(&mut incomplete, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..8usize)
+        .map(|index| {
+            let before = incomplete.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                incomplete.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut incomplete, lanes, None);
+    assert_exit_code(&verify_err(&mut incomplete.context, tx), 5);
+
+    let mut almost_complete = create_poll_fixture(112, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = almost_complete.open_poll.deadline;
+    set_fixture_epoch(
+        &mut almost_complete,
+        deadline + FINALIZATION_GRACE_EPOCHS + 1,
+    );
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .filter(|index| *index != MAX_SHARDS_PER_FINALIZE / 2)
+        .map(|index| {
+            let before = almost_complete.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                almost_complete.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let tx = build_tally_shard_batch_finalization_tx(&mut almost_complete, lanes, None);
+    assert_exit_code(&verify_err(&mut almost_complete.context, tx), 5);
+
+    let mut duplicate = create_poll_fixture(121, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = duplicate.open_poll.deadline;
+    set_fixture_epoch(&mut duplicate, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let mut lanes: Vec<_> = (0..(MAX_SHARDS_PER_FINALIZE - 1))
+        .map(|index| {
+            let before = duplicate.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                duplicate.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let duplicate_index = MAX_SHARDS_PER_FINALIZE - 2;
+    let duplicate_before = duplicate.shard_data[duplicate_index].clone();
+    let mut duplicate_after = duplicate_before.clone();
+    duplicate_after.finalized = true;
+    let duplicate_script = shard_script_for_fixture(&mut duplicate, duplicate_index as u32);
+    let duplicate_op = governance_cell(
+        &mut duplicate.context,
+        TALLY_SHARD_MIN_SHANNONS,
+        duplicate_script.clone(),
+        duplicate_script,
+        encode_tally_shard(&duplicate_before),
+    );
+    lanes.push((
+        duplicate_op,
+        duplicate_before,
+        duplicate_after,
+        absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+    ));
+    let tx = build_tally_shard_batch_finalization_tx(&mut duplicate, lanes, None);
+    assert_exit_code(&verify_err(&mut duplicate.context, tx), 5);
+
+    let mut out_of_range = create_poll_fixture(122, 1, false);
+    let deadline = out_of_range.open_poll.deadline;
+    set_fixture_epoch(&mut out_of_range, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let before = TallyShardData {
+        poll_type_hash: out_of_range.poll_type_hash,
+        shard_id: 1,
+        shard_count: 1,
+        vote_counts: vec![0, 0],
+        total_voters: 0,
+        counted_voter_lock_hashes: Vec::new(),
+        finalized: false,
+    };
+    let mut after = before.clone();
+    after.finalized = true;
+    let shard_script = tally_shard_script_from_parts(
+        &mut out_of_range.context,
+        &out_of_range.governance_op,
+        &out_of_range.poll_type_hash,
+        1,
+    );
+    let shard_op = governance_cell(
+        &mut out_of_range.context,
+        TALLY_SHARD_MIN_SHANNONS,
+        shard_script.clone(),
+        shard_script,
+        encode_tally_shard(&before),
+    );
+    let lanes = vec![(
+        shard_op,
+        before,
+        after,
+        absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+    )];
+    let tx = build_tally_shard_batch_finalization_tx(&mut out_of_range, lanes, None);
+    assert_exit_code(&verify_err(&mut out_of_range.context, tx), 4);
+
+    let mut mixed_poll = create_poll_fixture(113, 2, false);
     let deadline = mixed_poll.open_poll.deadline;
-    set_fixture_epoch(&mut mixed_poll, deadline + 1);
+    set_fixture_epoch(&mut mixed_poll, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let normal_before = mixed_poll.shard_data[0].clone();
     let mut normal_after = normal_before.clone();
     normal_after.finalized = true;
@@ -3503,13 +3760,13 @@ fn tally_shard_batch_finalization_rejects_order_scope_and_batch_violations() {
             mixed_poll.shard_ops[0].clone(),
             normal_before,
             normal_after,
-            absolute_epoch_since(deadline + 1),
+            absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
         ),
         (
             foreign_op,
             foreign_before,
             foreign_after,
-            absolute_epoch_since(deadline + 1),
+            absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
         ),
     ];
     let tx = build_tally_shard_batch_finalization_tx(&mut mixed_poll, lanes, None);
@@ -3518,15 +3775,19 @@ fn tally_shard_batch_finalization_rejects_order_scope_and_batch_violations() {
 
 #[test]
 fn tally_shard_batch_finalization_rejects_bad_since_root_and_extra_lane_output() {
-    let mut bad_since = create_poll_fixture(112, 2, false);
+    let mut bad_since = create_poll_fixture(114, MAX_ACTIVE_TALLY_SHARDS, false);
     let deadline = bad_since.open_poll.deadline;
-    set_fixture_epoch(&mut bad_since, deadline + 1);
-    let lanes = (0..2usize)
+    set_fixture_epoch(&mut bad_since, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
         .map(|index| {
             let before = bad_since.shard_data[index].clone();
             let mut after = before.clone();
             after.finalized = true;
-            let since_epoch = if index == 0 { deadline + 1 } else { deadline };
+            let since_epoch = if index == 0 {
+                deadline + FINALIZATION_GRACE_EPOCHS + 1
+            } else {
+                deadline + FINALIZATION_GRACE_EPOCHS
+            };
             (
                 bad_since.shard_ops[index].clone(),
                 before,
@@ -3538,37 +3799,142 @@ fn tally_shard_batch_finalization_rejects_bad_since_root_and_extra_lane_output()
     let tx = build_tally_shard_batch_finalization_tx(&mut bad_since, lanes, None);
     assert_exit_code(&verify_err(&mut bad_since.context, tx), 5);
 
-    let mut bad_root = create_poll_fixture(113, 1, false);
+    let mut bad_root = create_poll_fixture(115, MAX_ACTIVE_TALLY_SHARDS, false);
     let deadline = bad_root.open_poll.deadline;
-    set_fixture_epoch(&mut bad_root, deadline + 1);
-    let before = bad_root.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    after.counted_voter_lock_hashes.push([0xBB; 32]);
-    let lanes = vec![(
-        bad_root.shard_ops[0].clone(),
-        before,
-        after,
-        absolute_epoch_since(deadline + 1),
-    )];
+    set_fixture_epoch(&mut bad_root, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = bad_root.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            if index == 0 {
+                after.counted_voter_lock_hashes.push([0xBB; 32]);
+            }
+            (
+                bad_root.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
     let tx = build_tally_shard_batch_finalization_tx(&mut bad_root, lanes, None);
     assert_exit_code(&verify_err(&mut bad_root.context, tx), 5);
 
-    let mut extra_output = create_poll_fixture(114, 2, false);
+    let mut bad_capacity = create_poll_fixture(123, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = bad_capacity.open_poll.deadline;
+    set_fixture_epoch(&mut bad_capacity, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = bad_capacity.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                bad_capacity.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let first_script = shard_script_for_fixture(&mut bad_capacity, 0);
+    let tx = build_tally_shard_batch_finalization_tx_with_output_overrides(
+        &mut bad_capacity,
+        lanes,
+        None,
+        vec![Some((
+            TALLY_SHARD_MIN_SHANNONS + 1,
+            first_script.clone(),
+            Some(first_script),
+        ))],
+    );
+    assert_exit_code(&verify_err(&mut bad_capacity.context, tx), 5);
+
+    let mut bad_lock = create_poll_fixture(124, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = bad_lock.open_poll.deadline;
+    set_fixture_epoch(&mut bad_lock, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = bad_lock.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                bad_lock.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let first_script = shard_script_for_fixture(&mut bad_lock, 0);
+    let wrong_lock = bad_lock
+        .context
+        .build_script(&bad_lock.always_success_op, Bytes::from(vec![0xF1]))
+        .expect("wrong lane output lock");
+    let tx = build_tally_shard_batch_finalization_tx_with_output_overrides(
+        &mut bad_lock,
+        lanes,
+        None,
+        vec![Some((
+            TALLY_SHARD_MIN_SHANNONS,
+            wrong_lock,
+            Some(first_script),
+        ))],
+    );
+    assert_exit_code(&verify_err(&mut bad_lock.context, tx), 5);
+
+    let mut bad_type = create_poll_fixture(125, MAX_ACTIVE_TALLY_SHARDS, false);
+    let deadline = bad_type.open_poll.deadline;
+    set_fixture_epoch(&mut bad_type, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = bad_type.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                bad_type.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
+    let first_script = shard_script_for_fixture(&mut bad_type, 0);
+    let wrong_type = bad_type
+        .context
+        .build_script(&bad_type.always_success_op, Bytes::from(vec![0xF2]))
+        .expect("wrong lane output type");
+    let tx = build_tally_shard_batch_finalization_tx_with_output_overrides(
+        &mut bad_type,
+        lanes,
+        None,
+        vec![Some((
+            TALLY_SHARD_MIN_SHANNONS,
+            first_script,
+            Some(wrong_type),
+        ))],
+    );
+    assert_exit_code(&verify_err(&mut bad_type.context, tx), 5);
+
+    let mut extra_output = create_poll_fixture(116, MAX_ACTIVE_TALLY_SHARDS, false);
     let deadline = extra_output.open_poll.deadline;
-    set_fixture_epoch(&mut extra_output, deadline + 1);
-    let before = extra_output.shard_data[0].clone();
-    let mut after = before.clone();
-    after.finalized = true;
-    let lanes = vec![(
-        extra_output.shard_ops[0].clone(),
-        before,
-        after.clone(),
-        absolute_epoch_since(deadline + 1),
-    )];
+    set_fixture_epoch(&mut extra_output, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let lanes = (0..MAX_SHARDS_PER_FINALIZE)
+        .map(|index| {
+            let before = extra_output.shard_data[index].clone();
+            let mut after = before.clone();
+            after.finalized = true;
+            (
+                extra_output.shard_ops[index].clone(),
+                before,
+                after,
+                absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+            )
+        })
+        .collect();
     let tx = build_tally_shard_batch_finalization_tx(&mut extra_output, lanes, None);
-    let hidden_script = shard_script_for_fixture(&mut extra_output, 1);
-    let mut hidden_after = extra_output.shard_data[1].clone();
+    let hidden_script = shard_script_for_fixture(&mut extra_output, 0);
+    let mut hidden_after = extra_output.shard_data[0].clone();
     hidden_after.finalized = true;
     let tx = append_output(
         tx,
@@ -3583,19 +3949,29 @@ fn tally_shard_batch_finalization_rejects_bad_since_root_and_extra_lane_output()
 }
 
 #[test]
-fn direct_small_poll_close_uses_finalized_shards_and_refunds_exact_capacity() {
-    let mut fixture = create_poll_fixture(120, 3, false);
+fn direct_eight_lane_poll_close_uses_finalized_shards_and_refunds_exact_capacity() {
+    let mut fixture = create_poll_fixture(120, MAX_DIRECT_CLOSE_SHARDS, false);
     let deadline = fixture.open_poll.deadline;
-    set_fixture_epoch(&mut fixture, deadline + 1);
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let shards = vec![
         finalized_shard(&mut fixture, 0, vec![2, 0], 10),
         finalized_shard(&mut fixture, 1, vec![0, 1], 30),
         finalized_shard(&mut fixture, 2, vec![1, 1], 50),
+        finalized_shard(&mut fixture, 3, vec![0, 2], 70),
+        finalized_shard(&mut fixture, 4, vec![3, 0], 90),
+        finalized_shard(&mut fixture, 5, vec![1, 0], 110),
+        finalized_shard(&mut fixture, 6, vec![0, 1], 130),
+        finalized_shard(&mut fixture, 7, vec![2, 2], 150),
     ];
     let capacities = vec![
         TALLY_SHARD_MIN_SHANNONS,
         TALLY_SHARD_MIN_SHANNONS + 123,
         TALLY_SHARD_MIN_SHANNONS + 456,
+        TALLY_SHARD_MIN_SHANNONS + 789,
+        TALLY_SHARD_MIN_SHANNONS + 1011,
+        TALLY_SHARD_MIN_SHANNONS + 1213,
+        TALLY_SHARD_MIN_SHANNONS + 1415,
+        TALLY_SHARD_MIN_SHANNONS + 1617,
     ];
     let mut shard_inputs = Vec::new();
     for (shard, capacity) in shards.iter().zip(capacities.iter()) {
@@ -3605,7 +3981,6 @@ fn direct_small_poll_close_uses_finalized_shards_and_refunds_exact_capacity() {
     let mut before_poll = fixture.open_poll.clone();
     before_poll.vote_counts = vec![9, 9];
     before_poll.total_voters = 18;
-    before_poll.pending_intent_count = 1;
     let after_poll = closed_poll_from_result(
         &before_poll,
         summed_vote_counts(&shards),
@@ -3662,10 +4037,33 @@ fn direct_small_poll_close_uses_finalized_shards_and_refunds_exact_capacity() {
 }
 
 #[test]
+fn close_rejects_nonzero_reserved_pending_counter_input() {
+    let mut fixture = create_poll_fixture(121, MAX_DIRECT_CLOSE_SHARDS, true);
+    let deadline = fixture.open_poll.deadline;
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let mut before_poll = fixture.open_poll.clone();
+    before_poll.pending_intent_count = 1;
+    let after_poll = closed_poll_from_result(&before_poll, vec![0, 0], 0);
+    let tx = close_poll_with_inputs_tx_at_since(
+        &mut fixture,
+        before_poll,
+        after_poll,
+        true,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        CREATOR_DEPOSIT_SHANNONS,
+        absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
 fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
     let mut unfinalized = create_poll_fixture(130, 2, false);
     let deadline = unfinalized.open_poll.deadline;
-    set_fixture_epoch(&mut unfinalized, deadline + 1);
+    set_fixture_epoch(&mut unfinalized, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let shards = vec![
         unfinalized.shard_data[0].clone(),
         finalized_shard(&mut unfinalized, 1, vec![0, 1], 20),
@@ -3691,7 +4089,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
 
     let mut missing = create_poll_fixture(131, 2, false);
     let deadline = missing.open_poll.deadline;
-    set_fixture_epoch(&mut missing, deadline + 1);
+    set_fixture_epoch(&mut missing, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let shard = finalized_shard(&mut missing, 0, vec![1, 0], 30);
     let (op, _) = shard_cell_with_capacity(&mut missing, &shard, TALLY_SHARD_MIN_SHANNONS);
     let before = missing.open_poll.clone();
@@ -3710,7 +4108,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
 
     let mut duplicate = create_poll_fixture(132, 2, false);
     let deadline = duplicate.open_poll.deadline;
-    set_fixture_epoch(&mut duplicate, deadline + 1);
+    set_fixture_epoch(&mut duplicate, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let shard0 = finalized_shard(&mut duplicate, 0, vec![1, 0], 40);
     let shard0_again = finalized_shard(&mut duplicate, 0, vec![0, 1], 50);
     let (op0, _) = shard_cell_with_capacity(&mut duplicate, &shard0, TALLY_SHARD_MIN_SHANNONS);
@@ -3735,7 +4133,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
 
     let mut wrong_poll = create_poll_fixture(133, 2, false);
     let deadline = wrong_poll.open_poll.deadline;
-    set_fixture_epoch(&mut wrong_poll, deadline + 1);
+    set_fixture_epoch(&mut wrong_poll, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let mut shard0 = finalized_shard(&mut wrong_poll, 0, vec![1, 0], 60);
     shard0.poll_type_hash = [0x77; 32];
     let shard1 = finalized_shard(&mut wrong_poll, 1, vec![0, 1], 70);
@@ -3760,7 +4158,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
 
     let mut no_auth = create_poll_fixture(134, 2, false);
     let deadline = no_auth.open_poll.deadline;
-    set_fixture_epoch(&mut no_auth, deadline + 1);
+    set_fixture_epoch(&mut no_auth, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let shards = vec![
         finalized_shard(&mut no_auth, 0, vec![1, 0], 80),
         finalized_shard(&mut no_auth, 1, vec![0, 1], 90),
@@ -3781,7 +4179,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
         Vec::new(),
         Vec::new(),
         CREATOR_DEPOSIT_SHANNONS,
-        absolute_epoch_since(deadline + 1),
+        absolute_epoch_since(deadline + FINALIZATION_GRACE_EPOCHS + 1),
     );
     assert_exit_code(&verify_err(&mut no_auth.context, tx), 5);
 }
@@ -3790,7 +4188,7 @@ fn direct_small_poll_close_rejects_bad_shard_sets_and_auth() {
 fn direct_small_poll_close_rejects_extra_tally_inputs_and_large_poll_direct_close() {
     let mut extra = create_poll_fixture(140, 2, false);
     let deadline = extra.open_poll.deadline;
-    set_fixture_epoch(&mut extra, deadline + 1);
+    set_fixture_epoch(&mut extra, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let shards = vec![
         finalized_shard(&mut extra, 0, vec![1, 0], 10),
         finalized_shard(&mut extra, 1, vec![0, 1], 20),
@@ -3817,7 +4215,7 @@ fn direct_small_poll_close_rejects_extra_tally_inputs_and_large_poll_direct_clos
 
     let mut large = create_poll_fixture(141, MAX_DIRECT_CLOSE_SHARDS + 1, false);
     let deadline = large.open_poll.deadline;
-    set_fixture_epoch(&mut large, deadline + 1);
+    set_fixture_epoch(&mut large, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let mut shards = Vec::new();
     let mut inputs = Vec::new();
     for shard_id in 0..large.open_poll.shard_count {
@@ -3839,6 +4237,31 @@ fn direct_small_poll_close_rejects_extra_tally_inputs_and_large_poll_direct_clos
         CREATOR_DEPOSIT_SHANNONS,
     );
     assert_exit_code(&verify_err(&mut large.context, tx), 4);
+
+    let mut legacy = create_poll_fixture(142, MAX_ACTIVE_TALLY_SHARDS + 1, false);
+    let deadline = legacy.open_poll.deadline;
+    set_fixture_epoch(&mut legacy, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let mut shards = Vec::new();
+    let mut inputs = Vec::new();
+    for shard_id in 0..legacy.open_poll.shard_count {
+        let shard = finalized_shard(&mut legacy, shard_id, vec![0, 0], shard_id as u8);
+        let (op, _) = shard_cell_with_capacity(&mut legacy, &shard, TALLY_SHARD_MIN_SHANNONS);
+        shards.push(shard);
+        inputs.push((op, TALLY_SHARD_MIN_SHANNONS));
+    }
+    let before = legacy.open_poll.clone();
+    let after = closed_poll_from_result(&before, summed_vote_counts(&shards), 0);
+    let tx = close_poll_with_inputs_tx(
+        &mut legacy,
+        before,
+        after,
+        true,
+        inputs,
+        Vec::new(),
+        Vec::new(),
+        CREATOR_DEPOSIT_SHANNONS,
+    );
+    assert_exit_code(&verify_err(&mut legacy.context, tx), 5);
 }
 
 #[test]
@@ -3885,11 +4308,18 @@ fn merge_fixture(
     let mut shards = Vec::new();
     let mut ops = Vec::new();
     let mut total_capacity = 0u64;
-    for shard_id in 0..core::cmp::min(MAX_SHARDS_PER_MERGE as u32, shard_count) {
+    let mut built = 0u32;
+    for shard_id in 0..shard_count {
+        if built >= MAX_SHARDS_PER_MERGE as u32 {
+            break;
+        }
+        if !shard_id_has_voter(&mut fixture, shard_id, seed.saturating_add(shard_id as u8)) {
+            continue;
+        }
         let shard = finalized_shard(
             &mut fixture,
             shard_id,
-            vec![u64::from(shard_id + 1), u64::from(shard_id % 2)],
+            vec![u64::from((built % 3) + 1), u64::from(shard_id % 2)],
             seed.saturating_add(shard_id as u8),
         );
         let capacity = TALLY_SHARD_MIN_SHANNONS + u64::from(shard_id);
@@ -3897,14 +4327,65 @@ fn merge_fixture(
         shards.push(shard);
         ops.push(op);
         total_capacity += capacity;
+        built += 1;
     }
     let result = merge_result_for_shards(fixture.poll_type_hash, &shards, 1);
     (fixture, shards, ops, result, total_capacity)
 }
 
+fn merge_sixteen_shard_fixture(
+    seed: u8,
+) -> (
+    PollFixture,
+    Vec<TallyShardData>,
+    Vec<OutPoint>,
+    TallyMergeResultData,
+    u64,
+) {
+    merge_fixture(seed, MAX_ACTIVE_TALLY_SHARDS)
+}
+
+fn merge_fixture_with_count(
+    seed: u8,
+    shard_count: u32,
+) -> (PollFixture, Vec<TallyShardData>, Vec<OutPoint>, Vec<u64>) {
+    let mut fixture = create_poll_fixture(400, shard_count, false);
+    let mut shards = Vec::new();
+    let mut ops = Vec::new();
+    let mut capacities = Vec::new();
+    for shard_id in 0..fixture.open_poll.shard_count {
+        let vote_counts = vec![u64::from((shard_id % 3) + 1), u64::from((shard_id + 1) % 2)];
+        let total_voters: u64 = vote_counts.iter().sum();
+        let counted_voter_lock_hashes = (0..total_voters)
+            .map(|offset| {
+                let mut hash = [0u8; 32];
+                hash[0] = seed;
+                hash[1] = shard_id as u8;
+                hash[2] = offset as u8;
+                hash
+            })
+            .collect();
+        let shard = TallyShardData {
+            poll_type_hash: fixture.poll_type_hash,
+            shard_id,
+            shard_count: fixture.open_poll.shard_count,
+            vote_counts,
+            total_voters,
+            counted_voter_lock_hashes,
+            finalized: true,
+        };
+        let capacity = TALLY_SHARD_MIN_SHANNONS + u64::from(shard_id);
+        let (op, _) = shard_cell_with_capacity(&mut fixture, &shard, capacity);
+        shards.push(shard);
+        ops.push(op);
+        capacities.push(capacity);
+    }
+    (fixture, shards, ops, capacities)
+}
+
 #[test]
 fn merge_tally_shards_happy_path_passes() {
-    let (mut fixture, _, ops, result, total_capacity) = merge_fixture(10, 9);
+    let (mut fixture, _, ops, result, total_capacity) = merge_sixteen_shard_fixture(10);
     let tx = build_merge_tx(
         &mut fixture,
         ops,
@@ -3920,8 +4401,210 @@ fn merge_tally_shards_happy_path_passes() {
 }
 
 #[test]
+fn active_nine_lane_merge_pipeline_closes_from_complete_merge_result() {
+    let (mut fixture, shards, shard_ops, capacities) =
+        merge_fixture_with_count(170, MAX_DIRECT_CLOSE_SHARDS + 1);
+
+    let partial_shards = &shards[..MAX_SHARDS_PER_MERGE];
+    let partial_ops = shard_ops[..MAX_SHARDS_PER_MERGE].to_vec();
+    let trailing_op = shard_ops[MAX_SHARDS_PER_MERGE].clone();
+    let partial_capacity: u64 = capacities[..MAX_SHARDS_PER_MERGE].iter().sum();
+    let trailing_capacity = capacities[MAX_SHARDS_PER_MERGE];
+
+    let partial_result = merge_result_for_shards(fixture.poll_type_hash, partial_shards, 1);
+    let partial_merge_tx = build_merge_tx(
+        &mut fixture,
+        partial_ops,
+        partial_result.clone(),
+        partial_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, partial_merge_tx);
+
+    let (partial_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &partial_result, partial_capacity);
+    let final_capacity = partial_capacity + trailing_capacity;
+    let final_result = merge_result_for_shards(fixture.poll_type_hash, &shards, 2);
+    let final_merge_tx = build_merge_tx(
+        &mut fixture,
+        vec![partial_result_op, trailing_op],
+        final_result.clone(),
+        final_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, final_merge_tx);
+
+    let (final_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &final_result, final_capacity);
+    let deadline = fixture.open_poll.deadline;
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let before = fixture.open_poll.clone();
+    let after = closed_poll_from_result(
+        &before,
+        final_result.vote_counts.clone(),
+        final_result.total_voters,
+    );
+    let close_tx = close_poll_with_inputs_tx(
+        &mut fixture,
+        before,
+        after,
+        true,
+        vec![(final_result_op, final_capacity)],
+        Vec::new(),
+        Vec::new(),
+        CREATOR_DEPOSIT_SHANNONS,
+    );
+    verify_ok(&mut fixture.context, close_tx);
+}
+
+#[test]
+fn merge_result_first_then_shard_input_still_merges() {
+    let (mut fixture, shards, shard_ops, capacities) =
+        merge_fixture_with_count(41, MAX_DIRECT_CLOSE_SHARDS + 1);
+    let partial_shards = &shards[..MAX_SHARDS_PER_MERGE];
+    let partial_ops = shard_ops[..MAX_SHARDS_PER_MERGE].to_vec();
+    let trailing_op = shard_ops[MAX_SHARDS_PER_MERGE].clone();
+    let partial_capacity: u64 = capacities[..MAX_SHARDS_PER_MERGE].iter().sum();
+    let trailing_capacity = capacities[MAX_SHARDS_PER_MERGE];
+
+    let partial_result = merge_result_for_shards(fixture.poll_type_hash, partial_shards, 1);
+    let partial_merge_tx = build_merge_tx(
+        &mut fixture,
+        partial_ops,
+        partial_result.clone(),
+        partial_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, partial_merge_tx);
+
+    let (partial_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &partial_result, partial_capacity);
+    let final_capacity = partial_capacity + trailing_capacity;
+    let final_result = merge_result_for_shards(fixture.poll_type_hash, &shards, 2);
+    let final_merge_tx = build_merge_tx(
+        &mut fixture,
+        vec![partial_result_op, trailing_op],
+        final_result.clone(),
+        final_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, final_merge_tx);
+}
+
+#[test]
+fn shard_first_then_merge_result_input_merges_after_lock_fix() {
+    let (mut fixture, shards, shard_ops, capacities) =
+        merge_fixture_with_count(72, MAX_DIRECT_CLOSE_SHARDS + 1);
+    let partial_shards = &shards[..MAX_SHARDS_PER_MERGE];
+    let partial_ops = shard_ops[..MAX_SHARDS_PER_MERGE].to_vec();
+    let trailing_op = shard_ops[MAX_SHARDS_PER_MERGE].clone();
+    let partial_capacity: u64 = capacities[..MAX_SHARDS_PER_MERGE].iter().sum();
+    let trailing_capacity = capacities[MAX_SHARDS_PER_MERGE];
+
+    let partial_result = merge_result_for_shards(fixture.poll_type_hash, partial_shards, 1);
+    let partial_merge_tx = build_merge_tx(
+        &mut fixture,
+        partial_ops,
+        partial_result.clone(),
+        partial_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, partial_merge_tx);
+
+    let (partial_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &partial_result, partial_capacity);
+    let final_capacity = partial_capacity + trailing_capacity;
+    let final_result = merge_result_for_shards(fixture.poll_type_hash, &shards, 2);
+    let final_merge_tx = build_merge_tx(
+        &mut fixture,
+        vec![trailing_op, partial_result_op],
+        final_result.clone(),
+        final_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, final_merge_tx);
+}
+
+#[test]
+fn two_partial_merge_results_compose_into_one_complete_result() {
+    let (mut fixture, shards, shard_ops, capacities) =
+        merge_fixture_with_count(173, MAX_ACTIVE_TALLY_SHARDS);
+    let first_shards = &shards[..MAX_SHARDS_PER_MERGE];
+    let second_shards = &shards[MAX_SHARDS_PER_MERGE..MAX_ACTIVE_TALLY_SHARDS as usize];
+    let first_ops = shard_ops[..MAX_SHARDS_PER_MERGE].to_vec();
+    let second_ops = shard_ops[MAX_SHARDS_PER_MERGE..MAX_ACTIVE_TALLY_SHARDS as usize].to_vec();
+    let first_capacity: u64 = capacities[..MAX_SHARDS_PER_MERGE].iter().sum();
+    let second_capacity: u64 = capacities[MAX_SHARDS_PER_MERGE..MAX_ACTIVE_TALLY_SHARDS as usize]
+        .iter()
+        .sum();
+
+    let first_result = merge_result_for_shards(fixture.poll_type_hash, first_shards, 1);
+    let first_merge_tx = build_merge_tx(
+        &mut fixture,
+        first_ops,
+        first_result.clone(),
+        first_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, first_merge_tx);
+
+    let second_result = merge_result_for_shards(fixture.poll_type_hash, second_shards, 1);
+    let second_merge_tx = build_merge_tx(
+        &mut fixture,
+        second_ops,
+        second_result.clone(),
+        second_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, second_merge_tx);
+
+    let (first_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &first_result, first_capacity);
+    let (second_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &second_result, second_capacity);
+    let final_capacity = first_capacity + second_capacity;
+    let final_result = merge_result_for_shards(fixture.poll_type_hash, &shards, 2);
+    let final_merge_tx = build_merge_tx(
+        &mut fixture,
+        vec![first_result_op, second_result_op],
+        final_result,
+        final_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut fixture.context, final_merge_tx);
+}
+
+#[test]
 fn merge_tally_shards_rejects_bad_shard_inputs_and_overlap() {
-    let (mut unfinalized, mut shards, _ops, result, total_capacity) = merge_fixture(20, 9);
+    let (mut unfinalized, mut shards, _ops, result, total_capacity) =
+        merge_sixteen_shard_fixture(20);
     shards[0].finalized = false;
     let (bad_op, _) =
         shard_cell_with_capacity(&mut unfinalized, &shards[0], TALLY_SHARD_MIN_SHANNONS);
@@ -3937,7 +4620,8 @@ fn merge_tally_shards_rejects_bad_shard_inputs_and_overlap() {
     );
     assert_exit_code(&verify_err(&mut unfinalized.context, tx), 5);
 
-    let (mut wrong_poll, mut shards, _ops, result, total_capacity) = merge_fixture(21, 9);
+    let (mut wrong_poll, mut shards, _ops, result, total_capacity) =
+        merge_sixteen_shard_fixture(21);
     shards[0].poll_type_hash = [0x66; 32];
     let (bad_op, _) =
         shard_cell_with_capacity(&mut wrong_poll, &shards[0], TALLY_SHARD_MIN_SHANNONS);
@@ -3953,7 +4637,7 @@ fn merge_tally_shards_rejects_bad_shard_inputs_and_overlap() {
     );
     assert_exit_code(&verify_err(&mut wrong_poll.context, tx), 5);
 
-    let (mut duplicate, shards, _ops, _result, _total_capacity) = merge_fixture(22, 9);
+    let (mut duplicate, shards, _ops, _result, _total_capacity) = merge_sixteen_shard_fixture(22);
     let (op0, _) = shard_cell_with_capacity(&mut duplicate, &shards[0], TALLY_SHARD_MIN_SHANNONS);
     let mut duplicate_shard = shards[0].clone();
     duplicate_shard.vote_counts = vec![0, 1];
@@ -3973,11 +4657,63 @@ fn merge_tally_shards_rejects_bad_shard_inputs_and_overlap() {
         false,
     );
     assert_exit_code(&verify_err(&mut duplicate.context, tx), 5);
+
+    // Each partial result is valid on its own. Their shared lane makes the
+    // combined result invalid even if its output claims only unique coverage.
+    let (mut overlapping_results, shards, shard_ops, capacities) =
+        merge_fixture_with_count(23, MAX_ACTIVE_TALLY_SHARDS);
+    let first_shards = &shards[..MAX_SHARDS_PER_MERGE];
+    let second_shards = &shards[(MAX_SHARDS_PER_MERGE - 1)..15];
+    let first_capacity: u64 = capacities[..MAX_SHARDS_PER_MERGE].iter().sum();
+    let second_capacity: u64 = capacities[(MAX_SHARDS_PER_MERGE - 1)..15].iter().sum();
+    let first_result = merge_result_for_shards(overlapping_results.poll_type_hash, first_shards, 1);
+    let second_result =
+        merge_result_for_shards(overlapping_results.poll_type_hash, second_shards, 1);
+    let first_tx = build_merge_tx(
+        &mut overlapping_results,
+        shard_ops[..MAX_SHARDS_PER_MERGE].to_vec(),
+        first_result.clone(),
+        first_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut overlapping_results.context, first_tx);
+    let second_tx = build_merge_tx(
+        &mut overlapping_results,
+        shard_ops[(MAX_SHARDS_PER_MERGE - 1)..15].to_vec(),
+        second_result.clone(),
+        second_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    verify_ok(&mut overlapping_results.context, second_tx);
+
+    let (first_result_op, _) =
+        merge_cell_with_capacity(&mut overlapping_results, &first_result, first_capacity);
+    let (second_result_op, _) =
+        merge_cell_with_capacity(&mut overlapping_results, &second_result, second_capacity);
+    let claimed_unique_result =
+        merge_result_for_shards(overlapping_results.poll_type_hash, &shards[..15], 2);
+    let tx = build_merge_tx(
+        &mut overlapping_results,
+        vec![first_result_op, second_result_op],
+        claimed_unique_result,
+        first_capacity + second_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+    assert_exit_code(&verify_err(&mut overlapping_results.context, tx), 5);
 }
 
 #[test]
 fn merge_tally_shards_rejects_wrong_result_shape_and_scripts() {
-    let (mut wrong_totals, _, ops, mut result, total_capacity) = merge_fixture(30, 9);
+    let (mut wrong_totals, _, ops, mut result, total_capacity) = merge_sixteen_shard_fixture(30);
     result.vote_counts[0] += 1;
     let tx = build_merge_tx(
         &mut wrong_totals,
@@ -3991,7 +4727,7 @@ fn merge_tally_shards_rejects_wrong_result_shape_and_scripts() {
     );
     assert_exit_code(&verify_err(&mut wrong_totals.context, tx), 5);
 
-    let (mut wrong_coverage, _, ops, mut result, total_capacity) = merge_fixture(31, 9);
+    let (mut wrong_coverage, _, ops, mut result, total_capacity) = merge_sixteen_shard_fixture(31);
     result.coverage[0] ^= 0b0000_0001;
     let tx = build_merge_tx(
         &mut wrong_coverage,
@@ -4005,7 +4741,7 @@ fn merge_tally_shards_rejects_wrong_result_shape_and_scripts() {
     );
     assert_exit_code(&verify_err(&mut wrong_coverage.context, tx), 5);
 
-    let (mut wrong_lock, _, ops, result, total_capacity) = merge_fixture(32, 9);
+    let (mut wrong_lock, _, ops, result, total_capacity) = merge_sixteen_shard_fixture(32);
     let bad_lock = wrong_lock
         .context
         .build_script(&wrong_lock.always_success_op, Bytes::from(vec![0xB1]))
@@ -4022,7 +4758,67 @@ fn merge_tally_shards_rejects_wrong_result_shape_and_scripts() {
     );
     assert_exit_code(&verify_err(&mut wrong_lock.context, tx), 5);
 
-    let (mut wrong_type, _, ops, result, total_capacity) = merge_fixture(33, 9);
+    let (mut missing_input_type, _shards, _, input_result, total_capacity) =
+        merge_sixteen_shard_fixture(32);
+    let (good_result_op, _) =
+        merge_cell_with_capacity(&mut missing_input_type, &input_result, total_capacity);
+    let bad_input_lock = merge_script_for_fixture(&mut missing_input_type);
+    let bad_input_op = missing_input_type.context.create_cell(
+        output(total_capacity, bad_input_lock, None),
+        encode_tally_merge_result(&input_result),
+    );
+    let mut output_result = input_result.clone();
+    output_result.merge_level += 1;
+    let tx = build_merge_tx(
+        &mut missing_input_type,
+        vec![good_result_op, bad_input_op],
+        output_result,
+        total_capacity * 2,
+        None,
+        None,
+        None,
+        false,
+    );
+    let err = verify_err(&mut missing_input_type.context, tx);
+    assert_exit_code(&err, 5);
+    assert!(
+        err.to_string().contains("Inputs[0].Lock"),
+        "missing merge input type must fail in the merge lock group: {err}"
+    );
+
+    let (mut wrong_input_type, _shards, _, input_result, total_capacity) =
+        merge_sixteen_shard_fixture(35);
+    let (good_result_op, _) =
+        merge_cell_with_capacity(&mut wrong_input_type, &input_result, total_capacity);
+    let bad_input_lock = merge_script_for_fixture(&mut wrong_input_type);
+    let harmless_type = wrong_input_type
+        .context
+        .build_script(&wrong_input_type.always_success_op, Bytes::from(vec![0xB2]))
+        .expect("harmless wrong merge input type");
+    let bad_input_op = wrong_input_type.context.create_cell(
+        output(total_capacity, bad_input_lock, Some(harmless_type)),
+        encode_tally_merge_result(&input_result),
+    );
+    let mut output_result = input_result.clone();
+    output_result.merge_level += 1;
+    let tx = build_merge_tx(
+        &mut wrong_input_type,
+        vec![good_result_op, bad_input_op],
+        output_result,
+        total_capacity * 2,
+        None,
+        None,
+        None,
+        false,
+    );
+    let err = verify_err(&mut wrong_input_type.context, tx);
+    assert_exit_code(&err, 5);
+    assert!(
+        err.to_string().contains("Inputs[0].Lock"),
+        "wrong merge input type must fail in the merge lock group: {err}"
+    );
+
+    let (mut wrong_type, _, ops, result, total_capacity) = merge_sixteen_shard_fixture(33);
     let bad_type = vote_intent_script(
         &mut wrong_type.context,
         &wrong_type.governance_op,
@@ -4040,7 +4836,7 @@ fn merge_tally_shards_rejects_wrong_result_shape_and_scripts() {
     );
     assert_exit_code(&verify_err(&mut wrong_type.context, tx), 5);
 
-    let (mut extra_output, _, ops, result, total_capacity) = merge_fixture(34, 9);
+    let (mut extra_output, _, ops, result, total_capacity) = merge_sixteen_shard_fixture(34);
     let tx = build_merge_tx(
         &mut extra_output,
         ops,
@@ -4052,6 +4848,53 @@ fn merge_tally_shards_rejects_wrong_result_shape_and_scripts() {
         true,
     );
     assert_exit_code(&verify_err(&mut extra_output.context, tx), 5);
+}
+
+#[test]
+fn merge_tally_shards_rejects_singleton_shard_wrap() {
+    let mut fixture = create_poll_fixture(199, 9, false);
+    let shard = finalized_shard(&mut fixture, 0, vec![1, 0], 0x99);
+    let (shard_op, _) = shard_cell_with_capacity(&mut fixture, &shard, TALLY_SHARD_MIN_SHANNONS);
+    let result = merge_result_for_shards(fixture.poll_type_hash, &[shard], 1);
+    let tx = build_merge_tx(
+        &mut fixture,
+        vec![shard_op],
+        result,
+        TALLY_SHARD_MIN_SHANNONS,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+}
+
+#[test]
+fn merge_tally_shards_rejects_singleton_result_rewrap() {
+    let mut fixture = create_poll_fixture(199, 9, false);
+    let partial_shards = vec![
+        finalized_shard(&mut fixture, 0, vec![1, 0], 0xA0),
+        finalized_shard(&mut fixture, 1, vec![0, 1], 0xA1),
+    ];
+    let partial_result = merge_result_for_shards(fixture.poll_type_hash, &partial_shards, 1);
+    let partial_capacity = TALLY_MERGE_RESULT_MIN_SHANNONS + 123;
+    let (partial_result_op, _) =
+        merge_cell_with_capacity(&mut fixture, &partial_result, partial_capacity);
+    let mut replacement_result = partial_result.clone();
+    replacement_result.merge_level += 1;
+    let tx = build_merge_tx(
+        &mut fixture,
+        vec![partial_result_op],
+        replacement_result,
+        partial_capacity,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
 }
 
 #[test]
@@ -4089,8 +4932,7 @@ fn large_close_fixture(
     OutPoint,
     u64,
 ) {
-    let mut fixture =
-        create_poll_fixture(u64::from(seed) + 220, MAX_DIRECT_CLOSE_SHARDS + 1, false);
+    let mut fixture = create_poll_fixture(u64::from(seed) + 220, MAX_ACTIVE_TALLY_SHARDS, false);
     let mut shards = Vec::new();
     for shard_id in 0..fixture.open_poll.shard_count {
         shards.push(finalized_shard(
@@ -4110,7 +4952,7 @@ fn large_close_fixture(
 fn large_poll_close_from_complete_merge_result_passes() {
     let (mut fixture, _shards, result, result_op, result_capacity) = large_close_fixture(10);
     let deadline = fixture.open_poll.deadline;
-    set_fixture_epoch(&mut fixture, deadline + 1);
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let before = fixture.open_poll.clone();
     let after = closed_poll_from_result(&before, result.vote_counts.clone(), result.total_voters);
     let tx = close_poll_with_inputs_tx(
@@ -4134,7 +4976,7 @@ fn large_poll_close_rejects_incomplete_wrong_poll_wrong_totals_and_extra_inputs(
     result.coverage[0] &= !0b0000_0001;
     let (result_op, _) = merge_cell_with_capacity(&mut incomplete, &result, result_capacity);
     let deadline = incomplete.open_poll.deadline;
-    set_fixture_epoch(&mut incomplete, deadline + 1);
+    set_fixture_epoch(&mut incomplete, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let before = incomplete.open_poll.clone();
     let after = closed_poll_from_result(&before, result.vote_counts.clone(), result.total_voters);
     let tx = close_poll_with_inputs_tx(
@@ -4154,7 +4996,7 @@ fn large_poll_close_rejects_incomplete_wrong_poll_wrong_totals_and_extra_inputs(
     result.poll_type_hash = [0x99; 32];
     let (result_op, _) = merge_cell_with_capacity(&mut wrong_poll, &result, result_capacity);
     let deadline = wrong_poll.open_poll.deadline;
-    set_fixture_epoch(&mut wrong_poll, deadline + 1);
+    set_fixture_epoch(&mut wrong_poll, deadline + FINALIZATION_GRACE_EPOCHS + 1);
     let before = wrong_poll.open_poll.clone();
     let after = closed_poll_from_result(&before, result.vote_counts.clone(), result.total_voters);
     let tx = close_poll_with_inputs_tx(
@@ -4211,6 +5053,29 @@ fn large_poll_close_rejects_incomplete_wrong_poll_wrong_totals_and_extra_inputs(
         CREATOR_DEPOSIT_SHANNONS,
     );
     assert_exit_code(&verify_err(&mut extra.context, tx), 5);
+}
+
+#[test]
+fn seventeen_lane_poll_cannot_use_hardened_merge_close_path() {
+    let (mut fixture, shards, result, result_op, result_capacity) = large_close_fixture(29);
+    fixture.open_poll.shard_count = MAX_ACTIVE_TALLY_SHARDS + 1;
+    replace_fixture_poll_input(&mut fixture);
+    let deadline = fixture.open_poll.deadline;
+    set_fixture_epoch(&mut fixture, deadline + FINALIZATION_GRACE_EPOCHS + 1);
+    let before = fixture.open_poll.clone();
+    let after = closed_poll_from_result(&before, result.vote_counts.clone(), result.total_voters);
+    let tx = close_poll_with_inputs_tx(
+        &mut fixture,
+        before,
+        after,
+        true,
+        vec![(result_op, result_capacity)],
+        Vec::new(),
+        Vec::new(),
+        CREATOR_DEPOSIT_SHANNONS,
+    );
+    assert_exit_code(&verify_err(&mut fixture.context, tx), 5);
+    let _ = shards;
 }
 
 #[test]
@@ -4349,16 +5214,22 @@ fn create_delegation_tx_with_output_data(
 
 fn merge_tx_with_output_data(
     fixture: &mut PollFixture,
-    shard: TallyShardData,
+    shards: Vec<TallyShardData>,
     result: TallyMergeResultData,
     output_data: Bytes,
 ) -> ckb_testtool::ckb_types::core::TransactionView {
-    let (op, _) = shard_cell_with_capacity(fixture, &shard, TALLY_SHARD_MIN_SHANNONS);
+    let mut inputs = Vec::new();
+    let mut locked_capacity = 0u64;
+    for shard in shards {
+        let (op, _) = shard_cell_with_capacity(fixture, &shard, TALLY_SHARD_MIN_SHANNONS);
+        inputs.push(op);
+        locked_capacity += TALLY_SHARD_MIN_SHANNONS;
+    }
     build_merge_tx(
         fixture,
-        vec![op],
+        inputs,
         result,
-        TALLY_SHARD_MIN_SHANNONS,
+        locked_capacity,
         None,
         None,
         Some(output_data),
@@ -4449,7 +5320,12 @@ fn codec_canonicality_rejects_trailing_bytes_in_vm() {
 
     let (mut bad_merge, shards, _ops, result, _capacity) = merge_fixture(40, 9);
     let output_data = with_trailing_byte(encode_tally_merge_result(&result));
-    let tx = merge_tx_with_output_data(&mut bad_merge, shards[0].clone(), result, output_data);
+    let tx = merge_tx_with_output_data(
+        &mut bad_merge,
+        vec![shards[0].clone(), shards[1].clone()],
+        result,
+        output_data,
+    );
     assert_exit_code(&verify_err(&mut bad_merge.context, tx), 4);
 }
 
