@@ -1,4 +1,4 @@
-# [DIS] CKB DAO Builder SDK — Reusable Governance Toolkit for CKB Communities
+# [DIS] CKB DAO Builder SDK - Reusable Governance Toolkit for CKB Communities
 
 ## Summary
 
@@ -68,7 +68,7 @@ CKBoost is the primary reference integration candidate because it is an active, 
 
 Vellum and `did:ckb` reputation claims remain a future-compatible eligibility source. Mint Gate-style membership cells remain another concrete adapter model. A self-seeded eligibility fixture guarantees that the grant can demonstrate the adapter boundary even if an external project's interface, schedule, or participation changes.
 
-This grant upgrades external eligibility from an application-level integration into a versioned protocol boundary. The existing governance contract already enforces proposal, voting, delegation, timing, tally, and refund rules; this grant adds contract validation for community-specific eligibility evidence. Milestone 1 will define how each poll commits to an eligibility policy and how evidence cells bind the governance scope and represented voter. Milestone 2 will implement and CKB-VM-test one on-chain-enforced reference policy, including manually constructed attempts to bypass the frontend. The SDK will support both advisory integrations and contract-enforced policies and will identify the applicable security level explicitly. CKBoost-compatible evidence is a primary reference integration possibility; it can use the enforced path once the selected CKBoost evidence has a stable CKB-verifiable representation. Delivery of the enforced reference policy will remain independent of changes to CKBoost itself.
+This grant upgrades external eligibility from an application-level integration into a versioned protocol boundary. The existing governance contract already enforces proposal, voting, delegation, timing, tally, and refund rules; this grant adds contract validation for community-specific eligibility evidence. 
 
 ### Why Now?
 
@@ -372,7 +372,7 @@ The first grant phase keeps voting equal-weight once a participant is eligible. 
 
 **Deposits as CKB capacity.** I will keep creator and voter deposits inside cells and preserve their recovery through validated protocol paths.
 
-**Testnet-first.** I am not requesting mainnet promotion or formal audit funding in this grant. I will ship and demonstrate the public reference integration on Pudge testnet.
+**Testnet-first.** I will ship and demonstrate the public reference integration on testnet first.
 
 ### 6.4 Fee Model And Sustainability
 
