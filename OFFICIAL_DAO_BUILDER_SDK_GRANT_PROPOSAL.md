@@ -68,7 +68,7 @@ CKBoost is the primary reference integration candidate because it is an active, 
 
 Vellum and `did:ckb` reputation claims remain a future-compatible eligibility source. Mint Gate-style membership cells remain another concrete adapter model. A self-seeded eligibility fixture guarantees that the grant can demonstrate the adapter boundary even if an external project's interface, schedule, or participation changes.
 
-This grant upgrades external eligibility from an application-level integration into a versioned protocol boundary. The existing governance contract already enforces proposal, voting, delegation, timing, tally, and refund rules; this grant adds contract validation for community-specific eligibility evidence. 
+This grant upgrades external eligibility from an application-level integration into a versioned protocol boundary. The existing governance contract already enforces proposal, voting, delegation, timing, tally, and refund rules; this grant adds contract validation for community-specific eligibility evidence.
 
 ### Why Now?
 
