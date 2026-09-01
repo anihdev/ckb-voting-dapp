@@ -80,7 +80,7 @@ Three things have lined up:
 
 3. **Existing DAO discussions have already identified the bottlenecks.** CKB governance discussions around on-chain tallying, vote-meta cell contention, intent cells, and deposit-paired voting point to the same design constraints this protocol addresses: cell contention, deposit control, and indexer-assisted coordination.
 
-The right next step is to turn the working protocol into a reusable SDK surface and reference dashboard.
+The next step is to turn the working protocol into a reusable SDK surface and reference dashboard.
 
 ---
 
